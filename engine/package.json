@@ -1,0 +1,13 @@
+﻿{
+  "name": "astrcraft-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Astrcraft engine: a real Minecraft client (mineflayer) driven over JSON-RPC",
+  "main": "index.js",
+  "dependencies": {
+    "mineflayer": "4.39.0",
+    "minecraft-data": "3.116.0",
+    "mineflayer-pathfinder": "2.4.5"
+  }
+}

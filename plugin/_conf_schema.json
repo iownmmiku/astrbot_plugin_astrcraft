@@ -1,0 +1,176 @@
+{
+  "engine_dir": {
+    "type": "string",
+    "description": "Minecraft 引擎（bot 目录）的路径。留空则使用插件目录同级的 bot/",
+    "default": "",
+    "hint": "引擎是 Node 子进程，目录里需要有 index.js 和 node_modules（在 bot 目录执行过 npm install）"
+  },
+  "node_path": {
+    "type": "string",
+    "description": "node 可执行文件路径。留空自动探测",
+    "default": "",
+    "hint": "Windows 常见位置：C:\\\\Program Files\\\\nodejs\\\\node.exe"
+  },
+  "engine_log_level": {
+    "type": "string",
+    "description": "引擎日志级别",
+    "default": "info",
+    "options": ["error", "warn", "info", "debug"]
+  },
+  "server_host": {
+    "type": "string",
+    "description": "Minecraft 服务器地址",
+    "default": "127.0.0.1"
+  },
+  "server_port": {
+    "type": "int",
+    "description": "Minecraft 服务器端口",
+    "default": 25565
+  },
+  "bot_username": {
+    "type": "string",
+    "description": "机器人游戏内名字（离线账号，1-16 字符）",
+    "default": "AstrBot"
+  },
+  "mc_version": {
+    "type": "string",
+    "description": "目标服务器版本（必须与服务器一致，不会自动探测）",
+    "default": "1.20.1"
+  },
+  "auth_method": {
+    "type": "string",
+    "description": "登录方式。offline 只能进 online-mode=false 的服务器；microsoft 需要额外配置 prismarine-auth",
+    "default": "offline",
+    "options": ["offline", "microsoft"]
+  },
+  "auto_connect": {
+    "type": "bool",
+    "description": "插件加载后自动让机器人进服",
+    "default": true
+  },
+  "reply_in_game": {
+    "type": "bool",
+    "description": "游戏内聊天提到机器人名字时，用 LLM 自动回话",
+    "default": true
+  },
+  "wake_words": {
+    "type": "list",
+    "description": "游戏内聊天触发回复的唤醒词（机器人名字始终有效）",
+    "default": []
+  },
+  "persona": {
+    "type": "string",
+    "description": "自定义人格描述（仅当读不到 AstrBot 人格库时的兜底；正常情况请直接在 AstrBot 里配人格）",
+    "default": ""
+  },
+  "mc_persona_id": {
+    "type": "string",
+    "description": "指定她在 MC 里用哪个人格（填 AstrBot 的人格 ID，留空=用 AstrBot 默认人格）。也可用 /mc人格 <名字> 随时切换",
+    "default": ""
+  },
+  "enable_life_loop": {
+    "type": "bool",
+    "description": "让她自己过日子：没人派活时自己决定做什么（挖矿、盖房、散步、找人聊天）",
+    "default": true
+  },
+  "life_decide_interval": {
+    "type": "int",
+    "description": "空闲时最多多少秒想一次「接下来干嘛」。任务一结束会立刻唤醒她，所以这只是上限；调小=动作更连贯（默认 20）",
+    "default": 20
+  },
+  "life_share_cooldown": {
+    "type": "int",
+    "description": "她主动分享见闻的最小间隔（秒）。发现钻石、死亡这类大事不受此限制",
+    "default": 600
+  },
+  "remember_experiences": {
+    "type": "bool",
+    "description": "记录她的经历（去过哪、见过什么、和谁聊过），让她有连续的记忆",
+    "default": true
+  },
+  "enable_llm_planner": {
+    "type": "bool",
+    "description": "允许 LLM 把说不上来的目标拆成技能步骤（模板匹配失败时兜底）",
+    "default": true
+  },
+  "forward_engine_events": {
+    "type": "bool",
+    "description": "把引擎事件记录到插件事件缓冲（/mc调试 可查）",
+    "default": true
+  },
+  "auto_mode": {
+    "type": "bool",
+    "description": "允许自主层行动（关掉后只响应明确指令）",
+    "default": true
+  },
+  "in_game_actions": {
+    "type": "bool",
+    "description": "游戏内聊天可以驱动动作：玩家在游戏里让她砍树/跟随/挖矿，她真的会去做。关掉则游戏内只聊天不动手",
+    "default": true
+  },
+  "in_game_llm_timeout": {
+    "type": "int",
+    "description": "游戏内对话的 LLM 超时（秒）。模型太慢时超时会退回纯文字回复，不会一直卡着",
+    "default": 120
+  },
+  "announce_task_done": {
+    "type": "bool",
+    "description": "技能任务做完后在游戏里播报结果（「砍完了，拿到 8 个木头」）。关掉则只在 QQ 侧可见",
+    "default": true
+  },
+  "auto_eat": {
+    "type": "bool",
+    "description": "饿了自动进食",
+    "default": true
+  },
+  "auto_defend": {
+    "type": "bool",
+    "description": "被敌对生物近身时自动反击",
+    "default": true
+  },
+  "auto_collect_drops": {
+    "type": "bool",
+    "description": "自动捡起附近的掉落物（真人不会把挖到的东西留在地上）",
+    "default": true
+  },
+  "auto_torch": {
+    "type": "bool",
+    "description": "太黑时自动插火把照明（也能防止怪物贴脸刷新）",
+    "default": true
+  },
+  "humanize": {
+    "type": "bool",
+    "description": "拟人化动作：渐进转头、走路轻微扫视、变速行走、偶尔停顿环顾、空闲时东张西望。只影响观感，不改变决策与安全性；关掉动作更机械但略快",
+    "default": true
+  },
+  "slow_mode": {
+    "type": "bool",
+    "description": "反作弊保守模式：移动更慢、关闭跑酷，适合有反作弊插件的服务器",
+    "default": false
+  },
+  "dig_whitelist": {
+    "type": "list",
+    "description": "允许挖掘的方块白名单（留空=不限制）。用于领地/主城保护场景",
+    "default": []
+  },
+  "dig_blacklist": {
+    "type": "list",
+    "description": "禁止挖掘的方块",
+    "default": ["bedrock", "barrier", "command_block"]
+  },
+  "spawn_protection_radius": {
+    "type": "int",
+    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作",
+    "default": 0
+  },
+  "enable_action_queue": {
+    "type": "bool",
+    "description": "【此项不生效，已固定为开启】长动作一律异步返回 task_id。关掉会让长动作阻塞对话，并破坏「按需激活工具」机制，所以不提供关闭选项",
+    "default": true
+  },
+  "skill_timeout_seconds": {
+    "type": "int",
+    "description": "单个技能的最长执行时间（秒）。超过就中止并如实报告（会下发给引擎）",
+    "default": 300
+  }
+}

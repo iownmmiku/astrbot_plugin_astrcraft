@@ -1,0 +1,30 @@
+# 依赖与构建产物（用户自己 npm install）
+node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行期数据（不该进仓库）
+data/
+logs/
+*.log
+.testserver/
+server/
+world*/
+*.jsonl
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试与调试的临时产物
+*.tmp
+_probe.txt
