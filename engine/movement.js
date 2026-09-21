@@ -385,6 +385,68 @@ class Navigator {
       .join('、');
   }
 
+  /**
+   * **障碍审计**：把"她周围被当成障碍的格子"连同**判据**一起列出来。
+   *
+   * 为什么要这个：用户反馈"火把这种方块似乎会被当成实体方块挡路"，
+   * 但我用三种办法都复现不出来——穿过一排火把没问题、她不会挖自己的火把、
+   * 代码里所有占位判断用的都是 `boundingBox === 'block'`（火把是 'empty'）。
+   * 与其继续猜，不如让**下一次真的发生时能一眼看清**：
+   * 到底是哪一格、被谁判成了障碍、判据是什么。
+   *
+   * 只读，不改世界。
+   */
+  auditObstacles(radius = 3) {
+    const bot = this._bot;
+    if (!bot || !bot.entity) return { ok: false, reason: '没连接' };
+    const p = bot.entity.position;
+    const cx = Math.floor(p.x);
+    const cy = Math.floor(p.y);
+    const cz = Math.floor(p.z);
+    const r = Math.max(1, Math.min(6, Number(radius) || 3));
+    const rows = [];
+    for (let dy = -1; dy <= 2; dy += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        for (let dz = -r; dz <= r; dz += 1) {
+          let b = null;
+          try {
+            b = blockAt(bot, cx + dx, cy + dy, cz + dz);
+          } catch {
+            continue;
+          }
+          if (!b) continue;
+          const bbox = String(b.boundingBox || '?');
+          // 只报告"不是空气"的格子——空气不用看
+          if (bbox === 'empty' && b.name === 'air') continue;
+          rows.push({
+            x: cx + dx,
+            y: cy + dy,
+            z: cz + dz,
+            name: b.name,
+            bounding_box: bbox,
+            // **判据**：我的代码是拿 boundingBox === 'block' 当"实体挡路"的。
+            // 这里如实标出来，这样"火把到底算不算挡路"一眼可见。
+            counts_as_solid: bbox === 'block',
+            diggable: !!b.diggable,
+          });
+        }
+      }
+    }
+    const solids = rows.filter((r2) => r2.counts_as_solid);
+    const nonSolid = rows.filter((r2) => !r2.counts_as_solid);
+    return {
+      ok: true,
+      position: { x: cx, y: cy, z: cz },
+      radius: r,
+      counts_as_solid: solids,
+      non_solid_but_present: nonSolid,
+      verdict:
+        `${rows.length} 个非空气格里，${solids.length} 个被当成实体挡路、` +
+        `${nonSolid.length} 个不算（火把/草/按钮这类 bounding_box=empty 的东西在这里）`,
+      note: '判据是 bounding_box === "block"。如果这里有 torch 被算进 counts_as_solid，那才是真 bug',
+    };
+  }
+
   /** 单次寻路：一次 A* 规划 */
   async _goToOnce({ x, y, z, range = ARRIVE_RADIUS, signal = null, timeoutMs = null, onTick = null, xzOnly = false }) {
     const bot = this._bot;

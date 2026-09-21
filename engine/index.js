@@ -1001,6 +1001,11 @@ rpc.handle('debug.blocking', () => {
   };
 });
 
+// **障碍审计**：把她周围"被当成障碍的格子 + 判据"列出来。
+// 用户反馈"火把好像会被当成实体方块挡路"，三种办法都复现不出来，
+// 于是让下次真出现时能一眼看清是哪一格、被判成了什么。
+rpc.handle('debug.obstacles', (params = {}) => engine.nav.auditObstacles(params.radius));
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {
