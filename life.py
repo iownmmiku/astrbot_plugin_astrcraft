@@ -230,6 +230,10 @@ class LifeLoop:
         # 我第一版写成 self._cfg(...) → AttributeError 被循环的 except 吞掉 →
         # 每 8 秒重试一次、**永远不决策**（test_life_rhythm 立刻抓到："30 秒内行动 0 次"）。
         self._min_decide_gap = float(min_decide_gap or 0)
+        # **决策失败最多重试几次**（W3）：照 numen 的"每条链只重试一次"。
+        # 到上限就进 BLOCKED 停牌并说清楚，而不是每 8 秒无限重试
+        # （实测那样能连着几十次，她一直在"想事情"却什么都没做）。
+        self._decide_retry_limit = 2
         self._share_cooldown = share_cooldown
         self._last_share_at = 0.0
         self._last_decide_at = 0.0
@@ -267,6 +271,39 @@ class LifeLoop:
         self._load_state()
 
     # ------------------------------------------------------------ 失败记忆
+
+    def note_decision_cut(self, reason: str, *, kind: str = "timeout") -> None:
+        """**记一次"想事情本身没成"**（W3，见 docs/PLAN_v2.md）。
+
+        为什么必须记：原来决策超时只打一行日志 + `sleep(8)` 重来，
+        **模型完全不知道上一轮失败了** ✗ 于是下一轮可能原样再来一遍，
+        或者以为自己刚才做过什么（其实被切断了）。
+
+        这对应 numen 的"在历史里写切断点"（`writeHalt`）——
+        它是进程内、有会话历史，所以写进历史；我们是**每轮无状态**的
+        （`ActionAgent.act()` 每次都从一条新 user 消息开始），
+        所以等价物是**写进"最近做过的事"**，让下一轮的观察里带着它。
+
+        @param kind timeout（超时）/ failed（调用出错）/ cancelled（被取消）
+        """
+        detail = {
+            "timeout": "想事情超时了，没想出来",
+            "failed": "想事情的时候出错了",
+            "cancelled": "想事情被中断了",
+        }.get(kind, "想事情没成")
+        self._recent_outcomes.append(
+            {
+                "at": time.time(),
+                "skill": "（想事情）",
+                "ok": False,
+                "detail": f"{detail}：{str(reason or '').strip()[:60]}",
+                # 标出来，渲染时用不同的说法——"想事情失败"和"做事失败"不是一回事
+                "decision": True,
+            }
+        )
+        if len(self._recent_outcomes) > 8:
+            self._recent_outcomes = self._recent_outcomes[-8:]
+        logger.warning("记下一次决策失败（%s）：%s", kind, reason)
 
     def note_task_result(self, name: str, ok: bool, error: str = "") -> None:
         """记录一次任务结果（由插件在 task.finished 时调用）。
@@ -364,7 +401,14 @@ class LifeLoop:
             lines.append("- 你最近做过的事：")
             for o in reversed(self._recent_outcomes[-5:]):
                 when = time.strftime("%H:%M", time.localtime(o["at"]))
-                if o["ok"]:
+                if o.get("decision"):
+                    # **"想事情失败"要和"做事失败"分开说**（W3）。
+                    # 不分开的话，她会以为自己试过某件事而其实那轮根本没跑起来。
+                    lines.append(
+                        f"    {when}  ⚠️ 上一轮{ o['detail'] }"
+                        "——**那一轮什么都没做成**，别以为你做过什么"
+                    )
+                elif o["ok"]:
                     lines.append(f"    {when}  {o['skill']} → 做成了")
                 else:
                     detail = f"：{o['detail']}" if o["detail"] else ""
@@ -630,16 +674,57 @@ class LifeLoop:
                             self._act_via_agent(), timeout=self._decide_timeout
                         )
                     except asyncio.TimeoutError:
+                        # **失败要留痕 + 只重试一次**（W3，见 docs/PLAN_v2.md）。
+                        #
+                        # 原来这里只是"打一行日志 + sleep(8) 重来"，两个毛病：
+                        #   ① 模型不知道上一轮被切断了 → 下一轮可能原样再来一遍，
+                        #      或者以为自己做过什么（其实那轮根本没跑起来）
+                        #   ② **无限重试**：`_decide_timeouts` 只计数从不放弃，
+                        #      实测能连着几十次，她一直在"想事情"但什么都没做
+                        # 现在：记进"最近做过的事"（下一轮观察里带着），
+                        # 连续 2 次就进 BLOCKED 停牌并说清楚——
+                        # 端点真有问题就该让人知道，而不是假装还在努力。
                         self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
+                        self.note_decision_cut(
+                            f"{self._decide_timeout:.0f} 秒没想出来", kind="timeout"
+                        )
+                        if self._decide_timeouts >= self._decide_retry_limit:
+                            logger.error(
+                                "自主行动连续超时 %d 次（每次 %.0f 秒），"
+                                "不再重试——进停牌，等端点恢复或人来处理",
+                                self._decide_timeouts,
+                                self._decide_timeout,
+                            )
+                            self.note_blocked(
+                                f"连续 {self._decide_timeouts} 次决策超时"
+                                f"（每次 {self._decide_timeout:.0f} 秒）"
+                            )
+                            continue
                         logger.warning(
-                            "自主行动超时（%.0f 秒，连续第 %d 次），8 秒后重试",
+                            "自主行动超时（%.0f 秒，第 %d/%d 次），8 秒后重试一次",
                             self._decide_timeout,
                             self._decide_timeouts,
+                            self._decide_retry_limit,
                         )
+                        await asyncio.sleep(8)
+                        continue
+                    except asyncio.CancelledError:
+                        self.note_decision_cut("循环被取消", kind="cancelled")
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        self.note_decision_cut(str(exc), kind="failed")
+                        self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
+                        if self._decide_timeouts >= self._decide_retry_limit:
+                            logger.error("自主行动连续出错 %d 次，进停牌", self._decide_timeouts)
+                            self.note_blocked(f"连续 {self._decide_timeouts} 次决策出错：{exc}")
+                            continue
                         await asyncio.sleep(8)
                         continue
                     if handled:
                         self._decide_timeouts = 0
+                        # **成功一次就把"模型不可用"解开**：说明端点其实好的。
+                        if self._blocked_reason:
+                            self.note_unblocked()
                         continue
 
                 # **有计划就直接执行下一步，不再问 LLM。**
@@ -669,12 +754,28 @@ class LifeLoop:
                 try:
                     decision = await asyncio.wait_for(self.decide(), timeout=self._decide_timeout)
                     self._decide_timeouts = 0
+                    if self._blocked_reason:
+                        self.note_unblocked()  # 成功一次就说明端点其实好的
                 except asyncio.TimeoutError:
+                    # 同 W3：留痕 + 只重试一次，到上限就进停牌（不再无限重试）
                     self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
+                    self.note_decision_cut(
+                        f"{self._decide_timeout:.0f} 秒没想出来", kind="timeout"
+                    )
+                    if self._decide_timeouts >= self._decide_retry_limit:
+                        logger.error(
+                            "想事情连续超时 %d 次，不再重试——进停牌", self._decide_timeouts
+                        )
+                        self.note_blocked(
+                            f"连续 {self._decide_timeouts} 次决策超时"
+                            f"（每次 {self._decide_timeout:.0f} 秒）"
+                        )
+                        continue
                     logger.warning(
-                        "想事情超时（%.0f 秒，连续第 %d 次），8 秒后重试",
+                        "想事情超时（%.0f 秒，第 %d/%d 次），8 秒后重试一次",
                         self._decide_timeout,
                         self._decide_timeouts,
+                        self._decide_retry_limit,
                     )
                     await asyncio.sleep(8)
                     continue
