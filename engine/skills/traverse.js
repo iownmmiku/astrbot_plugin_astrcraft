@@ -118,6 +118,8 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
   }
   let done = 0;
   let skippedDanger = 0;
+  /** **每一步为什么停**——失败信息必须说清断在哪，不能只有一句笼统的话 */
+  const why = [];
   for (let i = 0; i < n; i += 1) {
     ctx.checkAborted();
     const p = bot.entity.position;
@@ -128,7 +130,10 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
     const yaw = bot.entity.yaw || 0;
     const dx = Math.round(-Math.sin(yaw));
     const dz = Math.round(-Math.cos(yaw));
-    if (dx === 0 && dz === 0) break;
+    if (dx === 0 && dz === 0) {
+      why.push('朝向算不出方向（yaw 异常）');
+      break;
+    }
     const tx = bx + dx;
     const tz = bz + dz;
     // **铺路要放在"她脚下的支撑层"（by - 1），不是她脚那一层（by）** ——
@@ -140,7 +145,14 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
     // 真人搭桥也是这么做的：**往脚下的那一层垫**，然后走过去。
     const supportY = by - 1;
     const support = bot.blockAt(vec3(tx, supportY, tz));
-    if (!support) break;
+    // **每一步都要能说清"断在哪"**（这一轮加的）。
+    // 之前所有 `break` 共用一句"前面不是空的，或者放了没站上去"——
+    // 实测排查时**根本看不出是哪一步断的**，只能靠猜。
+    // 这和之前治过的"报错误导"是同一类问题，我自己又犯了一次。
+    if (!support) {
+      why.push(`读不到前方那一格 (${tx}, ${supportY}, ${tz})（区块可能没加载）`);
+      break;
+    }
     if (support.boundingBox === 'block') {
       // 支撑层已经是实心的 → 这一格不用垫，直接走上去
       const feet = bot.blockAt(vec3(tx, by, tz));
@@ -151,6 +163,7 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
           continue;
         } catch (err) {
           if (err && err.name === 'CancelledError') throw err;
+          why.push(`支撑层已实心，但走不过去：${err.message.slice(0, 50)}`);
           break;
         }
       }
@@ -162,20 +175,30 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
           continue;
         } catch (err) {
           if (err && err.name === 'CancelledError') throw err;
+          why.push(`想跳上 1 格台阶但没上去：${err.message.slice(0, 50)}`);
           break;
         }
       }
+      why.push(
+        `前方 (${tx}, ${by}, ${tz}) 被 ${feet && feet.name} 占着，上面 (${by + 1}) 也被 ${up && up.name} 占着——没有落脚点`,
+      );
       break;
     }
     if (isDangerousBlock(support.name)) {
       // 支撑层是岩浆/水 —— 垫上去也站不住
       skippedDanger += 1;
+      why.push(`前方支撑层是 ${support.name}（岩浆/水），垫上去也站不住`);
       break;
     }
     // 她自己的身体高度那一格必须空着（不然放下去她会被卡住）
     const feetNow = bot.blockAt(vec3(tx, by, tz));
     const headNow = bot.blockAt(vec3(tx, by + 1, tz));
-    if (!isAir(feetNow) || !isAir(headNow)) break;
+    if (!isAir(feetNow) || !isAir(headNow)) {
+      why.push(
+        `她的身体高度 (${tx}, ${by}) 不是空的（脚=${feetNow && feetNow.name} 头=${headNow && headNow.name}）`,
+      );
+      break;
+    }
     try {
       await actions.place({
         x: tx,
@@ -189,7 +212,7 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       ctx.progress(`铺路 ${done}/${n} 格`);
     } catch (err) {
       if (err && err.name === 'CancelledError') throw err;
-      log.debug(`铺第 ${done + 1} 格失败：${err.message}`);
+      why.push(`在 (${tx}, ${supportY}, ${tz}) 放 ${blockName} 失败：${err.message.slice(0, 70)}`);
       break;
     }
     // 站到刚铺的那块上（她仍然在 by 这一层，只是脚下有东西了）
@@ -197,22 +220,25 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
     } catch (err) {
       if (err && err.name === 'CancelledError') throw err;
+      why.push(
+        `铺好了但走不上去（目标 (${tx}, ${by}, ${tz})）：${err.message.slice(0, 60)}`,
+      );
       break;
     }
   }
   if (!done) {
     return skillResult(false, {
-      note: skippedDanger
-        ? '没能铺过去：前面是**岩浆/水**，垫上去也站不住'
-        : '没能铺路（前面不是空的，或者放了没站上去）',
-      reason: skippedDanger ? '前方是危险液体' : '铺路没有进展',
-      extra: { paved: 0, direction: 'forward', danger: skippedDanger },
+      note: `没能铺路：${why.length ? why[why.length - 1] : '原因不明'}`,
+      reason: why.length ? why[why.length - 1] : '铺路没有进展',
+      extra: { paved: 0, direction: 'forward', danger: skippedDanger, why },
     });
   }
   return skillResult(true, {
-    note: `往前铺了 ${done} 格（用 ${blockName}）`,
+    note:
+      `往前铺了 ${done} 格（用 ${blockName}）` +
+      (why.length ? `；走到第 ${done + 1} 格时停了：${why[why.length - 1]}` : ''),
     consumed: { [blockName]: done },
-    extra: { paved: done, direction: 'forward', item: blockName },
+    extra: { paved: done, direction: 'forward', item: blockName, why },
   });
 }
 
