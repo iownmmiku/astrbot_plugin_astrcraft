@@ -280,6 +280,47 @@ const SKILLS = {
       });
     },
   },
+
+  /**
+   * 远程攻击：用弓射（有蓄力、预判、抬枪）。
+   */
+  shoot: {
+    label: '射箭',
+    description: '用弓射目标（需要弓和箭）。会预判目标移动并抬枪修正下坠',
+    params: {
+      target: { type: 'string', required: true, def: 'zombie' },
+      max_shots: { type: 'number', min: 1, max: 30, def: 12 },
+    },
+    async run({ actions, ctx, params }) {
+      const target = requireParam(params, 'target', { type: 'string', def: 'zombie' });
+      const shots = requireParam(params, 'max_shots', { def: 12 });
+      const r = await actions.attackRanged({ target, maxShots: shots, signal: ctx.signal });
+      const note = r.killed
+        ? `射死了 ${r.target}（用了 ${r.shots} 箭）`
+        : `没射死：${r.reason || '原因不明'}`;
+      return skillResult(!!r.killed, {
+        steps: [{ action: 'shoot', ok: !!r.killed, detail: note }],
+        note,
+      });
+    },
+  },
+
+  /**
+   * 举盾格挡。
+   */
+  shield: {
+    label: '举盾',
+    description: '举起盾牌挡伤害（需要盾牌）',
+    params: { hold_seconds: { type: 'number', min: 1, max: 15, def: 3 } },
+    async run({ actions, ctx, params }) {
+      const secs = requireParam(params, 'hold_seconds', { def: 3 });
+      const r = await actions.raiseShield({ signal: ctx.signal, holdMs: secs * 1000 });
+      return skillResult(true, {
+        steps: [{ action: 'shield', ok: true, detail: r.note }],
+        note: r.note,
+      });
+    },
+  },
 };
 
 function get(name) {

@@ -1330,6 +1330,161 @@ class Actions {
 
   // ================================================================ 战斗
 
+  /**
+   * **用弓射**（远程）。原来只有近战——骷髅在十几格外射你，她只能干挨着走过去。
+   *
+   * 要点：
+   *   1. **要蓄力**：弓不拉满伤害很低（拉满约 9~10 点，半拉只有 1~2 点）
+   *   2. **要预判**：箭飞过去要时间，得瞄"目标将要在的位置"而不是当前位置
+   *   3. **要抬一点**：箭会下坠，远距离要往上修正
+   * 这三条少一条都打不中——真人射箭也是这么瞄的。
+   */
+  async attackRanged({ target, signal = null, maxShots = 12, chargeMs = 1200, retreatHealth = null } = {}) {
+    const bot = this._requireBot();
+    // **先查装备再找目标**：没有弓/箭是最该先说的（否则会报"找不到目标"，
+    // 让人以为是目标的问题，其实是没武器——实测踩过这个误导）。
+    if (this.countItem('bow') === 0) {
+      throw new MissingItemError('弓', '先做一把弓（3 根木棍 + 3 根线），还要有箭');
+    }
+    if (this.countItem('arrow') === 0) {
+      throw new MissingItemError('箭', '弓有了但没箭（燧石 + 木棍 + 羽毛），可以先 mc_craft("arrow")');
+    }
+    const entity = this._resolveEntity(target);
+    if (!entity) throw new ActionError(`附近找不到目标：${target}`);
+    await this.holdItem({ item: 'bow', signal });
+    const lowHealth = retreatHealth === null ? Number(this._config.get('retreatHealth')) || 8 : retreatHealth;
+
+    let shots = 0;
+    const start = Date.now();
+    while (shots < maxShots) {
+      if (signal && signal.aborted) throw new CancelledError();
+      if (Date.now() - start > 90000) {
+        return { ok: false, reason: '射箭超时（90 秒）', shots, target: entity.name };
+      }
+      if (bot.health <= lowHealth) {
+        return { ok: false, reason: `血量降到 ${bot.health}，主动撤退（低于阈值 ${lowHealth}）`, shots };
+      }
+      const live = bot.entities[entity.id];
+      if (!live) return { ok: true, killed: true, shots, target: entity.name };
+
+      const dist = distance(bot.entity.position, live.position);
+      if (dist > 48) {
+        return { ok: false, reason: `目标在 ${dist.toFixed(0)} 格外，太远了（弓的射程约 48 格）`, shots };
+      }
+      // 太近就别射了——箭没拉开就打，伤害还不如直接砍
+      if (dist < 3.5) {
+        return { ok: false, reason: `目标已经贴到 ${dist.toFixed(1)} 格，太近了，改用近战（mc_attack）`, shots };
+      }
+
+      // **预判 + 抬枪**：箭速约 40 格/秒，重力约 20 格/秒²
+      const t = dist / 40;
+      const vel = live.velocity || { x: 0, y: 0, z: 0 };
+      const aimX = live.position.x + (vel.x || 0) * t;
+      const aimZ = live.position.z + (vel.z || 0) * t;
+      const aimY = live.position.y + (live.height ? live.height * 0.6 : 0.9) + (vel.y || 0) * t + 0.5 * 20 * t * t;
+
+      try {
+        await bot.lookAt(vec3(aimX, aimY, aimZ), true);
+      } catch (err) {
+        log.debug(`瞄准失败：${err.message}`);
+      }
+
+      // 拉弓 → 等蓄力 → 放
+      try {
+        bot.activateItem();
+        await delay(chargeMs, { signal });
+        bot.deactivateItem();
+        shots += 1;
+      } catch (err) {
+        throw new ActionError(`射箭失败：${describeFailure(err)}`);
+      }
+      // 射完等一会儿再看结果。
+      //
+      // **判断"死了没"踩过两个坑，都记在这里**：
+      //   1. 只看 `!bot.entities[id]` 会误判——实体被击中时 mineflayer 会短暂
+      //      把它从实体表里摘掉再放回，"看不到"被当成"死了"。
+      //   2. 兜底的"按名字找附近"半径写小了也会误判——实测半径 8，
+      //      而目标在 10 格外，于是**每一箭都被当成射死了**。
+      // 现在：先按 id 查（在就是活着）；id 没了再按名字在**整个射程内**找；
+      // 而且要**连续 3 次都看不到**才算死（约 1.5 秒）。
+      // 宁可多说"还没打死"，也不要虚报战果——虚报会让模型以为赢了、不再补刀。
+      let gone = false;
+      for (let i = 0; i < 3; i += 1) {
+        await delay(500, { signal });
+        if (this._targetAlive(entity.id, entity.name, 48)) {
+          gone = false;
+          break;
+        }
+        gone = true;
+      }
+      if (gone) {
+        return { ok: true, killed: true, shots, target: entity.name };
+      }
+      // 箭用完了就停
+      if (this.countItem('arrow') === 0) {
+        return { ok: false, reason: `箭用完了（射了 ${shots} 次）`, shots, target: entity.name };
+      }
+    }
+    const stillAlive = this._targetAlive(entity.id, entity.name, 48);
+    return {
+      ok: !stillAlive,
+      killed: !stillAlive,
+      shots,
+      target: entity.name,
+      reason: stillAlive ? `射了 ${shots} 次还没打死（可能要靠近点，或换更好的弓）` : undefined,
+    };
+  }
+
+  /**
+   * 目标还活着吗？
+   *
+   * 先按实体 id 查（在就是活着）；id 没了再按名字在给定半径内找一遍。
+   * 半径要**大于交战距离**——见 attackRanged 里的说明（写成 8 会误判）。
+   */
+  _targetAlive(entityId, name, radius = 48) {
+    const bot = this._requireBot();
+    if (entityId !== undefined && entityId !== null && bot.entities[entityId]) return true;
+    return this._entityStillNearby(name, radius);
+  }
+
+  /**
+   * 附近还有没有这个类型的实体？（比"查实体表里那个 id 在不在"可靠）
+   */
+  _entityStillNearby(name, radius = 8) {
+    const bot = this._requireBot();
+    const want = String(name || '').toLowerCase();
+    if (!want || !bot.entity) return false;
+    const me = bot.entity.position;
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || !e.position || e === bot.entity) continue;
+      if (String(e.name || '').toLowerCase() !== want) continue;
+      if (distance(me, e.position) <= radius) return true;
+    }
+    return false;
+  }
+
+  /**
+   * **举盾格挡**（按住右键）。
+   *
+   * 真人在挨打时会举盾：正面来的伤害能减掉大部分。这里只是"举起来"，
+   * 什么时候放下由调用方决定（通常是威胁没了）。
+   */
+  async raiseShield({ signal = null, holdMs = 3000 } = {}) {
+    const bot = this._requireBot();
+    if (this.countItem('shield') === 0) {
+      throw new MissingItemError('盾牌', '先做一个（6 块木板 + 1 个铁锭），挨打时举起来能挡掉大部分伤害');
+    }
+    await this.holdItem({ item: 'shield', signal });
+    try {
+      await bot.activateItem(true); // 副手/主手举盾
+      await delay(Math.max(300, Math.min(holdMs, 15000)), { signal });
+      bot.deactivateItem();
+    } catch (err) {
+      throw new ActionError(`举盾失败：${describeFailure(err)}`);
+    }
+    return { ok: true, note: `举了 ${(holdMs / 1000).toFixed(1)} 秒盾` };
+  }
+
   /** 攻击实体。会先走过去、装备武器、连续攻击到目标死亡或逃跑 */
   async attack({ target, signal = null, maxAttacks = 40, retreatHealth = null } = {}) {
     const bot = this._requireBot();
@@ -1383,6 +1538,19 @@ class Actions {
         attacks += 1;
       } catch (err) {
         log.debug(`攻击失败：${err.message}`);
+      }
+      // **走位：像真人那样侧移绕圈**，而不是站着对砍。
+      // 站着不动对砍在 MC 里很吃亏（怪会连续命中），而且看着也不像人在打架。
+      // 每 2~3 下换一次方向，保持"绕圈"而不是"来回抖"。
+      if (attacks % 2 === 0) {
+        try {
+          const side = Math.random() < 0.5 ? 'left' : 'right';
+          bot.setControlState(side, true);
+          await delay(180 + Math.random() * 220, { signal });
+          bot.setControlState(side, false);
+        } catch {
+          /* 走位失败不影响攻击 */
+        }
       }
       // 原版攻击冷却约 0.6 秒，太快会被服务器判定无效
       await delay(this._config.get('slowMode') ? 900 : 620, { signal });

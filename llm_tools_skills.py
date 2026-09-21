@@ -158,6 +158,49 @@ class McSkillTools:
             params["item"] = str(item).strip()
         return await self._submit_skill(event, "interact", params, f"对 {target} 用 {item or '手'}")
 
+    @filter.llm_tool(name="mc_shoot")
+    async def tool_mc_shoot(
+        self,
+        event: AstrMessageEvent,
+        target: str = "zombie",
+        max_shots: int = 12,
+    ) -> MessageEventResult:
+        """**用弓射**（远程攻击）。需要弓和箭。
+
+        什么时候用：敌人在 4 格以外、你有弓有箭。**骷髅在十几格外射你的时候，
+        用这个反击**——不要傻乎乎走过去挨打。
+
+        会自动预判目标移动、抬枪修正箭的下坠、拉满弓再放。
+        目标贴到 3.5 格以内会提示你改用 mc_attack（太近射不划算）。
+
+        Args:
+            target(string): 射谁，如 zombie / skeleton / creeper
+            max_shots(number): 最多射几箭，默认 12
+        """
+        return await self._submit_skill(
+            event,
+            "shoot",
+            {"target": str(target).strip() or "zombie", "max_shots": int(max_shots)},
+            f"用弓射 {target}",
+        )
+
+    @filter.llm_tool(name="mc_shield")
+    async def tool_mc_shield(
+        self,
+        event: AstrMessageEvent,
+        hold_seconds: int = 3,
+    ) -> MessageEventResult:
+        """**举盾格挡**。需要盾牌。
+
+        什么时候用：被远程攻击、或者要硬吃一下伤害的时候。举起来能挡掉正面来的大部分伤害。
+
+        Args:
+            hold_seconds(number): 举多久，默认 3 秒
+        """
+        return await self._submit_skill(
+            event, "shield", {"hold_seconds": int(hold_seconds)}, "举起盾牌"
+        )
+
     @filter.llm_tool(name="mc_blueprint")
     async def tool_mc_blueprint(
         self,

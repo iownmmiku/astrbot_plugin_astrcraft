@@ -162,7 +162,7 @@ async function main() {
     check('未知技能被拒绝并列出可用技能', /可用技能/.test(err.message), err.message.slice(0, 60));
   }
   const list = await c.call('skill.list');
-  check('skill.list 返回 14 个技能', list.names.length === 14, list.names.join(','));
+  check('skill.list 返回 16 个技能', list.names.length === 16, list.names.join(','));
 
   // ---- 3. 协议纯度：stdout 只能是 NDJSON（上面解析失败会记 fail）
   console.log('\n[3] 协议纯度');

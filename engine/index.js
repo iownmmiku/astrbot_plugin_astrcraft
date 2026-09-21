@@ -803,6 +803,27 @@ rpc.handle(
 );
 
 rpc.handle(
+  'attack.ranged',
+  wrap(async (params) => {
+    engine.requireBot();
+    if (params.target === undefined) throw new GameError('缺少参数 target（要射谁）');
+    return engine.actions.attackRanged({
+      target: params.target,
+      maxShots: Number(params.max_shots) || 12,
+      chargeMs: Number(params.charge_ms) || 1200,
+    });
+  }),
+);
+
+rpc.handle(
+  'shield.raise',
+  wrap(async (params = {}) => {
+    engine.requireBot();
+    return engine.actions.raiseShield({ holdMs: Number(params.hold_ms) || 3000 });
+  }),
+);
+
+rpc.handle(
   'use.block',
   wrap(async (params) => {
     engine.requireBot();
