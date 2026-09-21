@@ -1606,6 +1606,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if self.life and self.life.current:
             lines.append("")
             lines.append(f"她自己在做：{self.life.current.activity}")
+        # **用量台账**（W6）：一次决策到底花多少 token、缓存有没有生效。
+        # 没有这行数据就没法谈"不烧 token"——提示词分层省了多少也看不出来。
+        try:
+            from .tokens import ledger
+
+            lines.append("")
+            lines.append("【用量】")
+            lines.append(ledger().describe())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("渲染用量台账失败：%s", exc)
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mc进服", alias={"mcconnect"})

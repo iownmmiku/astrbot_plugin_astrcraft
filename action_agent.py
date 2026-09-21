@@ -283,6 +283,25 @@ class ActionAgent:
                 logger.warning("自主行动的模型调用失败：%s", exc)
                 return (None, used) if not used else ("（模型调用失败，先这样）", used)
 
+            # **记一次用量**（W6）。每一步都是一次模型往返，所以每一轮都要记——
+            # 只记最后一步的话，"一次决策花多少 token"会严重低估
+            # （6 步就是 6 次往返）。
+            try:
+                from .tokens import ledger
+
+                u = ledger().record(getattr(resp, "usage", None))
+                if not u.is_empty():
+                    logger.debug(
+                        "用量：输入 %d（缓存命中 %d，%.0f%%）+ 输出 %d = %d",
+                        u.input_total,
+                        u.input_cached,
+                        u.hit_rate * 100,
+                        u.output,
+                        u.total,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("记录用量失败（不影响主流程）：%s", exc)
+
             names = list(getattr(resp, "tools_call_name", None) or [])
             args_list = list(getattr(resp, "tools_call_args", None) or [])
             ids = list(getattr(resp, "tools_call_ids", None) or [])

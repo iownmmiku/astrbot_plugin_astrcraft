@@ -268,6 +268,15 @@ class GameChatAgent:
                 logger.error("游戏内 LLM 调用失败：%s", exc)
                 return None
 
+            # 记一次用量（W6）——和 action_agent 记进同一个台账，
+            # 否则 /mc状态 显示的用量只覆盖"自主行动"，玩家对话那条路是黑的。
+            try:
+                from .tokens import ledger
+
+                ledger().record(getattr(resp, "usage", None))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("记录用量失败（不影响主流程）：%s", exc)
+
             tool_names = getattr(resp, "tools_call_name", None) or []
             tool_args = getattr(resp, "tools_call_args", None) or []
             tool_ids = getattr(resp, "tools_call_ids", None) or []
