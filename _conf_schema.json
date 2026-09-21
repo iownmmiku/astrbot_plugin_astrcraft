@@ -15,7 +15,12 @@
     "type": "string",
     "description": "引擎日志级别",
     "default": "info",
-    "options": ["error", "warn", "info", "debug"]
+    "options": [
+      "error",
+      "warn",
+      "info",
+      "debug"
+    ]
   },
   "server_host": {
     "type": "string",
@@ -41,12 +46,15 @@
     "type": "string",
     "description": "登录方式。offline 只能进 online-mode=false 的服务器；microsoft 需要额外配置 prismarine-auth",
     "default": "offline",
-    "options": ["offline", "microsoft"]
+    "options": [
+      "offline",
+      "microsoft"
+    ]
   },
   "auto_connect": {
     "type": "bool",
-    "description": "插件加载后自动让机器人进服",
-    "default": true
+    "description": "插件加载后自动让机器人进服。**默认关闭**：第一次装好时请先填好服务器地址、再打开这个开关（或用 mc进服 指令手动进）",
+    "default": false
   },
   "reply_in_game": {
     "type": "bool",
@@ -145,28 +153,50 @@
   },
   "slow_mode": {
     "type": "bool",
-    "description": "反作弊保守模式：移动更慢、关闭跑酷，适合有反作弊插件的服务器",
+    "description": "反作弊保守模式：移动更慢、关闭跑酷、跳跃更少。**进带反作弊插件的服务器（Grim / Vulcan / 严格 NCP）请打开**，否则可能被踢或误判",
     "default": false
   },
   "dig_whitelist": {
     "type": "list",
-    "description": "允许挖掘的方块白名单（留空=不限制）。用于领地/主城保护场景",
-    "default": []
+    "description": "允许挖掘的方块白名单。**留空 = 机器人可以挖掉你世界里任何方块（基岩等已在黑名单里除外）**。想保护建筑/领地就填上允许的方块名",
+    "default": [
+      "stone",
+      "cobblestone",
+      "deepslate",
+      "cobbled_deepslate",
+      "dirt",
+      "grass_block",
+      "sand",
+      "gravel",
+      "clay",
+      "oak_log",
+      "spruce_log",
+      "birch_log",
+      "jungle_log",
+      "acacia_log",
+      "dark_oak_log",
+      "oak_leaves",
+      "spruce_leaves",
+      "birch_leaves",
+      "andesite",
+      "diorite",
+      "granite",
+      "netherrack"
+    ]
   },
   "dig_blacklist": {
     "type": "list",
     "description": "禁止挖掘的方块",
-    "default": ["bedrock", "barrier", "command_block"]
+    "default": [
+      "bedrock",
+      "barrier",
+      "command_block"
+    ]
   },
   "spawn_protection_radius": {
     "type": "int",
-    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作",
-    "default": 0
-  },
-  "enable_action_queue": {
-    "type": "bool",
-    "description": "【此项不生效，已固定为开启】长动作一律异步返回 task_id。关掉会让长动作阻塞对话，并破坏「按需激活工具」机制，所以不提供关闭选项",
-    "default": true
+    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作。**默认 16**：出生点通常是玩家建筑最密的地方",
+    "default": 16
   },
   "skill_timeout_seconds": {
     "type": "int",
