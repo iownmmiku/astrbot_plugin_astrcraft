@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 /**
  * 通用收集技能：mc_collect 的实现。
  *
@@ -92,7 +92,11 @@ const BLOCK_ALIASES = {
  * @param {string} o.item 目标物品
  * @param {number} o.count 数量
  */
-async function collect({ actions, nav, state, ctx, item, count = 1, autoDomain = true }) {
+async function collect({ actions, nav, state, ctx, item, count = 1, autoDomain = true, maxAttempts = null }) {
+  // **null 表示"不覆盖"**：委派给 chop_tree / mine_ores / mine_stone 时，
+  // 让它们各自用自己的默认重试次数（那三个的默认值并不一样：24 / 40 / 30）。
+  // 硬塞一个数字会悄悄改掉其中两条路的行为。
+  const attempts = Number(maxAttempts) > 0 ? Number(maxAttempts) : undefined;
   const want = String(item || '').replace(/^minecraft:/, '').toLowerCase();
   const target = Math.max(1, Math.min(256, Number(count) || 1));
   const steps = [];
@@ -114,16 +118,16 @@ async function collect({ actions, nav, state, ctx, item, count = 1, autoDomain =
       result = skillResult(true, { steps, note: `已有 ${already} 个 ${want}` });
       break;
     case 'chop':
-      result = await wood.chopTree({ actions, nav, state, ctx, want: (target - already) * 2 });
+      result = await wood.chopTree({ actions, nav, state, ctx, want: (target - already) * 2, maxAttempts: attempts });
       steps.push(...result.steps);
       break;
     case 'mine': {
       const blockNames = BLOCK_ALIASES[plan.ore] || [plan.ore];
-      result = await wood.mineSpecific({ actions, nav, ctx, blockNames, want: target - already, itemName: want, radius: 40 });
+      result = await wood.mineSpecific({ actions, nav, ctx, blockNames, want: target - already, itemName: want, radius: 40, maxAttempts: attempts });
       steps.push(...result.steps);
       if (!result.ok && plan.type === 'mine' && mining.ORES[plan.ore]) {
         // 普通挖掘失败时退回完整挖矿流程（带工具依赖与下挖）
-        const r2 = await mining.mineOre({ actions, nav, state, ctx, ore: plan.ore, want: target - already });
+        const r2 = await mining.mineOre({ actions, nav, state, ctx, ore: plan.ore, want: target - already, maxAttempts: attempts });
         steps.push(...r2.steps);
         result = r2;
       }

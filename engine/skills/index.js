@@ -47,9 +47,24 @@ const SKILLS = {
   chop_tree: {
     label: '砍树',
     description: '找树砍木材，自动捡起掉落物',
-    params: { count: { type: 'number', min: 1, max: 256, def: 8 } },
+    // **策略参数**（见 skills_docs/strategy.md）：
+    // 原来"找多远、试几次就放弃"是写死在代码里的常量，模型看不到也改不了。
+    // 现在摆出来当参数——它就能根据处境调（比如"这片林子砍光了，找远一点"）。
+    params: {
+      count: { type: 'number', min: 1, max: 256, def: 8 },
+      radius: { type: 'number', min: 8, max: 96, def: 48 },
+      max_attempts: { type: 'number', min: 1, max: 64, def: 24 },
+    },
     async run({ actions, nav, state, ctx, params }) {
-      return wood.chopTree({ actions, nav, state, ctx, want: requireParam(params, 'count', { def: 8 }) });
+      return wood.chopTree({
+        actions,
+        nav,
+        state,
+        ctx,
+        want: requireParam(params, 'count', { def: 8 }),
+        radius: requireParam(params, 'radius', { def: 48 }),
+        maxAttempts: requireParam(params, 'max_attempts', { def: 24 }),
+      });
     },
   },
 
@@ -69,31 +84,78 @@ const SKILLS = {
   mine_ores: {
     label: '挖矿',
     description: '挖指定矿石到指定数量（含工具依赖、向下挖阶梯、安全判断）',
-    params: { ore: { type: 'string', def: 'iron' }, count: { type: 'number', min: 1, max: 256, def: 8 } },
+    // 默认值**必须等于原来的硬编码值**（radius 40、maxAttempts 40），
+    // 否则这就不是"把策略搬到台面上"，而是偷偷改了行为。
+    params: {
+      ore: { type: 'string', def: 'iron' },
+      count: { type: 'number', min: 1, max: 256, def: 8 },
+      radius: { type: 'number', min: 8, max: 96, def: 40 },
+      max_attempts: { type: 'number', min: 1, max: 96, def: 40 },
+    },
     async run({ actions, nav, state, ctx, params }) {
       const ore = requireParam(params, 'ore', { type: 'string', def: 'iron' }).toLowerCase();
       const count = requireParam(params, 'count', { def: 8 });
-      return mining.mineOre({ actions, nav, state, ctx, ore, want: count });
+      return mining.mineOre({
+        actions,
+        nav,
+        state,
+        ctx,
+        ore,
+        want: count,
+        radius: requireParam(params, 'radius', { def: 40 }),
+        maxAttempts: requireParam(params, 'max_attempts', { def: 40 }),
+      });
     },
   },
 
   mine_stone: {
     label: '挖石头',
     description: '挖圆石（建筑与石制工具的基础材料）',
-    params: { count: { type: 'number', min: 1, max: 256, def: 20 } },
+    // 同样：radius 40、maxAttempts 30 是原来 mineStone/mineSpecific 里的值
+    params: {
+      count: { type: 'number', min: 1, max: 256, def: 20 },
+      radius: { type: 'number', min: 8, max: 96, def: 40 },
+      max_attempts: { type: 'number', min: 1, max: 96, def: 30 },
+    },
     async run({ actions, nav, state, ctx, params }) {
-      return mining.mineStone({ actions, nav, state, ctx, want: requireParam(params, 'count', { def: 20 }) });
+      return mining.mineStone({
+        actions,
+        nav,
+        state,
+        ctx,
+        want: requireParam(params, 'count', { def: 20 }),
+        radius: requireParam(params, 'radius', { def: 40 }),
+        maxAttempts: requireParam(params, 'max_attempts', { def: 30 }),
+      });
     },
   },
 
   collect: {
     label: '收集物品',
     description: '通用收集：给定物品名与数量，自动决定去砍/挖/合成/熔炼/打猎',
-    params: { item: { type: 'string', required: true }, count: { type: 'number', min: 1, max: 256, def: 1 } },
+    // collect 会**委派**给 chop_tree / mine_ores / mine_stone 去做，
+    // 那三个技能各自的默认重试次数并不一样（24 / 40 / 30）。
+    // 所以这里留空表示"用被委派技能自己的默认值"——
+    // 硬塞一个 40 会悄悄改掉砍树那条路的行为。
+    params: {
+      item: { type: 'string', required: true },
+      count: { type: 'number', min: 1, max: 256, def: 1 },
+      max_attempts: { type: 'number', min: 1, max: 96, def: 0 },
+    },
     async run({ actions, nav, state, ctx, params }) {
       const item = requireParam(params, 'item', { type: 'string' });
       const count = requireParam(params, 'count', { def: 1 });
-      return gathering.collect({ actions, nav, state, ctx, item, count });
+      const rawAttempts = requireParam(params, 'max_attempts', { def: 0 });
+      return gathering.collect({
+        actions,
+        nav,
+        state,
+        ctx,
+        item,
+        count,
+        // 0 = 不覆盖，交给被委派的技能决定
+        maxAttempts: Number(rawAttempts) > 0 ? Number(rawAttempts) : null,
+      });
     },
   },
 

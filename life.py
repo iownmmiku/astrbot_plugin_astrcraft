@@ -654,7 +654,8 @@ class LifeLoop:
 **关于攻略（load_skill，很有用）**：
 - 遇到多步、容易出错的大事，先用 `mc_load_skill` 读攻略再动手。
   可选：building（盖房）/ tools（从零到石制工具）/ food（吃饱肚子）/
-  mining（安全挖矿）/ combat（打架与自保）/ storage（安顿好家）。
+  mining（安全挖矿）/ combat（打架与自保）/ storage（安顿好家）/
+  blueprint（照着图纸盖房子）/ strategy（**什么时候该放弃、找多远、怎么调这些**）。
 
 **关于走路（重要）**：
 - **走路不会改动世界**（这是有意的设计）。走不通时用 `mc_plan_route` 看

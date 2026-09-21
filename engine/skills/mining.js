@@ -66,7 +66,7 @@ const TIER_INDEX = { wooden: 0, stone: 1, iron: 2, diamond: 3, netherite: 4 };
 /**
  * 挖矿：确保工具 → 找矿 → 挖 → 捡，直到拿到 want 个产物。
  */
-async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radius = 40, autoTool = true, allowSearch = true }) {
+async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radius = 40, maxAttempts = 40, autoTool = true, allowSearch = true }) {
   const steps = [];
   const spec = ORES[ore] || ORES[String(ore).toLowerCase()];
   if (!spec) {
@@ -110,7 +110,7 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
     have,
     want: startHave + want,
     ctx,
-    maxAttempts: 40,
+    maxAttempts,
     label: `挖${ore}`,
     fetchOne: async (attempt) => {
       ctx.checkAborted();
@@ -185,7 +185,7 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
  *   第一阶段只挖真正掉圆石的（stone/cobblestone）——这是做工具和盖房的主力
  *   第二阶段才接受其它石质方块（它们是不错的建材，只是做不了石制工具）
  */
-async function mineStone({ actions, nav, state, ctx, want = 20 }) {
+async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, maxAttempts = 40 }) {
   const strict = await wood.mineSpecific({
     actions,
     nav,
@@ -194,7 +194,8 @@ async function mineStone({ actions, nav, state, ctx, want = 20 }) {
     blockNames: ['stone', 'cobblestone'],
     want,
     itemName: 'cobblestone',
-    radius: 40,
+    radius,
+    maxAttempts,
   });
   if (strict.ok) return strict;
 
@@ -209,7 +210,8 @@ async function mineStone({ actions, nav, state, ctx, want = 20 }) {
     blockNames: STONE_VARIANTS,
     want: stillWant,
     itemNames: STONE_VARIANT_DROPS,
-    radius: 40,
+    radius,
+    maxAttempts,
   });
 
   // 两阶段合并报告：只要任一段有产出就算部分成功

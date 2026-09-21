@@ -26,7 +26,7 @@ function planksOf(logName) {
 /**
  * 砍树：找到最近的树，把树干整根挖掉，直到拿到 want 个原木。
  */
-async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48 }) {
+async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAttempts = 24 }) {
   const steps = [];
   const before = actions.inventoryMap();
   const have = () => LOG_NAMES.reduce((s, n) => s + actions.countItem(n), 0);
@@ -47,7 +47,7 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48 }) {
     have,
     want: startHave + want,
     ctx,
-    maxAttempts: 24,
+    maxAttempts,
     label: '砍树',
     fetchOne: async (attempt) => {
       ctx.checkAborted();
@@ -763,7 +763,7 @@ async function ensurePickaxeDurability({ actions, nav, state, ctx, need = 10 }) 
   return false;
 }
 
-async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want, itemName = null, itemNames = null, radius = 40, allowSearch = true }) {
+async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want, itemName = null, itemNames = null, radius = 40, maxAttempts = 40, allowSearch = true }) {
   const steps = [];
   const before = actions.inventoryMap();
   // **要数哪些物品**：早期只数 itemName 一个名字，导致"挖了 18 个石质方块却判定为
@@ -778,7 +778,7 @@ async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want,
     have,
     want: startHave + want,
     ctx,
-    maxAttempts: 30,
+    maxAttempts,
     label: `挖${target}`,
     fetchOne: async (attempt) => {
       ctx.checkAborted();
