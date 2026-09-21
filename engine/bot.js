@@ -1592,6 +1592,21 @@ class McEngine {
           });
           self.setDetail(result && result.note ? result.note : null);
           return result;
+        } catch (err) {
+          // **技能抛异常时把调用栈写进日志**。
+          //
+          // 为什么值得单独做：像 "Cannot read properties of null (reading 'y')"
+          // 这种报错，光看消息**定位不了是哪一行**（实测出现过 46 次，
+          // 排查了很久才靠这个找到 wood.js 的回调）。栈里第一帧就是现场。
+          if (err && err.stack) {
+            const frames = String(err.stack)
+              .split('\n')
+              .filter((l) => l.includes('skills/') || l.includes('bot\\') || l.includes('bot/'))
+              .slice(0, 3)
+              .map((l) => l.trim());
+            log.warn(`技能「${def.label || skill}」抛异常：${err.message}｜现场：${frames.join(' ← ')}`);
+          }
+          throw err;
         } finally {
           this.state.unpin(`${def.label || skill}：`);
           // 清理进度 pin：state.unpin 是按完整文本匹配的，这里做一次兜底清理

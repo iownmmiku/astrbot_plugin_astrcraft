@@ -121,6 +121,20 @@ async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label =
       fails += 1;
       lastError = describeFailure(err);
       log.debug(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
+      // **带调用栈，而且要用 warn 级别**。
+      //
+      // 这类"某个变量是 null"的报错只看消息定位不了是哪一行
+      // （实测 "Cannot read properties of null (reading 'y')" 出现过 46 次）。
+      // 第一次写成 debug，结果默认 info 级别下**根本没打出来**，
+      // 白等了一轮复现。只打第一次，避免 4 次重试刷 4 条。
+      if (fails === 1 && err && err.stack) {
+        const frames = String(err.stack)
+          .split('\n')
+          .filter((l) => l.includes('skills/') || l.includes('skills\\') || l.includes('bot/') || l.includes('bot\\'))
+          .slice(0, 3)
+          .map((l) => l.trim());
+        log.warn(`${label} 失败现场：${err.message}｜${frames.join(' ← ')}`);
+      }
       if (fails >= 4) break;
       await delay(400, { signal: ctx.signal });
     }
