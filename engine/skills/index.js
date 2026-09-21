@@ -21,6 +21,7 @@ const mining = require('./mining');
 const building = require('./building');
 const gathering = require('./gathering');
 const blueprint = require('./blueprint');
+const traverse = require('./traverse');
 // **`vec3` 和 `log` 必须显式引入**——climb_out 里要用。
 // 我第一版直接用了这两个名字（以为在作用域里），实际没有 import：
 // `node --check` 抓不到（它们是合法标识符），只会在运行到那一行时 ReferenceError。
@@ -375,6 +376,52 @@ const SKILLS = {
         note: `捡回来了：${names.map(([k, v]) => `${k}×${v}`).join('、')}`,
         produced: got,
         extra: { went: true, arrived: true, gained: got },
+      });
+    },
+  },
+
+  pave: {
+    label: '铺路/垫高',
+    description:
+      '主动改造地形：往前逐格垫方块（跨过坑、岩浆、水），或者垂直垫高自己。' +
+      '**走不过去又不想挖的时候用这个**',
+    params: {
+      direction: { type: 'string', def: 'forward' }, // forward | up
+      count: { type: 'number', min: 1, max: 32, def: 4 },
+      item: { type: 'string', def: '' },
+    },
+    async run({ actions, nav, ctx, params }) {
+      return traverse.pave({
+        actions,
+        nav,
+        ctx,
+        direction: String(params.direction || 'forward'),
+        count: requireParam(params, 'count', { def: 4 }),
+        item: params.item || null,
+      });
+    },
+  },
+
+  dig_path: {
+    label: '挖通一条路',
+    description:
+      '把通往目标的挡路方块**真的挖掉**再走过去。mc_plan_route 只说"要挖哪几格"，' +
+      '这个技能一次把整条路挖通（走不通、被方块挡住时用它）',
+    params: {
+      x: { type: 'number', required: true },
+      y: { type: 'number', def: null },
+      z: { type: 'number', required: true },
+      max_blocks: { type: 'number', min: 1, max: 48, def: 8 },
+    },
+    async run({ actions, nav, ctx, params }) {
+      return traverse.digPath({
+        actions,
+        nav,
+        ctx,
+        x: requireParam(params, 'x', {}),
+        y: params.y === undefined || params.y === null || params.y === '' ? null : Number(params.y),
+        z: requireParam(params, 'z', {}),
+        maxBlocks: requireParam(params, 'max_blocks', { def: 8 }),
       });
     },
   },

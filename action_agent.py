@@ -109,6 +109,11 @@ ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在�
 | 要存东西 | `mc_store_items()` | 一格一格搬 |
 | 要熔炼 | `mc_smelt(item="iron_ingot", count=3)` | 一个个烧 |
 | 要吃饭 | `mc_cook_food()` 或 `mc_supply` | 一步步找食材 |
+| **掉进坑里/出不来** | `mc_climb_out()` | 硬走（**2 格以上跳不上去，走不出来的**） |
+| **前面过不去（坑/沟/岩浆）** | `mc_pave(direction="forward", count=4)` | 硬走 |
+| **要上高处但跳不上去** | `mc_pave(direction="up", count=3)` | 硬跳 |
+| **走不到、被方块挡住** | `mc_dig_path(x, z, max_blocks=8)` | mc_mine 一格一格挖 |
+| **死了要回去捡东西** | `mc_recover_drops(x, y, z, age_seconds)` | 硬走（它会告诉你值不值得去） |
 
 （想看完整技能清单就调 `mc_skills`。）
 

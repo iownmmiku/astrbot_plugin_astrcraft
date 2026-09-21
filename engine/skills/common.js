@@ -714,4 +714,8 @@ module.exports = {
   climbToSurface,
   isUnderground,
   isDangerousBlock,
+  // **垫脚上升要导出**（B 批次）：pave 的"垂直垫高"要复用它。
+  // 不导出的话只能复制一份——而它的时序很讲究（跳起来、等真离地 0.7 格以上、
+  // 趁空中往脚下放，站地上放会被服务端拒绝），复制一份必然会走样。
+  pillarUpOne,
 };

@@ -345,6 +345,64 @@ class McSkillTools:
             f"回去捡掉落物（{int(x)}, {int(y)}, {int(z)}）",
         )
 
+    @filter.llm_tool(name="mc_pave")
+    async def tool_mc_pave(
+        self,
+        event: AstrMessageEvent,
+        direction: str = "forward",
+        count: int = 4,
+        item: str = "",
+    ) -> MessageEventResult:
+        """主动改造地形：往前逐格垫方块，或者垂直垫高自己。
+
+        **什么时候用它**：
+          · 前面是坑/沟/岩浆/水，走不过去又不想挖 → `direction="forward"`
+          · 需要上到高处但跳不上去（1 格以上）→ `direction="up"`（垫脚上升）
+          · 目标在 2 格高的台子上，而 mc_climb_out 又挖不动 → 用 up 垫上去
+
+        背包里得有方块（石头/泥土/木板都行）；没有会直接告诉你。
+
+        Args:
+            direction(string): forward（往前铺）或 up（垂直垫高），默认 forward
+            count(number): 铺/垫几格，默认 4
+            item(string): 用哪种方块，留空就自己挑（优先圆石/泥土/木板）
+        """
+        return await self._submit_skill(
+            event,
+            "pave",
+            {"direction": str(direction or "forward"), "count": int(count), "item": str(item or "")},
+            f"铺路/垫高（{direction}，{count} 格）",
+        )
+
+    @filter.llm_tool(name="mc_dig_path")
+    async def tool_mc_dig_path(
+        self,
+        event: AstrMessageEvent,
+        x: float,
+        y: float = None,
+        z: float = 0,
+        max_blocks: int = 8,
+    ) -> MessageEventResult:
+        """把通往目标的挡路方块**真的挖掉**，然后走过去。
+
+        **和 mc_plan_route 的区别**：那个只说"要挖哪几格"，真正挖要靠 mc_mine 一格一格来
+        （一轮最多几步，挖不通一条路）。这个一次把整条路挖通。
+
+        **什么时候用它**：走不到某个地方、报错里说"挡路的大概是 stone×3"的时候。
+
+        Args:
+            x(number): 目标 x
+            y(number): 目标 y（可省略）
+            z(number): 目标 z
+            max_blocks(number): 最多挖几格，默认 8（防止一次挖穿半座山）
+        """
+        params = {"x": float(x), "z": float(z), "max_blocks": int(max_blocks)}
+        if y is not None:
+            params["y"] = float(y)
+        return await self._submit_skill(
+            event, "dig_path", params, f"挖通到 ({int(x)}, {int(z)})"
+        )
+
     @filter.llm_tool(name="mc_supply")
     async def tool_mc_supply(self, event: AstrMessageEvent) -> MessageEventResult:
         """让机器人做一次生存补给：准备食物 + 补齐工具 + 做火把。适合出远门前用。"""
