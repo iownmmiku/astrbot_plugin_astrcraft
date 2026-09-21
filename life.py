@@ -1600,15 +1600,28 @@ class LifeLoop:
         # 模型往返的耗时主要取决于输入大小，这是我们能控制的。
         _prep_ms = _marks[-1][1] * 1000 if _marks else 0
         _detail = "，".join(f"{k} {v * 1000:.0f}ms" for k, v in _marks)
+        # **别在这里重建工具集**：`_toolset()` 每次都重新遍历 func_list 构建一个
+        # ToolSet —— 虽然只是微秒级，但**我自己在日志里又调了一次**纯属浪费，
+        # 而且写日志不该有副作用。工具数从注册表直接数就行。
+        _tool_count = 0
+        try:
+            mgr = getattr(getattr(self.action_agent, "plugin", None), "context", None)
+            mgr = getattr(mgr, "provider_manager", None)
+            mgr = getattr(mgr, "llm_tools", None)
+            for t in getattr(mgr, "func_list", []) or []:
+                if str(getattr(t, "name", "")).startswith("mc_"):
+                    _tool_count += 1
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(
             "决策耗时：准备 %.0fms（%s）+ 模型 %.0fms = 共 %.0fms；"
-            "提示词 %d 字符，工具 %d 个，本轮调了 %d 次工具",
+            "提示词 %d 字符，工具约 %d 个，本轮调了 %d 次工具",
             _prep_ms,
             _detail,
             _model_ms,
             _prep_ms + _model_ms,
             len(prompt) + len(system) + len(ACTION_PROMPT),
-            len(agent._toolset().tools) if hasattr(agent, "_toolset") and agent._toolset() else 0,
+            _tool_count,
             len(used),
         )
 
