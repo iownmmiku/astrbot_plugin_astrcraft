@@ -716,6 +716,19 @@ class McEngine {
     if (this._currentReflexRunning) return;
     this._currentReflexRunning = true;
     try {
+      // **审计用：记下这一 tick 里"她做了什么"**。
+      //
+      // 为什么要这个：用户反馈"很多无意义的动作"，但光看代码看不出到底是谁在动她。
+      // 这里把反射层**每一次真正动手**都记进一个环形缓冲，
+      // 用 `debug.reflexAudit` 就能数出"一分钟里她自己动了几次、分别是什么"。
+      // 审计完可以关掉（audit 只在 debug 级别打印）。
+      this._reflexAudit = this._reflexAudit || [];
+      const audit = (what) => {
+        this._reflexAudit.push({ at: Date.now(), what });
+        if (this._reflexAudit.length > 200) this._reflexAudit.splice(0, 100);
+        log.debug(`反射动作：${what}`);
+      };
+      this._auditReflex = audit;
       // **"环境行为"只在完全没别的事时才做**（按「本能 vs 策略」的分层）。
       //
       // 机制该分成两类：

@@ -118,15 +118,31 @@ async def main() -> None:
     n0 = len(acts)
     check("循环能自己跑起来并做出决定", n0 >= 1, f"30 秒内行动 {n0} 次")
 
-    print("\n--- 唤醒：任务结束应立刻继续想 ---")
-    loop._busy_until = time.time() + 300  # 模拟"刚提交技能后的等待期"
+    print("\n--- 唤醒：任务结束会继续想，但要过承诺间隔 ---")
+    # **契约变了，说明为什么。**
+    #
+    # 原来断言"唤醒后 4 秒内立刻继续想"——那正是**乱走乱挖的来源**：
+    # 模型用短动作干活时（一次 mc_goto 一两秒就完），task.finished 会立刻唤醒她，
+    # 于是她的决策节奏变成每几秒一次，每决策一次就可能改主意。
+    # 现在加了"两次决策之间的最小间隔"（life_min_decide_gap，默认 6 秒），
+    # 让一个打算至少能连续执行几步。所以新的契约是：
+    #   - **要等过 gap**（不能立刻改主意）
+    #   - **但不必等满 decide_interval**（不能退回到"190 秒才动一下"那个毛病）
+    loop._busy_until = time.time() + 300
     loop.wake(reason="测试：任务结束")
-    await asyncio.sleep(4)
-    gained = len(acts) - n0
+    await asyncio.sleep(3)
+    early = len(acts) - n0
     check(
-        "唤醒后 4 秒内就继续想（不必等满间隔）",
-        gained > 0,
-        f"新增 {gained} 次行动",
+        "唤醒后不会立刻改主意（承诺间隔内不重新决策）",
+        early == 0,
+        f"3 秒内新增 {early} 次（gap 是 6 秒，这里应该还是 0）",
+    )
+    await asyncio.sleep(10)
+    later = len(acts) - n0
+    check(
+        "过了承诺间隔就继续想（不必等满 8 秒间隔）",
+        later > 0,
+        f"13 秒内新增 {later} 次行动",
     )
 
     print("\n--- 对照：她正忙的时候不要打扰 ---")

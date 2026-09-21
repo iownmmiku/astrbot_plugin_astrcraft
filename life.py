@@ -117,6 +117,7 @@ class LifeLoop:
         is_connected: Callable[[], bool] | None = None,
         state_provider: Callable[[], Awaitable[dict]] | None = None,
         decide_interval: float = 90.0,
+        min_decide_gap: float = 6.0,
         share_cooldown: float = 600.0,
     ):
         self._call = engine_call
@@ -173,6 +174,11 @@ class LifeLoop:
         self._todos: list[dict] = []
 
         self._decide_interval = decide_interval
+        # 两次决策之间的最小间隔（"承诺机制"，见 _loop 里的说明）。
+        # **必须是构造参数**：life.py 这个模块没有 _cfg（配置读取在 main.py），
+        # 我第一版写成 self._cfg(...) → AttributeError 被循环的 except 吞掉 →
+        # 每 8 秒重试一次、**永远不决策**（test_life_rhythm 立刻抓到："30 秒内行动 0 次"）。
+        self._min_decide_gap = float(min_decide_gap or 0)
         self._share_cooldown = share_cooldown
         self._last_share_at = 0.0
         self._last_decide_at = 0.0
@@ -432,6 +438,23 @@ class LifeLoop:
                     pass
                 if self._stopped:
                     break
+
+                # **承诺机制：两次决策之间有一个最小间隔。**
+                #
+                # 为什么要这个（这是"乱走乱挖"的主要来源）：
+                # `task.finished` 会立刻唤醒她继续想，而模型用**短动作**干活时
+                # （一次 mc_goto / mc_craft 一两秒就完），于是她的决策节奏变成
+                # **每几秒一次**。每决策一次就可能改主意 → 玩家看到的就是
+                # "她一直在乱走、换个没完"。
+                #
+                # 真人的节奏不是这样：做完一个小动作不会立刻重新规划人生。
+                # 这里设一个下限（默认 6 秒），让一个"打算"至少能连续执行几步。
+                # 长任务不受影响——它们在跑的时候本来就不会走到这里（见下面的 busy）。
+                gap = self._min_decide_gap
+                since = time.time() - (self._last_decide_at or 0)
+                if gap > 0 and since < gap:
+                    await asyncio.sleep(min(gap - since, 3.0))
+                    continue
 
                 self.drives.tick()
                 self.drives.save()

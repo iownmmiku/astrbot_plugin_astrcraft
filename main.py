@@ -240,6 +240,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             is_connected=lambda: self.connected,
             state_provider=self._life_state_snapshot,
             decide_interval=float(self._cfg("life_decide_interval", 20) or 20),
+            # 两次决策之间的最小间隔（"承诺机制"）：避免她被"任务完成"反复唤醒、
+            # 每几秒改一次主意（那是"乱走乱挖"的主要来源）。0 = 关掉。
+            min_decide_gap=float(self._cfg("life_min_decide_gap", 6) or 0),
             share_cooldown=float(self._cfg("life_share_cooldown", 600) or 600),
         )
         self.life.bind_data_dir(self._data_dir)
