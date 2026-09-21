@@ -287,13 +287,6 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 引擎监管：崩了自动拉起（引擎进程是长期依赖，不能等用户手动重启）
         self._supervise_task = asyncio.create_task(self._supervise_loop(), name="mc-engine-supervise")
 
-        # 配置里若有"不生效"的项，明确说出来——静默忽略最坑人
-        if not self._cfg("enable_action_queue", True):
-            logger.warning(
-                "enable_action_queue=false 不会生效：长动作必须异步返回 task_id，"
-                "否则会阻塞对话并破坏「按需激活工具」机制。此项已固定为开启",
-            )
-
         # 兜底：即使 on_astrbot_loaded 钩子没触发（某些版本/加载路径下可能不触发），
         # 也要在稍后把工具绑定补上——initialize 执行时工具往往还没注册完。
         for delay in (5, 15, 40):

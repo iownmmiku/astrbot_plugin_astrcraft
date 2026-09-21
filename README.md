@@ -38,13 +38,20 @@ Astrcraft：木头砍够了，工作台也摆好了，镐子也顺手做了。
 
 ### 1. 装插件
 
-把 `plugin/` 整个目录放进 AstrBot 的插件目录，重命名为 `astrbot_plugin_astrcraft`：
+**可以直接把整个仓库克隆进插件目录**（仓库根目录就是插件本体，`metadata.yaml` / `main.py` 都在根上）：
 
+```bash
+cd <AstrBot 数据目录>/data/plugins
+git clone https://github.com/iownmmiku/astrbot_plugin_astrcraft.git
 ```
-<AstrBot 数据目录>/data/plugins/astrbot_plugin_astrcraft/
-```
+
+或者手动复制：把仓库**根目录的 `.py` 文件 + `metadata.yaml` + `_conf_schema.json` + `skills_docs/`**
+放进 `<AstrBot 数据目录>/data/plugins/astrbot_plugin_astrcraft/`。
 
 然后在 AstrBot 里**重载插件**。
+
+> **不需要装任何 Python 依赖**——插件只用 AstrBot API + 标准库。
+> 只有 Node 引擎需要 `npm install`（下一步）。
 
 ### 2. 装引擎依赖
 
@@ -73,6 +80,9 @@ mc进服
 ```
 
 看到 `机器人已进服：xxx @ 1.20.1` 就成了。
+
+> **注意：默认不会自动进服**（`auto_connect` 默认关——避免第一次装上时服务器地址还没填就乱连）。
+> 确认能正常进服之后，可以在插件配置里把它打开。
 
 ### 6. 让它干活
 
@@ -129,7 +139,7 @@ Minecraft 服务器
 ## 目录结构
 
 ```
-plugin/          AstrBot 插件（Python）
+<仓库根目录> = 插件本体（AstrBot 要求 metadata.yaml / main.py 在根目录）
   main.py            插件主体、引擎生命周期、事件转发
   life.py            「过日子」循环：观察 → 决定 → 行动
   action_agent.py    ReAct：让模型用工具直接驱动它
@@ -138,14 +148,32 @@ plugin/          AstrBot 插件（Python）
   llm_tools_*.py     50+ 个 LLM 工具
   skills_docs/       攻略（Markdown，模型按需读）
 
-engine/          Node 引擎（mineflayer）
+engine/              Node 引擎（mineflayer）
   bot.js             引擎主体、本能层、诊断视图
   movement.js        寻路、卡住脱困、悬崖保护
   actions.js         挖掘/放置/合成/熔炼/容器
   skills/            技能：砍树、挖矿、建造、蓝图、采集…
   stations.js        工作站记忆
   humanize.js        拟人化：渐进转头、变速行走、空闲环顾
+
+dev-tools/           开发用的测试与探针（**不参与运行**，可删）
+docs/                详细文档（能力边界、安装、模块图）
 ```
+
+---
+
+## 已知问题
+
+这一节是**如实告知**，不是免责声明。完整清单见 [docs/LIMITS.md](docs/LIMITS.md)。
+
+| 问题 | 表现 | 现状 |
+|---|---|---|
+| **复杂地形长距离寻路** | 在起伏大的丛林里可能"找不到路、原地不动" | 超平坦世界稳定通过；引擎会**如实报错并给出"要挖哪几格"**，不会假装到达 |
+| **合成偶发失败** | 约 1/6 的运行里，**合成工作台**这一步失败 | mineflayer ↔ 服务端窗口状态机的固有脆弱点；有 3 轮复位重试兜底，失败会如实报错 |
+| **从高处坠落的自救** | 能检测到（下落速度判断准确），但**倒水/垫方块在服务端不被接受** | **未解决**。建议靠提前预防：`mc_check_danger` 能扫出悬崖和岩浆 |
+| **正版账号登录** | 默认走离线账号 | 正版需要额外配置，**未端到端验证** |
+| **模组服** | 只支持原版 / Paper / Spigot 类服务端 | mineflayer 需要模组注册表适配，工作量大 |
+| **每步都要过一次模型** | 模型慢 → 它的反应就慢 | 这是"LLM 真正控制角色"的代价；换更快的模型端点最有效 |
 
 ---
 

@@ -1,6 +1,5 @@
-# 依赖与构建产物（用户自己 npm install）
+﻿# 依赖与构建产物（用户自己 npm install）
 node_modules/
-package-lock.json
 
 # Python
 __pycache__/
