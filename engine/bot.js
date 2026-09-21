@@ -549,15 +549,23 @@ class McEngine {
     // 反射层：1 秒一次，纯本地规则，不经过 LLM
     // 反射层：默认 **1 秒**一次（可用 MC_REFLEX_MS 调快）。
     //
-    // **身体层设计里的 S1（提到 200ms）试过，但回退了**——原因是它打破了
-    // 一个已验证的能力：`test_unstuck` 的"完全被埋住时能自救"连续 3 次失败
-    // （原来稳定 3/3）。脱困逻辑里有一串**按秒调过的时间常数**
-    // （8 秒节流、2 秒二次确认、60 秒降频），反射层变快 5 倍之后这些常数的
-    // 相对关系变了，行为跟着变。
+    // 本能的最坏延迟是 1 秒——被怪贴脸、溺水、着火都可能等满 1 秒，
+    // 而"错过一秒就必死"的坠落早就证明 1 秒太慢（所以 MLG 单独拆到 100ms）。
+    // 身体层设计里的 S1 就是要把这个提上去。
     //
-    // 所以 S1 不是"改个数字"那么简单：**要连同那些时间常数一起重新调**，
-    // 并且每调一次都要重跑 test_unstuck。见 docs/BODY_LAYER.md 的 S1。
-    // 在那之前，默认保持 1 秒——**不发布一个破坏已验证能力的东西**。
+    // **S1 现在做了一半**：
+    //   ✅ 找到并修掉了真正的阻碍——脱困的"二次确认"原来用**方块的确切坐标**
+    //      当 key，而她被埋住时会被服务器推动、坐标一直微动 → 确认永远凑不齐两次。
+    //      换成"被几格围住 + 都是什么方块"（不含坐标）之后，
+    //      200ms 下能连过 3 次（修之前是连续 3 次失败）。
+    //   ⚠️ 但把默认值提到 200ms **还没定**：`test_unstuck` 本身对时序敏感，
+    //      5 次采样下 200ms 是 3/5、1000ms 是 4/5——**样本太小，
+    //      差异在噪音范围内**，不足以证明 200ms 不会让脱困变差。
+    //      （对照还测了 500ms：1/3；300ms：3/3——这个分布没有机制上的解释，
+    //        更说明是测试本身不稳。）
+    //
+    // 所以：**默认仍是 1 秒**，等用更大的样本把 200ms 验稳了再改。
+    // 想自己试：MC_REFLEX_MS=200。
     const reflexMs = Math.max(50, Number(process.env.MC_REFLEX_MS || 1000) || 1000);
     this._reflexTimer = setInterval(() => {
       this._reflexTick().catch((err) => log.debug(`反射层异常：${err.message}`));
@@ -784,10 +792,21 @@ class McEngine {
         const now = Date.now();
         if (stuckList && stuckList.length) {
           const stuckBlock = stuckList[0];
-          const key = stuckList
-            .map((c) => `${c.x},${c.y},${c.z}`)
-            .sort()
-            .join('|');
+          // **二次确认用的 key 不能是"方块的确切坐标"。**
+          //
+          // 踩过：原来 key 是 `${x},${y},${z}`，而她在被埋住时会被服务器**推动**
+          // （位置一直微动，所以"卡住的那一格"坐标会变）→ 确认永远凑不齐两次 →
+          // 脱困不触发。1 秒反射时这个概率小，把反射提速到 200ms 之后
+          // 立刻暴露出来（test_unstuck 的"完全被埋住"连续 3 次失败）。
+          //
+          // 现在用**稳定的状态描述**当 key：被几格围住 + 都是什么方块，
+          // 不含坐标。位置微动不会让它变。
+          const key =
+            `${stuckList.length}:` +
+            stuckList
+              .map((c) => c.name)
+              .sort()
+              .join(',');
           const confirmed = this._unstuckPending && this._unstuckPending.key === key;
           if (!confirmed) {
             this._unstuckPending = { key, at: now };
