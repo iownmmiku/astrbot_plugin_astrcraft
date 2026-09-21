@@ -1517,18 +1517,34 @@ class LifeLoop:
         if agent is None:
             return False
 
+        # **计时**（用户反馈"每次停下来思考的时间太长了"）：
+        # 决策前的准备工作（状态简报 / 生存建议 / 知识库检索）**每轮都做**，
+        # 而且都是 await —— 但我之前**不知道它们各花多久**，改的时候只能猜。
+        # 这里把每一段和"模型本身花了多久"分开打出来，
+        # 这样"想得慢"到底慢在哪一段是有数据的，不是感觉。
+        import time as _t
+
+        _t0 = _t.perf_counter()
+        _marks: list[tuple[str, float]] = []
+
+        def _mark(label: str) -> None:
+            _marks.append((label, _t.perf_counter() - _t0))
+
         suggestion = self.drives.suggest_activity()
+        _mark("心情")
         brief = await self._brief()
+        _mark("状态简报（引擎 RPC）")
         advice_text = ""
         try:
             advice = await self._build_advice()
             advice_text = self._render_advice(advice) if advice else ""
         except Exception as exc:  # noqa: BLE001
             logger.debug("拼生存建议失败：%s", exc)
+        _mark("生存建议")
 
         recent_text = self._render_recent()
         # **把她自己学到的经验摆到面前**（按当前处境检索，最相关的几条）。
-        # 这是"她会学着怎样做更好"的落地点：知识库里的教训会在下一轮出现。
+        # 这是"她会学着怎样做更好的"落地点：知识库里的教训会在下一轮出现。
         learned = ""
         if self.knowledge is not None:
             try:
@@ -1536,6 +1552,7 @@ class LifeLoop:
                 learned = self.knowledge.render_for_prompt(query)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("检索知识库失败：%s", exc)
+        _mark("知识库检索")
 
         # **插话注入点**（W4）：主人的话和世界事件在"组装提示词"这一刻注入——
         # 这是我们的安全注入点（agent 每一轮都重新组装提示词，
@@ -1568,12 +1585,32 @@ class LifeLoop:
         system = await self._system_prompt()
         from .action_agent import ACTION_PROMPT
 
+        _mark("拼提示词")
+        _t_model = _t.perf_counter()
         summary, used = await agent.act(
             prompt=prompt,
             system=f"{system}\n\n{ACTION_PROMPT}",
         )
+        _model_ms = (_t.perf_counter() - _t_model) * 1000
         if summary is None and not used:
             return False  # agent 不可用 → 退回旧路径
+
+        # **把"想得慢"的账算清楚**（用户反馈"每次停下来思考的时间太长了"）：
+        # 准备工作 vs 模型本身分开报，而且带上"发了多大的提示词"——
+        # 模型往返的耗时主要取决于输入大小，这是我们能控制的。
+        _prep_ms = _marks[-1][1] * 1000 if _marks else 0
+        _detail = "，".join(f"{k} {v * 1000:.0f}ms" for k, v in _marks)
+        logger.info(
+            "决策耗时：准备 %.0fms（%s）+ 模型 %.0fms = 共 %.0fms；"
+            "提示词 %d 字符，工具 %d 个，本轮调了 %d 次工具",
+            _prep_ms,
+            _detail,
+            _model_ms,
+            _prep_ms + _model_ms,
+            len(prompt) + len(system) + len(ACTION_PROMPT),
+            len(agent._toolset().tools) if hasattr(agent, "_toolset") and agent._toolset() else 0,
+            len(used),
+        )
 
         if used:
             logger.info("她自己动手做了 %d 件事：%s", len(used), "、".join(used[:8]))
