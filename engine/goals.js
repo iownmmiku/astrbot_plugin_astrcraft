@@ -136,6 +136,17 @@ class TaskQueue {
     this._pumpScheduled = false;
     this._paused = false;
     this._stats = { submitted: 0, completed: 0, failed: 0, cancelled: 0, preempted: 0 };
+
+    // **防抖动三件套的阈值**（身体层设计 S4，见 docs/BODY_LAYER.md）。
+    // 想调就改这里，或者构造时传进来。
+    /** 一个任务刚开始这么多毫秒内不许被抢（避免被掐死在起跑线上） */
+    this.minOccupancyMs = 1500;
+    /** 同一个本能两次抢占之间至少隔这么久 */
+    this.preemptCooldownMs = 2000;
+    /** 一个任务被抢超过这么多次就不再让位，改为如实报告"我被反复打断" */
+    this.maxPreemptsPerTask = 5;
+    /** 本能名 → 上次抢占时间（冷却用） */
+    this._lastPreemptByName = new Map();
   }
 
   get current() {
@@ -148,6 +159,61 @@ class TaskQueue {
 
   get stats() {
     return { ...this._stats };
+  }
+
+  /**
+   * **防抖动三件套**（身体层设计 S4，见 docs/BODY_LAYER.md）。
+   *
+   * 返回 true = 这次抢占被拦下（新任务排队等，不抢）。
+   *
+   * 为什么需要：抢占本身会抖动——本能反复抢、任务反复重启，
+   * 从外面看就是"她一直在原地折腾"。三条防护：
+   *
+   *   ① **最小占用时间**：一个任务刚开始 N 毫秒内不许被抢。
+   *      否则一个"每秒检查一次"的本能会把每个任务都掐死在起跑线上。
+   *   ② **抢占冷却**：同一个本能两次抢占之间至少隔 M 毫秒。
+   *      避免"抢了又失败、失败了又抢"的死循环。
+   *   ③ **抢占次数上限**：一个任务被抢超过 K 次就不再让它被抢，
+   *      而且**如实报告**"我被反复打断"——而不是无限重启。
+   *      这一条用的是 S3 加的 preemptCount。
+   */
+  _thrashGuard(task) {
+    const now = Date.now();
+    const cur = this._current;
+    if (!cur) return false;
+
+    // ① 最小占用时间：刚开跑的任务先让它跑一会儿
+    const held = cur.startedAt ? now - cur.startedAt : 0;
+    if (held < this.minOccupancyMs) {
+      log.debug(
+        `防抖动：${cur.name} 才跑了 ${held}ms（< ${this.minOccupancyMs}ms），${task.name} 先排队`,
+      );
+      return true;
+    }
+
+    // ② 抢占冷却：同一个本能别连着抢
+    const last = this._lastPreemptByName.get(task.name) || 0;
+    if (now - last < this.preemptCooldownMs) {
+      log.debug(
+        `防抖动：${task.name} 上次抢占才过 ${now - last}ms` +
+          `（< ${this.preemptCooldownMs}ms），这次先排队`,
+      );
+      return true;
+    }
+
+    // ③ 抢占次数上限：被抢太多次就别再抢了，如实说
+    if ((cur.preemptCount || 0) >= this.maxPreemptsPerTask) {
+      log.warn(
+        `防抖动：「${cur.name}」已经被抢 ${cur.preemptCount} 次（上限 ${this.maxPreemptsPerTask}），` +
+          `这次不再让位——${task.name} 排队等它做完。` +
+          `（如果它一直做不完，说明它自己卡住了，该看的是它，不是继续抢）`,
+      );
+      cur.reportThrashed = true;
+      return true;
+    }
+
+    this._lastPreemptByName.set(task.name, now);
+    return false;
   }
 
   /**
@@ -173,6 +239,12 @@ class TaskQueue {
       if (isReflexLevel && currentIsProtected) {
         // 普通反射遇上用户指令：不抢占，排到后面去做
         log.debug(`反射任务 ${task.name} 让位于正在执行的用户任务 ${this._current.name}`);
+      } else if (this._thrashGuard(task)) {
+        // **防抖动（身体层设计 S4）拦下了这次抢占**，新任务排队等
+        // （_thrashGuard 里已经打了日志说明原因）
+        this._queue.push(task);
+        this._sortQueue();
+        this._schedule();
       } else {
         log.info(`任务 ${task.name}(${task.id}) 抢占 ${this._current.name}(${this._current.id})`);
         this._stats.preempted += 1;
@@ -187,6 +259,8 @@ class TaskQueue {
         // "我被反复打断"（S4 的上限判断要用它）。
         victim.preemptCount = (victim.preemptCount || 0) + 1;
         victim.preemptedBy = task.name;
+        victim.lastPreemptAt = Date.now();
+        task.startedAt = task.startedAt || Date.now();
         log.warn(
           `「${victim.name}」被「${task.name}」抢走身体（第 ${victim.preemptCount} 次），` +
             `已放回队头——重新跑会从"已经做到哪"接着做，不会白费`,

@@ -1681,6 +1681,10 @@ class McEngine {
       // 被反复打断时就能如实报告，而不是让人以为"任务莫名其妙重启了"。
       preempt_count: task.preemptCount || 0,
       preempted_by: task.preemptedBy || null,
+      // **被反复打断**（S4 的抢占上限触发过）：这时它已经不再让位，
+      // 上层应该如实告诉 LLM/用户"这件事被反复打断，问题可能在它自己卡住了"，
+      // 而不是继续抢、继续重启。
+      thrashed: !!task.reportThrashed,
     };
     this.state.setCurrentTaskText(null);
     this._emit('task.finished', payload);
