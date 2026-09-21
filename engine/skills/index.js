@@ -288,6 +288,97 @@ const SKILLS = {
     },
   },
 
+  recover_drops: {
+    label: '回去捡掉落物',
+    description:
+      '走回死亡地点，把掉在那儿的东西捡回来。**会自动判断值不值得去**：' +
+      '掉落物大约 5 分钟就消失，太远或太久它会直接告诉你别去了',
+    params: {
+      x: { type: 'number', required: true },
+      y: { type: 'number', required: true },
+      z: { type: 'number', required: true },
+      age_seconds: { type: 'number', min: 0, max: 3600, def: 0 },
+      radius: { type: 'number', min: 2, max: 16, def: 8 },
+    },
+    async run({ actions, nav, state, ctx, params }) {
+      const x = requireParam(params, 'x', {});
+      const y = requireParam(params, 'y', {});
+      const z = requireParam(params, 'z', {});
+      const age = requireParam(params, 'age_seconds', { def: 0 });
+      const radius = requireParam(params, 'radius', { def: 8 });
+      const bot = actions.bot;
+      const me = bot.entity.position;
+      const dist = Math.hypot(me.x - x, me.z - z) + Math.abs(me.y - y) * 0.5;
+
+      // **时间判断是这一步的核心**（C 批次，见 docs/DEATH_RECOVERY.md）。
+      //
+      // 掉落物大约 5 分钟消失。不做判断的话会出现"她花 6 分钟走回去、
+      // 什么都没捡到"——**那比不去更糟**（浪费时间，失败还会写进她的教训里）。
+      // 判据：已经过了 4 分钟 → 直接劝退；或者按距离估算走不到（约 1.5 格/秒）→ 也劝退。
+      const LEFT = 300; // 掉落物存活约 5 分钟
+      const left = Math.max(0, LEFT - age);
+      const eta = dist / 1.5; // 粗估：每秒约 1.5 格（含绕路）
+      if (left <= 30) {
+        return skillResult(true, {
+          note: `别去了：掉落物已经过了 ${Math.round(age)} 秒，基本消失了`,
+          reason: 'MC 里掉落物大约 5 分钟就没了',
+          extra: { went: false, distance: Number(dist.toFixed(1)) },
+        });
+      }
+      if (eta > left - 20) {
+        return skillResult(true, {
+          note:
+            `别去了：距离约 ${dist.toFixed(0)} 格、估计要走 ${Math.round(eta)} 秒，` +
+            `而掉落物只剩约 ${Math.round(left)} 秒——**走一趟捡不到，不如现在开始重建**`,
+          reason: '时间不够',
+          extra: { went: false, distance: Number(dist.toFixed(1)), eta_seconds: Math.round(eta) },
+        });
+      }
+
+      // 值得去 → 走过去再捡
+      ctx.progress(`走去死亡地点（约 ${dist.toFixed(0)} 格，掉落物还剩约 ${Math.round(left)} 秒）`);
+      let arrived = false;
+      try {
+        const r = await nav.goTo({ x, y: null, z, range: 2, signal: ctx.signal, timeoutMs: 60000 });
+        arrived = !!(r && r.arrived);
+      } catch (err) {
+        if (err && err.name === 'CancelledError') throw err;
+        log.debug(`走去死亡地点失败：${err.message}`);
+      }
+      if (!arrived) {
+        return skillResult(false, {
+          note: `走不到死亡地点（约 ${dist.toFixed(0)} 格外）`,
+          reason: '路上被挡住了，或者地形过不去（可以试试 mc_climb_out）',
+          extra: { went: true, arrived: false, distance: Number(dist.toFixed(1)) },
+        });
+      }
+      let got = {};
+      try {
+        const res = await actions.collectDrops({
+          signal: ctx.signal,
+          timeoutMs: 12000,
+          maxDistance: radius,
+        });
+        got = (res && res.gained) || {};
+      } catch (err) {
+        if (err && err.name === 'CancelledError') throw err;
+        log.debug(`捡掉落物失败：${err.message}`);
+      }
+      const names = Object.entries(got);
+      if (!names.length) {
+        return skillResult(true, {
+          note: '走到了，但地上已经没有掉落物了（多半已经消失）',
+          extra: { went: true, arrived: true, gained: {} },
+        });
+      }
+      return skillResult(true, {
+        note: `捡回来了：${names.map(([k, v]) => `${k}×${v}`).join('、')}`,
+        produced: got,
+        extra: { went: true, arrived: true, gained: got },
+      });
+    },
+  },
+
   collect: {
     label: '收集物品',
     description: '通用收集：给定物品名与数量，自动决定去砍/挖/合成/熔炼/打猎',

@@ -317,6 +317,34 @@ class McSkillTools:
             event, "climb_out", {"max_steps": int(max_steps)}, "爬出坑/矿道"
         )
 
+    @filter.llm_tool(name="mc_recover_drops")
+    async def tool_mc_recover_drops(
+        self,
+        event: AstrMessageEvent,
+        x: float,
+        y: float,
+        z: float,
+        age_seconds: int = 0,
+    ) -> MessageEventResult:
+        """走回死亡地点，把掉在那儿的东西捡回来。
+
+        **它会自己判断值不值得去**：MC 里掉落物大约 **5 分钟**就消失，所以
+        太远或太久它会直接告诉你"别去了"（那样比白跑一趟好——省下的时间够砍树做木镐）。
+        返回值里 `went=false` 就是"没去"。
+
+        Args:
+            x(number): 死亡地点的 x
+            y(number): 死亡地点的 y
+            z(number): 死亡地点的 z
+            age_seconds(number): 从死亡到现在过了多少秒（默认 0）
+        """
+        return await self._submit_skill(
+            event,
+            "recover_drops",
+            {"x": float(x), "y": float(y), "z": float(z), "age_seconds": int(age_seconds)},
+            f"回去捡掉落物（{int(x)}, {int(y)}, {int(z)}）",
+        )
+
     @filter.llm_tool(name="mc_supply")
     async def tool_mc_supply(self, event: AstrMessageEvent) -> MessageEventResult:
         """让机器人做一次生存补给：准备食物 + 补齐工具 + 做火把。适合出远门前用。"""

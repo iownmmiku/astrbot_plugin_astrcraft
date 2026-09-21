@@ -58,13 +58,13 @@ PROMISES: list[tuple[str, str, str, str]] = [
     ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "bot/movement.js", "只描述，不改世界"),
     ("挖台阶/垫脚从坑里出来", "climbToSurface", "bot/skills/common.js", "代码已有"),
     ("垫脚上升（跳起来往脚下放方块）", "pillarUpOne", "bot/skills/common.js", "climbToSurface 内部"),
-    # 下面这几条**故意留成失败**，等 A/B/C 批次做完再打开——
+    # 下面这几条**故意留成失败**，等 B 批次做完再打开——
     # 它们就是当前"她做不到但提示词说能做"的证据。
-    ("她能不能主动调'爬出坑'（工具入口）", "mc_climb_out", "plugin/llm_tools_skills.py", "A 批次要做"),
+    ("她能不能主动调'爬出坑'（工具入口）", "mc_climb_out", "plugin/llm_tools_skills.py", "A 批次 ✅"),
+    ("她能不能主动'走回去捡掉落物'", "mc_recover_drops", "plugin/llm_tools_skills.py", "C 批次 ✅"),
+    ("死亡时写入恢复清单", "_death_recovery_todos", "plugin/life.py", "C 批次"),
     ("她能不能主动'铺路/垫高'", "mc_pave", "plugin/llm_tools_skills.py", "B 批次要做"),
     ("她能不能主动'挖通一条路'", "mc_dig_path", "plugin/llm_tools_skills.py", "B 批次要做"),
-    ("她能不能主动'走回去捡掉落物'", "mc_recover_drops", "plugin/llm_tools_skills.py", "C 批次要做"),
-    ("死亡时写入恢复清单", "_death_recovery_todos", "plugin/life.py", "C 批次要做"),
 ]
 
 

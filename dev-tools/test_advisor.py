@@ -198,7 +198,30 @@ loop_r.note_death({"x": 100, "y": 12, "z": 200})
 text2 = loop_r._render_recent()
 check("死亡地点会告诉她", "100" in text2 and "200" in text2)
 check("并且提醒东西会消失（掉落物 5 分钟）", "5 分钟" in text2, "提示掉落物时限")
-check("明确把决定权留给她", "你自己决定" in text2)
+# **契约变了**（C 批次，见 docs/DEATH_RECOVERY.md）：
+# 原来这里断言"你自己决定"——那句话**没给她判断依据**，而掉落物 5 分钟就消失，
+# 她很可能花 6 分钟走回去、什么都没捡到（**比不去更糟**）。
+# 现在给她可执行的判据："能在 2 分钟内走到就去，否则别去"。
+check(
+    "给了可执行的判断依据（不是丢一句「你自己决定」）",
+    "2 分钟" in text2 and "别去" in text2,
+    "掉落物 5 分钟消失 → 给她'能不能在 2 分钟内走到'这个判据",
+)
+# **死亡时要写恢复清单**（C 批次的核心）：她死后身上什么都没有，
+# 而泥土徒手就能挖、立刻"成功"，做木镐要先砍树、容易失败——
+# 没有清单她就会一直挖泥土（用户实测反馈）。
+check(
+    "死亡时写入了恢复清单（先砍树 → 做木镐）",
+    len(loop_r._todos) >= 3
+    and any("砍树" in t["text"] for t in loop_r._todos)
+    and any("木镐" in t["text"] for t in loop_r._todos),
+    f"{len(loop_r._todos)} 条",
+)
+check(
+    "死亡时丢掉了死前的打算（不然她还惦记着'盖房子'）",
+    loop_r._intention == "",
+    f"intention={loop_r._intention!r}",
+)
 
 # 很久以前的死亡不该再念叨（东西早没了）
 loop_r._last_death["at"] -= 4000

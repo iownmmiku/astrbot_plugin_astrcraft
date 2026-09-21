@@ -580,16 +580,105 @@ class LifeLoop:
         except RuntimeError:
             logger.debug("没有事件循环，跳过教训提炼")
 
+    @staticmethod
+    def _death_recovery_todos() -> list[dict]:
+        """**死亡恢复清单**（C 批次，见 docs/DEATH_RECOVERY.md）。
+
+        顺序是有讲究的——**按"能不能徒手做到"排**：
+
+          1. 砍树拿木头 —— **徒手就能砍**，所以排第一（她死后身上什么都没有）
+          2. 做工作台 + 木镐 —— 有了木头就能做
+          3. 挖石头做石制工具 —— 有镐了才行
+          4. 再想死前那件事 —— 最后，因为那时才具备条件
+
+        为什么必须写成"有名字的东西"：用户实测反馈"死过一次之后，他不会做木镐了，
+        直接开始挖泥土"。原因是她死后**泥土徒手就能挖、立刻成功**，
+        而做木镐要先砍树、容易失败——**没有任何东西告诉她"你现在一无所有、
+        必须先重建工具"**。这份清单就是那个"东西"。
+
+        （另外它被 `bot/tools/check_capabilities.py` 的承诺表盯着——
+          "死亡时写入恢复清单"这条承诺必须能找到这个符号。）
+        """
+        return [
+            {"text": "砍树拿木头（徒手也能砍，先砍 4~6 个原木）", "done": False},
+            {"text": "做工作台 + 木镐", "done": False},
+            {"text": "有镐了再挖石头，做石制工具（石镐/石剑/石斧）", "done": False},
+            {"text": "有余力再想死前那件事（现在身上什么都没有，先别急）", "done": False},
+        ]
+
     def note_death(self, position: dict | None = None) -> None:
-        """记住"我刚死在哪"。真人死后第一反应是回去捡东西（掉落物 5 分钟就没了）。"""
+        """记住"我刚死在哪"，并**真的把状态重置成"从零开始"**（C 批次）。
+
+        **改之前它只打了一行日志**——注释写着"死亡是重大变故：原来的打算多半要
+        重新考虑"，但代码什么都没做。后果（用户实测反馈）：
+          "死过一次之后，他不会做木镐什么的了，直接开始挖泥土，也不去拾取掉落的装备"
+
+        为什么会那样：她死后**身上什么都没有**，而打算/清单还是死前那套
+        （比如"盖个房子"）。泥土**徒手就能挖**、立刻"任务成功"；
+        做木镐要先砍树还要合成、容易失败。**没有任何东西告诉她"你现在一无所有、
+        必须先重建工具"** —— 所以她做的是**能成功的事**，不是**该做的事**。
+
+        现在：清掉打算/清单/计划，**写一份"死亡恢复"清单**。
+        用现成的 todo 机制，不需要新机制——需要的是"死亡时真的用它"。
+        """
         self._last_death = {
             "at": time.time(),
             "position": dict(position or {}),
         }
         logger.info("记下死亡地点：%s", self._last_death["position"])
-        # 死亡是重大变故：原来的打算多半要重新考虑
+
+        # ---- 真的做注释说的事 ----
         if self._intention:
-            logger.info("她死了，原来的打算「%s」需要重新考虑", self._intention)
+            logger.info("她死了，丢掉原来的打算「%s」", self._intention)
+        self._intention = ""
+        self._intention_rounds = 0
+        self._intention_since = 0.0
+        self.clear_plan("她死了，死前的计划作废")
+        # **写一份恢复清单**：顺序是有讲究的——
+        # 先徒手能做的（砍树），再做工具，然后才是石头；最后才轮到死前那件事。
+        self._todos = self._death_recovery_todos()
+        logger.warning(
+            "她死了：已丢掉打算和计划，写入 %d 条死亡恢复清单"
+            "（先砍树 → 做木镐 → 挖石头 → 再想原来的事）",
+            len(self._todos),
+        )
+        # 叫醒她：别等下一个决策间隔，立刻按新清单开始
+        try:
+            self._wake.set()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def death_drop_hint(self) -> str:
+        """给提示词用：**该不该回去捡**（C 批次，含时间判断）。
+
+        **为什么必须做时间判断**：MC 里掉落物大约 **5 分钟**消失。
+        不做判断的话会出现"她花 6 分钟走回去、什么都没捡到"——**那比不去更糟**
+        （浪费 6 分钟，而且失败会写进她的教训里）。
+        """
+        d = self._last_death
+        if not d:
+            return ""
+        ago = time.time() - float(d.get("at") or 0)
+        mins = ago / 60.0
+        pos = d.get("position") or {}
+        where = f"({pos.get('x')}, {pos.get('y')}, {pos.get('z')})" if pos else "某处"
+        if ago > 360:
+            # 超过 6 分钟：东西早没了，别让她白跑
+            self._last_death = None
+            return ""
+        if mins >= 4:
+            return (
+                f"- 你 {int(mins)} 分钟前死在 {where}，**掉落物基本已经消失了**，"
+                "别再回去找了，直接从砍树开始重建。"
+            )
+        return (
+            f"- 你 {int(mins)} 分钟前死在 {where}，身上的东西都掉在那里。"
+            f"**掉落物大约 5 分钟就消失**——所以：\n"
+            f"    · 如果你判断**能在 2 分钟内走到**（大约 100 格以内、路上没有大坑或水），"
+            f"就去捡（mc_recover_drops 会告诉你值不值得去）；\n"
+            f"    · 否则**别去**，直接开始重建（先砍树做木镐）——"
+            f"走一趟捡不到东西比不去更亏。"
+        )
 
     def _render_progress_since(self, since: float, *, limit: int = 8) -> str:
         """**自某个时刻以来的累计进展**（W5）——给"打算"当评估证据用。
@@ -631,17 +720,13 @@ class LifeLoop:
     def _render_recent(self) -> str:
         """把"最近做过的事 + 刚死过"渲染成给 LLM 看的一小段。"""
         lines: list[str] = []
-        if self._last_death:
-            ago = int(time.time() - self._last_death["at"])
-            pos = self._last_death["position"] or {}
-            where = f"({pos.get('x')}, {pos.get('y')}, {pos.get('z')})" if pos else "某处"
-            if ago <= 360:
-                lines.append(
-                    f"- 你 {ago // 60} 分钟前在 {where} 死了，**身上的东西都掉在那里**"
-                    "（MC 里掉落物大约 5 分钟就会消失）。要不要回去捡，你自己决定。"
-                )
-            else:
-                self._last_death = None  # 太久远了，东西早没了
+        # **死亡那段改用 death_drop_hint()**（C 批次）。
+        # 原来只有一句"要不要回去捡，你自己决定"——**没给判断依据**，
+        # 而掉落物 5 分钟就消失，她很可能花 6 分钟走回去、什么都没捡到
+        # （那比不去更糟）。现在给她可执行的判据："2 分钟内能走到就去，否则别去"。
+        death_hint = self.death_drop_hint()
+        if death_hint:
+            lines.append(death_hint)
         if self._recent_outcomes:
             lines.append("- 你最近做过的事：")
             for o in reversed(self._recent_outcomes[-5:]):
@@ -1582,8 +1667,19 @@ class LifeLoop:
         self._plan = []
         self._intention_rounds = 0
         self._session_planned = False
+        # **进游戏也要清打算和清单**（C 批次）。
+        # 原来只清了 _plan 和 _intention_rounds —— 于是"死过之后又进游戏"
+        # 会带着死前的打算（比如"盖个房子"）和死前的清单，
+        # 而身上什么都没有。她就会去挖泥土（唯一能立刻成功的事）。
+        if self._intention:
+            logger.info("进游戏，丢掉上次的打算「%s」", self._intention)
+        self._intention = ""
+        self._intention_since = 0.0
+        if self._todos:
+            logger.info("进游戏，清掉上次的 %d 条清单", len(self._todos))
+        self._todos = []
         self._wake.set()
-        logger.info("她进游戏了：清空旧计划，准备重新安排要做的事")
+        logger.info("她进游戏了：清空旧计划和打算，准备重新安排要做的事")
 
     async def _reconsider_if_looping(
         self,
