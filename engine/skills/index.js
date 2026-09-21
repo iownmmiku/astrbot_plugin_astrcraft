@@ -239,6 +239,47 @@ const SKILLS = {
       });
     },
   },
+
+  /**
+   * 睡觉：天黑回屋睡一觉（跳过整个夜晚 + 设重生点）。
+   */
+  sleep: {
+    label: '睡觉',
+    description: '找一张床睡到天亮（跳过夜晚、设重生点）。附近有怪或不是夜里会如实说原因',
+    params: { timeout_seconds: { type: 'number', min: 30, max: 600, def: 120 } },
+    async run({ actions, ctx, params }) {
+      const secs = requireParam(params, 'timeout_seconds', { def: 120 });
+      const r = await actions.sleepInBed({ signal: ctx.signal, timeoutMs: secs * 1000 });
+      return skillResult(!!r.ok, {
+        steps: [{ action: 'sleep', ok: !!r.ok, detail: r.note }],
+        note: r.note,
+      });
+    },
+  },
+
+  /**
+   * 对实体右键：剪羊毛、喂食、挤奶。
+   */
+  interact: {
+    label: '和动物互动',
+    description: '对附近的动物做一件事：剪羊毛（sheep + shears）、喂食、挤奶（cow + bucket）',
+    params: {
+      target: { type: 'string', required: true, def: 'sheep' },
+      item: { type: 'string', def: null },
+    },
+    async run({ actions, ctx, params }) {
+      const target = requireParam(params, 'target', { type: 'string', def: 'sheep' });
+      const r = await actions.interactEntity({
+        target,
+        item: params.item || null,
+        signal: ctx.signal,
+      });
+      return skillResult(true, {
+        steps: [{ action: 'interact', ok: true, detail: r.note }],
+        note: r.note,
+      });
+    },
+  },
 };
 
 function get(name) {

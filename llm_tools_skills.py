@@ -117,6 +117,47 @@ class McSkillTools:
         """
         return await self._submit_skill(event, "build_shelter", {"size": int(size)}, f"盖 {size}×{size} 的庇护所")
 
+    @filter.llm_tool(name="mc_sleep")
+    async def tool_mc_sleep(
+        self,
+        event: AstrMessageEvent,
+        timeout_seconds: int = 120,
+    ) -> MessageEventResult:
+        """**睡一觉**：找一张床睡到天亮（跳过整个夜晚 + 设重生点）。
+
+        什么时候用：天黑了、附近有床。睡过去比摸黑干活安全得多。
+        如果附近有怪、或者天还亮着，她会**如实告诉你原因**（原版规则不让睡）。
+
+        Args:
+            timeout_seconds(number): 最多等多久醒来，默认 120 秒
+        """
+        return await self._submit_skill(
+            event, "sleep", {"timeout_seconds": int(timeout_seconds)}, "找张床睡到天亮"
+        )
+
+    @filter.llm_tool(name="mc_interact")
+    async def tool_mc_interact(
+        self,
+        event: AstrMessageEvent,
+        target: str = "sheep",
+        item: str = "",
+    ) -> MessageEventResult:
+        """**和动物互动**：剪羊毛、喂食、挤奶。
+
+        常用组合：
+        - 剪羊毛：`target="sheep"`，`item="shears"`（羊毛是做床的材料）
+        - 挤奶：`target="cow"`，`item="bucket"`
+        - 喂食（繁殖/回血）：`target="cow"`，`item="wheat"`
+
+        Args:
+            target(string): 动物名，如 sheep / cow / pig / chicken
+            item(string): 手上要拿的东西（留空则空手）
+        """
+        params = {"target": str(target).strip() or "sheep"}
+        if item:
+            params["item"] = str(item).strip()
+        return await self._submit_skill(event, "interact", params, f"对 {target} 用 {item or '手'}")
+
     @filter.llm_tool(name="mc_blueprint")
     async def tool_mc_blueprint(
         self,

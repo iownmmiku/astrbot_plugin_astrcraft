@@ -1479,6 +1479,217 @@ class Actions {
     return { ok: true, block: block.name, position: { x, y, z }, held: bot.heldItem ? bot.heldItem.name : null };
   }
 
+  /**
+   * 手写的小范围找床（不依赖 `bot.findBlock`）。
+   *
+   * 扫描量：半径 16、纵向 ±2 → 约 33×33×5 = 5400 次 blockAt。
+   * 比"直接把引擎卡住"好得多，而且只在 findBlock 失败时才跑。
+   */
+  _scanForBed(radius = 16) {
+    const bot = this._requireBot();
+    const p = bot.entity.position;
+    const cx = Math.floor(p.x);
+    const cy = Math.floor(p.y);
+    const cz = Math.floor(p.z);
+    let best = null;
+    let bestD = Infinity;
+    for (let dy = -2; dy <= 2; dy += 1) {
+      for (let dx = -radius; dx <= radius; dx += 1) {
+        for (let dz = -radius; dz <= radius; dz += 1) {
+          const b = blockAt(bot, cx + dx, cy + dy, cz + dz);
+          if (!b || !String(b.name).endsWith('_bed')) continue;
+          const d = Math.hypot(dx, dy, dz);
+          if (d < bestD) {
+            bestD = d;
+            best = b;
+          }
+        }
+      }
+    }
+    if (best) log.debug(`findBlock 没找到床，手写扫描在 ${bestD.toFixed(1)} 格外找到一张`);
+    return best;
+  }
+
+  /**
+   * **睡一觉**（真人天黑就睡，能跳过整个夜晚 + 设重生点）。
+   *
+   * mineflayer 有 `bot.sleep()`，但它要求很严、报错还是英文的——
+   * 这里把每一条都翻译成"她/模型能读懂并据此行动"的话：
+   *   - 不是夜里也不是雷雨 → 服务器不让睡（先干点别的，或者等天黑）
+   *   - 附近有怪（原版规则 ~8 格内）→ 先清怪
+   *   - 床被占了 / 只有半张床 → 换一张
+   * 另外她会**先走过去**——睡觉得站到床边。
+   */
+  async sleepInBed({ signal = null, timeoutMs = 120000 } = {}) {
+    const bot = this._requireBot();
+    if (bot.isSleeping) return { ok: true, already: true, note: '已经在睡了' };
+
+    // 先找床：附近 32 格（findBlock），找不到再用**手写的小范围扫描**兜底。
+    //
+    // 为什么要兜底：实测 `bot.findBlock` 在她**站进床里**（放床时被挤过去）之后
+    // 会返回 null——同一张床在天黑前能看到、天黑后就"消失"了，
+    // 于是她明明睡在一张床上却报"附近没有床"。
+    let bed = bot.findBlock({ matching: (b) => b && String(b.name).endsWith('_bed'), maxDistance: 32 });
+    if (!bed) bed = this._scanForBed(16);
+    if (!bed && this.stations && bot.entity) {
+      const known = this.stations.nearest('bed', bot.entity.position);
+      if (known && known.distance <= 96) {
+        const b = blockAt(bot, known.x, known.y, known.z);
+        if (b && String(b.name).endsWith('_bed')) bed = b;
+        else this.stations.forget('bed', known);
+      }
+    }
+    if (!bed) {
+      throw new MissingItemError(
+        '床',
+        '附近 32 格内没有床。先做一张（3 个羊毛 + 3 块木板）放在屋里——晚上能睡过去，还能设重生点',
+      );
+    }
+
+    // 走过去（睡觉得站到床边）
+    const d = distance(bot.entity.position, blockCenter(bed.position.x, bed.position.y, bed.position.z));
+    if (d > 2) {
+      try {
+        await this._nav.goTo({
+          x: bed.position.x,
+          y: null,
+          z: bed.position.z,
+          range: 1.6,
+          signal,
+          timeoutMs: 25000,
+          segmented: false,
+        });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        log.debug(`走到床边失败，就地试着睡：${err.message}`);
+      }
+    }
+
+    // 天亮就如实说，别浪费一轮
+    const tod = bot.time ? Number(bot.time.timeOfDay) : 0;
+    const isNight = tod >= 12541 && tod <= 23458;
+    const storm = !!bot.isRaining && Number(bot.thunderState) > 0;
+    if (!isNight && !storm) {
+      return {
+        ok: false,
+        note: '现在天还亮着，睡不了（原版规则：只能夜里或雷雨天睡）。天黑再来，或者先干点别的',
+      };
+    }
+
+    try {
+      await bot.sleep(bed);
+    } catch (err) {
+      const msg = String(err.message || err);
+      let hint = msg;
+      if (/not night/i.test(msg)) hint = '服务器说现在不是夜里，睡不了';
+      else if (/occupied/i.test(msg)) hint = '这张床被占了，换一张';
+      else if (/only half bed/i.test(msg)) hint = '这床只有半张（另一半被拆了），放一张新的';
+      else if (/monster|too far|not safe/i.test(msg)) hint = '附近有怪，原版规则不让睡——先清掉它们';
+      else if (/cant click/i.test(msg)) hint = '够不到这张床，走近一点再试';
+      throw new ActionError(`睡觉失败：${hint}`);
+    }
+
+    // 等服务器确认她真的睡下
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !bot.isSleeping) {
+      if (signal && signal.aborted) throw new CancelledError();
+      await delay(200, { signal });
+    }
+    if (!bot.isSleeping) {
+      return { ok: false, note: '请求睡觉了但服务器没让睡（可能床的位置不对，或附近有怪）' };
+    }
+    log.info('她睡下了（天黑了）');
+
+    // 等天亮（睡着期间服务器推进时间）。醒来或超时就返回。
+    const wakeDeadline = Date.now() + Math.max(30000, Math.min(timeoutMs, 600000));
+    while (Date.now() < wakeDeadline) {
+      if (signal && signal.aborted) throw new CancelledError();
+      if (!bot.isSleeping) break;
+      await delay(1000, { signal });
+    }
+    const stillSleeping = !!bot.isSleeping;
+    if (stillSleeping) {
+      try {
+        await bot.wake();
+      } catch {
+        /* 叫不醒就算了 */
+      }
+    }
+    const tod2 = bot.time ? Number(bot.time.timeOfDay) : 0;
+    return {
+      ok: true,
+      slept: true,
+      woke_at: tod2,
+      note: stillSleeping ? '睡了很久还没天亮（可能有人在旁边），先起来了' : '睡醒了，天亮了',
+    };
+  }
+
+  /**
+   * **对实体右键**：剪羊毛、给动物喂食、挤奶、给狗喂骨头…
+   *
+   * 参数做成"对谁做什么"，而不是"发什么包"——模型只要说
+   * `interact(target="sheep", item="shears")` 就够了。
+   */
+  async interactEntity({ target, item = null, signal = null, timeoutMs = 20000 } = {}) {
+    const bot = this._requireBot();
+    const ent = this._findEntity(target);
+    if (!ent) throw new ActionError(`附近没有 ${target}（可以先 mc_scan_entities 看看有什么）`);
+    const d = distance(bot.entity.position, ent.position);
+    if (d > 3) {
+      try {
+        await this._nav.goTo({
+          x: ent.position.x,
+          y: null,
+          z: ent.position.z,
+          range: 2,
+          signal,
+          timeoutMs: Math.max(8000, timeoutMs),
+          segmented: false,
+        });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        log.debug(`走到 ${target} 身边失败：${err.message}`);
+      }
+    }
+    if (item) {
+      const want = String(item).replace(/^minecraft:/, '');
+      if (!bot.heldItem || bot.heldItem.name !== want) await this.holdItem({ item: want, signal });
+    }
+    try {
+      await bot.lookAt(ent.position.offset(0, 1, 0), true);
+      await bot.useOn(ent);
+    } catch (err) {
+      throw new ActionError(`对 ${target} 使用失败：${describeFailure(err)}`);
+    }
+    await delay(300, { signal });
+    return {
+      ok: true,
+      target: ent.name || target,
+      item: bot.heldItem ? bot.heldItem.name : null,
+      note: `对 ${ent.name || target} 用了 ${bot.heldItem ? bot.heldItem.name : '手'}`,
+    };
+  }
+
+  /** 按名字/类型找一个实体（就近优先） */
+  _findEntity(target) {
+    const bot = this._requireBot();
+    const want = String(target || '').toLowerCase().replace(/^minecraft:/, '');
+    const me = bot.entity.position;
+    let best = null;
+    let bestD = Infinity;
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || !e.position || e === bot.entity) continue;
+      const name = String(e.name || e.displayName || '').toLowerCase();
+      if (name !== want && !name.includes(want)) continue;
+      const d = distance(me, e.position);
+      if (d < bestD) {
+        bestD = d;
+        best = e;
+      }
+    }
+    return best;
+  }
+
   /** 对玩家使用手持物品（给予物品/喂食/交易入口） */
   async useOnPlayer({ target, signal = null } = {}) {
     const bot = this._requireBot();

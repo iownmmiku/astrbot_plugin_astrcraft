@@ -812,6 +812,29 @@ rpc.handle(
 );
 
 rpc.handle(
+  'sleep',
+  wrap(async (params = {}) => {
+    engine.requireBot();
+    return engine.actions.sleepInBed({
+      timeoutMs: Number(params.timeout_ms) || 120000,
+    });
+  }),
+);
+
+rpc.handle(
+  'interact.entity',
+  wrap(async (params = {}) => {
+    engine.requireBot();
+    if (!params.target) throw new Error('interact.entity 需要 target（要交互的实体名，如 sheep/cow）');
+    return engine.actions.interactEntity({
+      target: params.target,
+      item: params.item || null,
+      timeoutMs: Number(params.timeout_ms) || 20000,
+    });
+  }),
+);
+
+rpc.handle(
   'use.player',
   wrap(async (params) => {
     engine.requireBot();
