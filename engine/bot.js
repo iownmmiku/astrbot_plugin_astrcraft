@@ -474,6 +474,13 @@ class McEngine {
       }
     });
 
+    // **工具坏了**（W4）：**mineflayer 没有 itemBreak 事件**（我第一版猜了这个名字，
+    // 实测镐子确实坏了、背包里没了，但事件一次都没发出来）。
+    // 所以改成自己盯：在反射层（200ms）里比较"手上的工具"这一拍和上一拍——
+    //   上一拍：拿着一个**快坏了**的工具
+    //   这一拍：它不见了，而且背包里也确实没有了
+    // 那就是坏了。
+    bot.on('itemDrop', () => {});
     // 记录"谁打了我"，用于自动反击
     bot.on('entitySwingArm', () => {});
     bot.on('itemDrop', () => {});
@@ -748,6 +755,9 @@ class McEngine {
         log.debug(`反射动作：${what}`);
       };
       this._auditReflex = audit;
+      // 工具损坏检测（W4）：挂在反射层上，因为它要"两拍比较"。
+      // mineflayer 没有 itemBreak 事件，只能自己盯（见 _toolBreakTick）。
+      this._toolBreakTick();
       // **"环境行为"只在完全没别的事时才做**（按「本能 vs 策略」的分层）。
       //
       // 机制该分成两类：
@@ -1079,6 +1089,14 @@ class McEngine {
       }
       // 3) 饿 → 吃
       if (this.config.get('autoEat') && bot.food < (Number(this.config.get('eatFoodLevel')) || 14)) {
+        // **饿了也要上报**（W4）：反射层会自己找东西吃，但决策层不知道"她饿了"——
+        // 于是她可能一边饿着一边安排长任务（挖矿/盖房），做到一半没力气。
+        // 事件带冷却：饥饿是持续状态，不加冷却会每 200ms 刷一条把队列刷满。
+        const now = Date.now();
+        if (now - (this._lastHungryAt || 0) > 60000) {
+          this._lastHungryAt = now;
+          this._emit('bot.hungry', { food: bot.food, position: this._pos() });
+        }
         const food = this.actions._pickBestFood();
         if (food) {
           this._submitReflex(`吃 ${food.name}`, async ({ signal }) => {
@@ -1683,6 +1701,57 @@ class McEngine {
       // 见 _bid 里的说明。
       preemptible: true,
     });
+  }
+
+  /**
+   * **工具损坏检测**（W4，见 docs/PLAN_v2.md）。
+   *
+   * 为什么要自己盯：**mineflayer 没有 itemBreak 事件**（实测确认）——
+   * 她手上那把镐子坏掉时，只有"下一次挖矿失败"能间接暴露，
+   * 而决策层完全不知道，会继续按"我有镐子"的思路安排挖矿。
+   *
+   * 判据（两拍比较，由 200ms 的反射层驱动）：
+   *   上一拍拿着一个**快坏了**的工具（剩余耐久 <= 3）
+   *   这一拍它不见了，而且**背包里也确实没有了**（排除换手/掉落）
+   * 两条都满足才算"坏了"——只看"不见了"会把"收进背包"误判成损坏。
+   */
+  _toolBreakTick() {
+    const bot = this.bot;
+    if (!bot || !bot.entity) return;
+    let held = null;
+    try {
+      held = bot.heldItem || null;
+    } catch {
+      return;
+    }
+    const prev = this._lastHeldTool || null;
+    let cur = null;
+    if (held && held.name) {
+      let left = null;
+      try {
+        const used = Number(held.durabilityUsed);
+        const max = Number(held.maxDurability);
+        if (Number.isFinite(used) && Number.isFinite(max) && max > 0) left = max - used;
+      } catch {
+        /* 拿不到耐久就算了，按"不知道"处理 */
+      }
+      cur = { name: held.name, left };
+    }
+    // 上一拍是快坏的工具，这一拍没了 + 背包里也没了 → 坏了
+    if (prev && prev.left !== null && prev.left <= 3) {
+      const gone = !cur || cur.name !== prev.name;
+      let inBag = 0;
+      try {
+        inBag = this.actions.countItem(prev.name) || 0;
+      } catch {
+        inBag = 1; // 数不出来就当还在，宁可漏报也不要误报
+      }
+      if (gone && inBag === 0) {
+        this._emit('tool.broken', { item: prev.name, position: this._pos() });
+        log.info(`检测到工具损坏：${prev.name}（上一拍只剩 ${prev.left} 点耐久）`);
+      }
+    }
+    this._lastHeldTool = cur;
   }
 
   _onTaskFinished(task) {

@@ -206,5 +206,29 @@ ok("提示词里注入了接续", "_pending_follow_up" in src)
 ok("控制条目在循环里被执行", "_run_control()" in src)
 ok("/mc状态 显示队列", "inbox_summary()" in mn)
 
+print("\n=== 世界事件入队的三个订阅点（W4 第三步）===")
+ok("订阅 bot.hurt", 'self.engine.on("bot.hurt"' in mn)
+ok("订阅 bot.hungry", 'self.engine.on("bot.hungry"' in mn)
+ok("订阅 tool.broken", 'self.engine.on("tool.broken"' in mn)
+ok("受伤入队且标急件", 'note_world_event("hurt"' in mn and "urgent=True" in mn)
+ok("饥饿入队", 'note_world_event(\n                "hungry"' in mn or '"hungry"' in mn)
+ok("工具损坏入队", '"tool_broken"' in mn)
+
+print("\n=== 引擎侧确实发了这些事件（源码断言）===")
+eng = (pathlib.Path(__file__).resolve().parents[2] / "bot" / "bot.js").read_text(encoding="utf-8")
+ok("引擎发 bot.hurt", "this._emit('bot.hurt'" in eng)
+ok("引擎发 bot.hungry", "this._emit('bot.hungry'" in eng)
+ok("引擎发 tool.broken", "this._emit('tool.broken'" in eng)
+ok(
+    "饥饿事件有冷却（不然每 200ms 刷一条把队列刷满）",
+    "_lastHungryAt" in eng and "60000" in eng,
+)
+ok(
+    "**没有用 itemBreak**（实测 mineflayer 根本没这个事件）",
+    "bot.on('itemBreak'" not in eng,
+    "第一版猜了这个名字，镐子坏了但事件一次都没发出来",
+)
+ok("改成自己盯手上的工具", "_toolBreakTick" in eng)
+
 print(f"\n=== 结果：{passed} 通过，{failed} 失败 ===")
 sys.exit(1 if failed else 0)

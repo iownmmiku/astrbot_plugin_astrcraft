@@ -220,6 +220,12 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         self.engine.on("task.finished", self._on_task_finished)
         # 有人走到她附近 → 主动打个招呼（真人不等人先开口）
         self.engine.on("player.nearby", self._on_player_nearby)
+        # **世界事件入队**（W4）：这几件事原来只有反射层知道，决策层完全不知道——
+        # 于是她会继续按"我很好/我有镐子"的思路安排长任务，做到一半才发现不对。
+        # 现在它们会进输入队列，在她到安全注入点时被告知。
+        self.engine.on("bot.hurt", self._on_bot_hurt)
+        self.engine.on("bot.hungry", self._on_bot_hungry)
+        self.engine.on("tool.broken", self._on_tool_broken)
 
         self.goals = GoalManager(
             engine_call=self._engine_call,
@@ -741,6 +747,48 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 )
             else:
                 logger.info("过日子循环已在配置中关闭（enable_life_loop=false）")
+
+    async def _on_bot_hurt(self, data: dict) -> None:
+        """她受伤了 → 入队（W4）。
+
+        **受伤是急件**：反射层会立刻处理（后撤/反击），但决策层得知道
+        "我现在在被谁打"——否则她可能刚被打完就继续安排长任务。
+        """
+        if not self.life:
+            return
+        try:
+            hp = data.get("health")
+            hp_text = f"（血量 {hp}）" if hp is not None else ""
+            self.life.note_world_event("hurt", f"我被打了一下{hp_text}", urgent=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("受伤事件入队失败：%s", exc)
+
+    async def _on_bot_hungry(self, data: dict) -> None:
+        """她饿了 → 入队（W4）。不是急件：反射层会自己找东西吃。"""
+        if not self.life:
+            return
+        try:
+            food = data.get("food")
+            self.life.note_world_event(
+                "hungry", f"我饿了（饱食度 {food}），得吃点东西" if food is not None else "我饿了"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("饥饿事件入队失败：%s", exc)
+
+    async def _on_tool_broken(self, data: dict) -> None:
+        """工具坏了 → 入队（W4）。
+
+        为什么这件事值得单独发一条：她手上那把镐子坏掉时，
+        **只有反射层知道**（下一次挖矿会失败），决策层完全不知道——
+        于是她会继续按"我有镐子"的思路安排挖矿，反复失败。
+        """
+        if not self.life:
+            return
+        try:
+            item = str(data.get("item") or "工具")
+            self.life.note_world_event("tool_broken", f"我的{item}用坏了")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("工具损坏事件入队失败：%s", exc)
 
     async def _on_player_nearby(self, data: dict) -> None:
         """有人走到她附近 → 主动打个招呼（主动社交）。
