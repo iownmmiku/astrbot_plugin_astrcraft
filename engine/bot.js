@@ -547,9 +547,21 @@ class McEngine {
   _startLoops() {
     if (this._reflexTimer) return;
     // 反射层：1 秒一次，纯本地规则，不经过 LLM
+    // 反射层：默认 **1 秒**一次（可用 MC_REFLEX_MS 调快）。
+    //
+    // **身体层设计里的 S1（提到 200ms）试过，但回退了**——原因是它打破了
+    // 一个已验证的能力：`test_unstuck` 的"完全被埋住时能自救"连续 3 次失败
+    // （原来稳定 3/3）。脱困逻辑里有一串**按秒调过的时间常数**
+    // （8 秒节流、2 秒二次确认、60 秒降频），反射层变快 5 倍之后这些常数的
+    // 相对关系变了，行为跟着变。
+    //
+    // 所以 S1 不是"改个数字"那么简单：**要连同那些时间常数一起重新调**，
+    // 并且每调一次都要重跑 test_unstuck。见 docs/BODY_LAYER.md 的 S1。
+    // 在那之前，默认保持 1 秒——**不发布一个破坏已验证能力的东西**。
+    const reflexMs = Math.max(50, Number(process.env.MC_REFLEX_MS || 1000) || 1000);
     this._reflexTimer = setInterval(() => {
       this._reflexTick().catch((err) => log.debug(`反射层异常：${err.message}`));
-    }, 1000);
+    }, reflexMs);
     // **MLG 单独用更快的频率（100ms）**。
     //
     // 为什么不能挂在上面那个 1 秒的反射循环里：实测从 18 格掉下来只有 **1.2 秒**，
