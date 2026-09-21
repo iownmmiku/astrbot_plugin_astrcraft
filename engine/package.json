@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "commonjs",
-  "description": "Astrcraft engine: a real Minecraft client (mineflayer) driven over JSON-RPC",
+  "description": "Astrcraft engine: a real Minecraft client (mineflayer) driven over JSON-RPC, with an optional first-person web viewer",
   "main": "index.js",
   "dependencies": {
-    "mineflayer": "4.39.0",
+    "canvas": "^3.2.3",
     "minecraft-data": "3.116.0",
-    "mineflayer-pathfinder": "2.4.5"
+    "mineflayer": "4.39.0",
+    "mineflayer-pathfinder": "2.4.5",
+    "prismarine-viewer": "^1.33.0"
   }
 }

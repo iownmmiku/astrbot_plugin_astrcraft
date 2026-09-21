@@ -201,6 +201,10 @@ class McEngine {
     this.state.attach(bot);
     this._wireBotEvents(bot);
     this._startLoops();
+    // 观战窗口（浏览器里以她的第一视角看她在干什么）
+    if (this.config.get('enableViewer')) {
+      this.startViewer().catch((err) => log.warn(`观战窗口启动失败：${err.message}`));
+    }
     this._reconnect.attempts = 0;
 
     log.info(`已进入服务器：${bot.username} @ ${bot.version}`);
@@ -269,6 +273,66 @@ class McEngine {
       /* ignore */
     }
     return !!this._chunksReady;
+  }
+
+  /**
+   * **观战窗口**：在浏览器里以她的第一视角看她在干什么。
+   *
+   * 用 prismarine-viewer：它把 mineflayer 看到的世界用 three.js 渲染，
+   * `firstPerson` 时相机就在她眼睛的位置。**只能看，不能操作**——
+   * 你看到的就是她看到的东西，和你站在她身后一样。
+   *
+   * 为什么不是"真的开一个 Minecraft 窗口"：mineflayer 是**无头客户端**，
+   * 不下载游戏资源也没有渲染器。真要开 MC 窗口只能用你自己的 Java 版客户端
+   * 进服务器 `/spectate 她的名字`（需要装 Java 版）。
+   * 这里给的是不需要第二个账号、不需要装游戏的方案。
+   *
+   * 懒加载：不开就不 require，省内存（这个库会拖进 express/socket.io/three）。
+   */
+  async startViewer() {
+    const bot = this.bot;
+    if (!bot || !bot.entity) throw new Error('她还没进游戏，等进服后再开观战');
+    if (this._viewer) return this.viewerInfo();
+    // 懒 require：不用观战的人不该为此付出内存
+    const { mineflayer: mineflayerViewer } = require('prismarine-viewer');
+    const port = Number(this.config.get('viewerPort')) || 3007;
+    const firstPerson = this.config.get('viewerFirstPerson') !== false;
+    const viewDistance = Math.max(2, Math.min(12, Number(this.config.get('viewerViewDistance')) || 6));
+    // prismarine-viewer 自己起 express + socket.io 服务，只监听本机
+    mineflayerViewer(bot, { port, firstPerson, viewDistance });
+    this._viewer = { port, firstPerson, viewDistance, startedAt: Date.now() };
+    log.warn(
+      `观战窗口已开启：浏览器打开 http://127.0.0.1:${port} 就能以她的第一视角看她` +
+        `（${firstPerson ? '第一视角' : '俯视'}，渲染 ${viewDistance} 区块）`,
+    );
+    this._emit('viewer.started', this.viewerInfo());
+    return this.viewerInfo();
+  }
+
+  viewerInfo() {
+    if (!this._viewer) return { running: false };
+    return {
+      running: true,
+      url: `http://127.0.0.1:${this._viewer.port}`,
+      first_person: this._viewer.firstPerson,
+      view_distance: this._viewer.viewDistance,
+      uptime_seconds: Math.round((Date.now() - this._viewer.startedAt) / 1000),
+    };
+  }
+
+  /**
+   * 关掉观战窗口。
+   *
+   * 注意：prismarine-viewer 没有提供"关闭"接口——它把 express/socket.io 服务
+   * 挂在了 bot 上，但没暴露 close。所以这里只能**如实说明**：
+   * 端口会一直开到引擎进程结束。不假装关掉了。
+   */
+  stopViewer() {
+    if (!this._viewer) return { ok: true, note: '本来就没开' };
+    return {
+      ok: false,
+      note: 'prismarine-viewer 没有提供关闭接口，观战端口会一直开着直到引擎重启。想立刻关掉就重启引擎',
+    };
   }
 
   /**

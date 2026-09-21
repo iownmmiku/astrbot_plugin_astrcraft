@@ -76,6 +76,8 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
 
 其它
   /mc技能              她能做的事
+  /mc看她              看她：观战窗口（浏览器里的第一视角）+ 她的背包 + 她在干什么
+  /mc开观战            立刻打开观战窗口（不用重进服）
   /mc调试              排障信息
   /mc帮助              显示本帮助
 
@@ -498,10 +500,24 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             ("auto_eat", "autoEat"),
             ("auto_defend", "autoDefend"),
             ("humanize", "humanize"),
+            ("enable_viewer", "enableViewer"),
+            ("viewer_first_person", "viewerFirstPerson"),
         ):
             val = self._cfg(cfg_key, None)
             if val is not None:
                 out[engine_key] = bool(val)
+
+        # 观战窗口的端口/渲染距离是数字，不能走上面那条 bool 通道
+        for cfg_key, engine_key in (
+            ("viewer_port", "viewerPort"),
+            ("viewer_view_distance", "viewerViewDistance"),
+        ):
+            val = self._cfg(cfg_key, None)
+            if val is not None:
+                try:
+                    out[engine_key] = int(val)
+                except (TypeError, ValueError):
+                    logger.warning("%s 不是整数，已忽略：%r", cfg_key, val)
 
         return out
 
@@ -1242,6 +1258,102 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         return await self.engine.state(detail)
 
     # ================================================================ 指令
+
+    @filter.command("mc看她", alias={"看她", "mcview", "看她在干什么"})
+    async def cmd_view(self, event: AstrMessageEvent):
+        """看她（观战窗口 + 背包 + 她现在在干什么）——只读，不会操作她"""
+        lines = ["👀 看她", ""]
+        if not self.engine or not self.engine.running:
+            lines.append("❌ 引擎没在运行——她根本没启动")
+            yield event.plain_result("\n".join(lines))
+            return
+        if not self.connected:
+            lines.append("❌ 她不在服务器里（先 mc进服）")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # 1) 观战窗口（浏览器里她的第一视角）
+        try:
+            v = await self.engine.call("viewer.status", {}, timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            v = {"running": False, "error": str(exc)}
+        if v.get("running"):
+            lines.append("🖥️ **观战窗口已开**")
+            lines.append(f"   浏览器打开：{v.get('url')}")
+            lines.append(
+                f"   视角：{'第一视角（她的眼睛）' if v.get('first_person') else '俯视'}"
+                f"｜渲染 {v.get('view_distance')} 区块｜已开 {v.get('uptime_seconds')} 秒"
+            )
+            lines.append("   （只能看，不能操作她）")
+        else:
+            lines.append("🖥️ 观战窗口没开。开启方式二选一：")
+            lines.append("   ① 在插件配置里把 **enable_viewer** 打开，然后 `mc退服` + `mc进服`")
+            lines.append("   ② 直接发 `mc开观战` 立刻打开（不用重进服）")
+
+        # 2) 她现在的状态 + 背包
+        try:
+            st = await self.engine.state("normal")
+        except Exception as exc:  # noqa: BLE001
+            st = None
+            lines.append(f"⚠️ 取不到状态：{exc}")
+        if st:
+            pos = st.get("block_position") or {}
+            lines.append("")
+            lines.append(
+                f"📍 ({pos.get('x')}, {pos.get('y')}, {pos.get('z')}) ｜ "
+                f"❤️ {st.get('health')}/{st.get('max_health')} ｜ 🍗 {st.get('food')}"
+            )
+            held = st.get("held_item")
+            lines.append(f"✋ 手上：{held.get('name') if isinstance(held, dict) else (held or '空手')}")
+            inv = st.get("inventory") or st.get("inventory_summary")
+            if isinstance(inv, dict) and inv:
+                items = "、".join(f"{k}×{v}" for k, v in list(inv.items())[:24])
+                lines.append(f"🎒 背包（{len(inv)} 种）：{items}")
+            elif isinstance(inv, list) and inv:
+                items = "、".join(
+                    f"{i.get('name')}×{i.get('count')}" for i in inv[:24] if isinstance(i, dict)
+                )
+                lines.append(f"🎒 背包（{len(inv)} 种）：{items}")
+            else:
+                lines.append("🎒 背包：空")
+
+        # 3) 她现在在干什么
+        if self.life:
+            try:
+                lines.append("")
+                lines.append(self.life.describe())
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 4) 如果你有 Java 版客户端：更真实的看法
+        lines.append("")
+        lines.append("💡 想看**真·第一视角**（真游戏画面）：用你自己的 Java 版客户端进这个服，然后")
+        lines.append("   `/gamemode spectator` → `/spectate 她的名字`，就能贴在她身上看她玩")
+        lines.append("   （注意：需要 Java 版；基岩版连不上 Java 服）")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("mc开观战", alias={"开观战", "mcviewstart"})
+    async def cmd_view_start(self, event: AstrMessageEvent):
+        """立刻打开观战窗口（浏览器里她的第一视角）"""
+        if not await self._ensure_engine():
+            yield event.plain_result("引擎未运行")
+            return
+        if not self.connected:
+            yield event.plain_result("她还没进服——先 mc进服，再开观战")
+            return
+        try:
+            v = await self.engine.call("viewer.start", {}, timeout=30.0)
+        except Exception as exc:  # noqa: BLE001
+            yield event.plain_result(f"开观战失败：{exc}")
+            return
+        if not v.get("running"):
+            yield event.plain_result(f"没开成：{v}")
+            return
+        yield event.plain_result(
+            f"🖥️ 观战窗口已开：**{v.get('url')}**\n"
+            f"浏览器打开它就能以她的第一视角看她（只能看，不能操作）\n"
+            f"视角：{'第一视角' if v.get('first_person') else '俯视'}｜渲染 {v.get('view_distance')} 区块"
+        )
 
     @filter.command("mc帮助", alias={"mchelp", "mc"})
     async def cmd_help(self, event: AstrMessageEvent):

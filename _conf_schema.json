@@ -151,6 +151,26 @@
     "description": "拟人化动作：渐进转头、走路轻微扫视、变速行走、偶尔停顿环顾、空闲时东张西望。只影响观感，不改变决策与安全性；关掉动作更机械但略快",
     "default": true
   },
+  "enable_viewer": {
+    "type": "bool",
+    "default": false,
+    "description": "**观战窗口**：打开后可以用浏览器以**她的第一视角**看她在干什么（只读，你不能操作她）。开启后进服时会自动起一个本地网页服务，浏览器打开 http://127.0.0.1:<观战端口> 即可。需要引擎里装过 prismarine-viewer（npm install 已包含）"
+  },
+  "viewer_port": {
+    "type": "int",
+    "default": 3007,
+    "description": "观战页面的端口。浏览器打开 http://127.0.0.1:这个端口 就能看她"
+  },
+  "viewer_first_person": {
+    "type": "bool",
+    "default": true,
+    "description": "观战用第一视角（她的眼睛）。关掉则从斜上方俯视她"
+  },
+  "viewer_view_distance": {
+    "type": "int",
+    "default": 6,
+    "description": "观战渲染多远（区块）。越大越吃 CPU/内存，6 够看"
+  },
   "slow_mode": {
     "type": "bool",
     "description": "反作弊保守模式：移动更慢、关闭跑酷、跳跃更少。**进带反作弊插件的服务器（Grim / Vulcan / 严格 NCP）请打开**，否则可能被踢或误判",

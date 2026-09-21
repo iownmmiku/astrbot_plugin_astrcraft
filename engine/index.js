@@ -976,6 +976,14 @@ rpc.handle(
   }),
 );
 
+// **观战窗口**：浏览器里以她的第一视角看她（只读，不提供任何操作入口）
+rpc.handle(
+  'viewer.start',
+  wrap(async () => engine.startViewer()),
+);
+rpc.handle('viewer.status', () => engine.viewerInfo());
+rpc.handle('viewer.stop', () => engine.stopViewer());
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {
