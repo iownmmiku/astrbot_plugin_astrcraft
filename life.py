@@ -77,6 +77,18 @@ class LifeDecision:
         }
 
 
+def _clip(text: str | None, limit: int) -> str:
+    """把一段文本截到 limit 字以内（超了就截断并标明"还有更多"）。
+
+    为什么要标明：直接截断会让模型以为"就这些了"，从而漏掉关键信息；
+    写一句"（后面还有 N 字没显示）"它就知道可以用工具去查。
+    """
+    t = (text or "").strip()
+    if len(t) <= limit:
+        return t
+    return f"{t[:limit].rstrip()}…（后面还有 {len(t) - limit} 字没显示）"
+
+
 class LifeLoop:
     """她自己过日子的循环。
 
@@ -604,22 +616,20 @@ class LifeLoop:
                 "在 intention 里写下来，下一轮你还会记得它。"
             )
 
-        prompt = f"""你现在正在 Minecraft 里自己玩，没人给你派活。决定一下接下来做什么。
-【当前状态】
-{brief}
-
-{intention_text}
-
-{self.render_todos()}
-
-{f'【你的近期经历】{chr(10)}{recent_text}{chr(10)}' if recent_text else ''}
-{advice_text}
-
-【你现在的心情】
-{suggestion['label']}（强度 {suggestion['level']}）：{suggestion['voice']}
-
-{f'【你记得的事】{chr(10)}{memo_text}{chr(10)}' if memo_text else ''}
-【你可以做的事（技能）】
+        # ============================================================
+        # **上下文分层**（为什么这样切）
+        #
+        # 提示词缓存（DeepSeek/OpenAI/Anthropic 都有）只认**前缀**：
+        # 前缀只要有一个字节变了，后面全部作废。原来的写法是把
+        # 「任务清单说明 / 攻略说明 / 走路说明 / plan 规则 / JSON 格式」
+        # 这一大段**静态文字夹在动态内容中间**，等于每次调用前缀都在变，
+        # 缓存永远命中不了，每一轮都要为这几千字重新付费、重新计算。
+        #
+        # 现在切成两层：
+        #   system = 人格 + **静态规则**（跨轮完全一致 → 可缓存）
+        #   user   = 观察（每轮都变 → 放在最后，不污染前缀）
+        # ============================================================
+        static_rules = f"""【你可以做的事（技能）】
 {skill_text}
 
 请用 JSON 回答，不要输出别的：
@@ -667,6 +677,48 @@ class LifeLoop:
 - 决定权在你：「生存现状」那段只是参考，你可以按自己的想法来；
   但如果那里指出前置条件不满足（没木头就没工具），硬做后面的事只会失败
 - 如果某个做法反复失败过，换个思路或先解决它缺的前置条件，不要重复同一个动作"""
+
+        # 动态部分：**每轮都在变，所以放在最后**（放前面会让缓存前缀失效）
+        #
+        # **观察精炼**：动态段按"做决定最需要什么"排序，而且每一段都有硬上限。
+        # 为什么要有上限：这些段都可能无限长——经历越攒越多、顾问建议会随阶段变长、
+        # 记忆条数虽然限了但每条长度没限。实测把它们原样塞进去时，
+        # 动态段能涨到一千多字，而其中大部分对"现在该做什么"毫无帮助。
+        # 真人做决定时脑子里也就那么几件事，不是把一整天的流水账过一遍。
+        recent_show = _clip(recent_text, 400)
+        advice_show = _clip(advice_text, 500)
+        memo_show = _clip(memo_text, 300)
+        prompt = f"""你现在正在 Minecraft 里自己玩，没人给你派活。决定一下接下来做什么。
+
+【当前状态】
+{brief}
+
+{advice_show}
+{intention_text}
+
+{self.render_todos()}
+
+{f'【你的近期经历】{chr(10)}{recent_show}{chr(10)}' if recent_show else ''}
+{f'【你记得的事】{chr(10)}{memo_show}{chr(10)}' if memo_show else ''}
+【你现在的心情】
+{suggestion['label']}（强度 {suggestion['level']}）：{suggestion['voice']}"""
+
+        # 上下文分层 + 体积分解（排查"为什么慢"时直接看日志）
+        system = f"{system}\n\n{static_rules}"
+        logger.debug(
+            "决策上下文分层：system %d 字（静态，可缓存）｜ user %d 字（动态）"
+            "｜ 其中 状态%d 打算%d 清单%d 经历%d 顾问%d 心情%d 记忆%d 技能%d",
+            len(system),
+            len(prompt),
+            len(brief),
+            len(intention_text),
+            len(self.render_todos()),
+            len(recent_show),
+            len(advice_show),
+            len(suggestion.get("voice") or ""),
+            len(memo_show),
+            len(skill_text),
+        )
 
         # 优先走"带感知工具"的决策：她可以先查看再决定（这才是真人在做的事）。
         # 拿不到工具（没 provider / 工具管理器不可用）就退回纯文本决策，功能不受影响。

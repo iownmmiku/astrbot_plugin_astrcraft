@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """测试：人格桥接 / 记忆 / 驱动力 / 过日子 四个模块能否正常工作。
 
 不依赖 AstrBot 运行时（用假的 Context 与假的人格库），也不依赖 Minecraft。
@@ -324,8 +324,14 @@ async def main() -> int:
         # 真实实现里这是两次不同的调用（不同的 prompt），这里用调用顺序区分：
         # 第 1、2 次是 decide，之后是分享。
         async def fake_llm_ordered(prompt=None, system=None, **kw):
-            llm_calls.append(prompt or "")
-            p = prompt or ""
+            # **记录 system + user 的合并文本**。
+            #
+            # 决策的静态指令（含"请用 JSON 回答"和技能清单）现在放在 system 里
+            # （见 life.decide 里"上下文分层"的说明：静态前缀才能被提示词缓存命中），
+            # 所以只记 prompt 会看不到它们——早期版本就是因为只记 prompt 而误判。
+            combined = f"{system or ''}\n{prompt or ''}"
+            llm_calls.append(combined)
+            p = combined
             if "请用 JSON 回答" in p:
                 return llm_replies[min(len([c for c in llm_calls if "请用 JSON 回答" in c]) - 1, len(llm_replies) - 1)]
             # 分享：返回一句人话
