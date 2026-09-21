@@ -71,27 +71,38 @@ EXCLUDED_TOOLS = (
 # **每一次调用都是一次 LLM 往返**（几秒），所以步数直接等于"她站着不动的时长"。
 # 8 步实测会让她站 30~60 秒，而且模型经常把预算全花在"查看"上、一步没动。
 # 4 步够做完"看一眼 → 动手 → 确认"这样一轮；要接着做，下一轮会自然继续。
-MAX_STEPS = 4
+# 单轮自主行动最多调几次工具。
+#
+# **为什么可以从 4 调回 6**：原来的 4 步之所以不够，是因为"提交了长任务就结束"
+# 这条规则**只写在提示词里、代码没强制**，于是模型会把预算烧在等待和查询上。
+# 现在代码里一看到 `task_id` 就跳出循环（见下面的 return），
+# 步数不再被浪费——多出来的两步留给"先查看再决定"这种正常情况。
+# 而且每一步都是一次模型往返（几秒），上限仍然不能大。
+MAX_STEPS = 6
 
 ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在指挥你。
 
 **你是用工具来行动的**——想做什么就直接调工具，不要只描述。
-比如"去砍树"就调 mc_skill_run(skill="chop_tree")；
-"看看背包"就调 mc_inventory。工具返回什么，你就根据真实结果决定下一步。
+比如"去砍树"就调 `mc_chop_tree(count=8)`；"看看背包"就调 `mc_inventory`。
+工具返回什么，你就根据真实结果决定下一步。
 
-**第二重要的规则：多步的事，用「技能」，不要用原语一步步硬拼。**
+**第二重要的规则：多步的事，用「技能工具」，不要用原语一步步硬拼。**
 
 这是最容易犯的错。原语（mc_craft / mc_mine / mc_goto / mc_place…）是**单个动作**；
-技能（mc_skill_run）是**一整套做完为止的流程**，它内部会处理依赖、重试、找材料。
+技能工具是**一整套做完为止的流程**，它内部会处理依赖、重试、找材料。
 
 | 你想做的事 | **该用**（一次调用） | 不该这样（拼原语） |
 |---|---|---|
-| 要一把木镐 | `mc_skill_run(skill="make_tools", params={"tier":"wooden"})` | mc_craft(oak_planks) → mc_craft(sticks) → mc_place(table) → mc_craft(pickaxe) |
-| 要木头 | `mc_skill_run(skill="chop_tree", params={"count":8})` | mc_scan(wood) → mc_goto → mc_mine ×8 |
-| 要圆石 | `mc_skill_run(skill="mine_stone", params={"count":20})` | mc_goto → mc_mine ×20 |
-| 要铁矿 | `mc_skill_run(skill="mine_ores", params={"ore":"iron","count":5})` | 一步步挖 |
-| 要盖房子 | `mc_skill_run(skill="build_shelter")` 或 `mc_blueprint` | 一块块 mc_place |
-| 要存东西 | `mc_skill_run(skill="store_items")` | 一格一格搬 |
+| 要一把木镐 | `mc_make_tools(tier="wooden")` | mc_craft(oak_planks) → mc_craft(sticks) → mc_place(table) → mc_craft(pickaxe) |
+| 要木头 | `mc_chop_tree(count=8)` | mc_scan → mc_goto → mc_mine ×8 |
+| 要圆石 | `mc_mine_stone(count=20)` | mc_goto → mc_mine ×20 |
+| 要铁矿 | `mc_mine_ores(ore="iron", count=5)` | 一步步挖 |
+| 要盖房子 | `mc_build_shelter()` 或 `mc_blueprint` | 一块块 mc_place |
+| 要存东西 | `mc_store_items()` | 一格一格搬 |
+| 要熔炼 | `mc_smelt(item="iron_ingot", count=3)` | 一个个烧 |
+| 要吃饭 | `mc_cook_food()` 或 `mc_supply` | 一步步找食材 |
+
+（想看完整技能清单就调 `mc_skills`。）
 
 **为什么这条重要**：你每一步都要过一次模型（好几秒）。用技能一次就顶十几个原语，
 而且技能内部会自己处理"材料不够 → 先去拿"这种依赖。
@@ -287,6 +298,20 @@ class ActionAgent:
                 contexts.append(
                     ToolCallMessageSegment(role="tool", tool_call_id=call_id, content=str(out))
                 )
+                # **提交了长任务就立刻结束这一轮——在代码里强制，不能只写在提示词里。**
+                #
+                # 为什么必须强制：技能工具（mc_chop_tree / mc_make_tools…）返回的是
+                # "已让机器人开始「砍树」，**任务号** xxx"，表示"这件事已经在跑了"。
+                # 原来只靠提示词说"提交了就停"，而模型经常不听话，继续一轮轮调工具
+                # **把 4 步预算烧在等待和查询上**，结果是"忙了半天什么都没做成"
+                # （用户看到的就是"一堆无意义的动作"）。
+                #
+                # 注意判据要匹配**中文的"任务号"**：我第一版写成 `"task_id" in out`，
+                # 而工具返回的文案里根本没有字面 task_id（只有"任务号"），
+                # 于是这个提前结束**永远不会触发**。
+                if "任务号" in str(out) or "task_id" in str(out):
+                    logger.info("她提交了长任务（%s），这一轮到此为止", nm)
+                    return "（已经交代下去了，等它跑完）", used
 
         logger.warning("自主行动超过 %s 步，收尾", self.max_steps)
         return "（这一轮做了不少事，先停一下）", used

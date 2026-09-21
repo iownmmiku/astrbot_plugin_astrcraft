@@ -518,5 +518,6 @@ class McSkillTools:
             return event.plain_result(f"没能开始「{label}」：{exc}")
         return event.plain_result(
             f"已让机器人开始「{label}」，任务号 {r.get('task_id')}。\n"
-            f"这会持续一段时间，你可以用 mc_task_status 查进度，或先跟用户说一声再回来查。"
+            f"这会持续一段时间——**你这一轮就到此为止，不用再调别的工具**。\n"
+            f"下一轮你会直接看到结果（做完了什么、拿到了什么）。"
         )
