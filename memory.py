@@ -53,6 +53,11 @@ KIND_LABEL = {
 
 MAX_ENTRIES = 400
 
+# **合并同类条目时最多留几条原始证据**（W5）。
+# 留证据是为了不让坐标/数字在合并时消失；但也不能无限涨——
+# 一条"走不到某处"的教训攒 50 个坐标，喂给模型反而是噪音。
+MAX_EVIDENCE = 5
+
 
 def normalize_text(text: str) -> str:
     """把一句话归一化成"同类型的事长什么样"，用于判重。
@@ -60,6 +65,11 @@ def normalize_text(text: str) -> str:
     去掉数字、括号里的细节、空白——这样
     「挖矿失败：走到 (12, -58, 40) 被挡住了」和
     「挖矿失败：走到 (99, -12, 7) 被挡住了」会被认成同一件事。
+
+    **注意：这个函数只用来"判重"，不要用它来存文本。**
+    踩过（W5）：合并同类条目时保留了第一条的 `text`，而判重会把数字抹掉，
+    于是第二个坐标永久丢失、而且没人会发现。现在每次的原始文本都进
+    `MemoryEntry.evidence`，判重只负责"要不要合并"。
     """
     t = str(text or "")
     t = re.sub(r"-?\d+(?:\.\d+)?", "N", t)  # 数字 → N
@@ -79,10 +89,29 @@ class MemoryEntry:
     context: dict = field(default_factory=dict)
     # **同一件事重复发生过几次**（见 remember 里的判重）
     count: int = 1
+    # ---- W5：记忆是"累积的账"（见 docs/PLAN_v2.md）----
+    #
+    # **为什么加这两个字段**：原来合并同类条目时只保留第一条的 `text`，
+    # 而判重用的 `normalize_text` 会把数字换成 N、把括号内容删掉——
+    # 于是「走不到 (12, -58, 40)」和「走不到 (99, -12, 7)」被认成同一件事，
+    # 合并之后**第二个坐标永久丢失**，而且没人会发现。
+    #
+    # 这正是 numen 的 Compactor 警告过的那件事（它的原话）：
+    #   "每压缩一轮，三轮前记下的坐标与教训就少一点，而且没人会发现。
+    #    摘要是累积的账，只能增补与推进，不能反复转述。"
+    #
+    # 所以：`first_seen` 记**第一次**见到它的时间（合并时绝不被覆盖），
+    # `evidence` 记**每一次的原始文本**（保留坐标/数字），只增不改。
+    first_seen: float = 0.0
+    evidence: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.weight:
             self.weight = KIND_WEIGHT.get(self.kind, 2)
+        if not self.first_seen:
+            self.first_seen = self.at
+        if not self.evidence and self.text:
+            self.evidence = [self.text]
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -97,6 +126,9 @@ class MemoryEntry:
             tags=list(d.get("tags") or []),
             context=dict(d.get("context") or {}),
             count=int(d.get("count", 1) or 1),
+            # 老文件没有这两个字段 → 回落成"就是这一条"（不丢已有信息）
+            first_seen=float(d.get("first_seen", d.get("at", time.time())) or 0),
+            evidence=list(d.get("evidence") or []),
         )
 
 
@@ -176,7 +208,20 @@ class MemoryStore:
 
     @staticmethod
     def _consolidate(entries: list[MemoryEntry]) -> list[MemoryEntry]:
-        """把同 kind + 同归一化文本的条目合成一条（保留最早的 at、累加 count）。"""
+        """把同 kind + 同归一化文本的条目合成一条——**只增补，不重述**（W5）。
+
+        合并时**必须只增不改**。原来这里有两个丢信息的地方：
+
+          1. `first.at = max(first.at, e.at)` —— 把"第一次见到它"的时间
+             覆盖成最近一次，于是"这件事最早是什么时候开始的"没了。
+             现在 `first_seen` 单独存，**合并时绝不动它**。
+          2. 只保留第一条的 `text`，而判重会把数字换成 N、把括号删掉 ——
+             于是「走不到 (12,-58,40)」和「走不到 (99,-12,7)」合并后
+             **第二个坐标永久丢失**。现在每次的原始文本都进 `evidence`。
+
+        能这么改的前提是"**记忆条目本身不是摘要**"：它就是一条条原始记录，
+        合并只是把重复的收拢、把证据留住，不是把它转述成更短的话。
+        """
         by_key: dict[tuple[str, str], MemoryEntry] = {}
         out: list[MemoryEntry] = []
         for e in entries:
@@ -186,10 +231,22 @@ class MemoryStore:
                 by_key[key] = e
                 out.append(e)
                 continue
-            # 合成：次数累加，时间取最近，权重取最大（重要的事不该被稀释）
+            # 合并：次数累加、时间取最近、权重取最大（重要的事不该被稀释）
             first.count += e.count
             first.at = max(first.at, e.at)
             first.weight = max(first.weight, e.weight)
+            # **首见时间只往早取，绝不往晚覆盖**（原来这里丢的就是它）
+            if e.first_seen:
+                first.first_seen = (
+                    min(first.first_seen, e.first_seen) if first.first_seen else e.first_seen
+                )
+            # **证据只增不减**：把这一条的原始文本也留下（坐标就靠它活着）
+            for text in e.evidence or ([e.text] if e.text else []):
+                if text and text not in first.evidence:
+                    first.evidence.append(text)
+            # 证据不能无限涨：留最近 MAX_EVIDENCE 条
+            if len(first.evidence) > MAX_EVIDENCE:
+                first.evidence = first.evidence[-MAX_EVIDENCE:]
             if not first.context and e.context:
                 first.context = e.context
         return out
@@ -242,6 +299,20 @@ class MemoryStore:
                     continue
                 e.count += 1
                 e.at = now
+                # **把这一次的原始文本留成证据**（W5）。
+                #
+                # 这里是**实际会跑**的那条合并路径（写入时判重）——
+                # 我第一版只改了 `_consolidate`（加载时合并），于是
+                # "第二个坐标还在吗" 的断言立刻挂了：真正丢信息的是这里。
+                # 判重会把数字抹掉，所以判重用的 key 不能当内容用，
+                # 每次的原文必须单独存一份。
+                if text and text not in e.evidence:
+                    e.evidence.append(text)
+                if len(e.evidence) > MAX_EVIDENCE:
+                    e.evidence = e.evidence[-MAX_EVIDENCE:]
+                # 首见时间绝不被覆盖（它是"这件事从什么时候开始的"）
+                if not e.first_seen:
+                    e.first_seen = now
                 # 反复发生的事会"变重"，但设上限避免一条噪音压过一切
                 e.weight = min(9.0, max(e.weight, float(weight) if weight is not None else e.weight) + 0.15)
                 if context:
@@ -338,7 +409,22 @@ class MemoryStore:
             # **重复次数要显示出来**：失败 29 次和失败 1 次是两回事，
             # 前者说明这件事有系统性问题（该换做法了），后者只是运气不好。
             times = f"（发生过 {e.count} 次）" if e.count > 1 else ""
-            lines.append(f"- {prefix}（{label}）{e.text}{times}")
+            line = f"- {prefix}（{label}）{e.text}{times}"
+            # **多次发生时把"第一次是什么时候"和具体证据一起给出来**（W5）。
+            # 只给"最近一次"是不够的：她说"这件事发生过 5 次"，
+            # 但不知道从什么时候开始、也不知道每次具体在哪——
+            # 而具体坐标恰恰是判重时被抹掉的东西。
+            if e.count > 1:
+                if e.first_seen and e.first_seen < e.at - 60:
+                    first_ago = _humanize_age(abs(now - e.first_seen))
+                    if first_ago:
+                        line += f"，最早在 {first_ago}前"
+                extra = [t for t in (e.evidence or []) if t and t != e.text]
+                if extra:
+                    # 只举 2 条，且截断——证据是给模型看的线索，不是全文
+                    samples = "；".join(t[:80] for t in extra[:2])
+                    line += f"\n    具体几次：{samples}"
+            lines.append(line)
         return "\n".join(lines)
 
 

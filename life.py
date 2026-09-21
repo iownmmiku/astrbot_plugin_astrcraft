@@ -466,6 +466,43 @@ class LifeLoop:
         if self._intention:
             logger.info("她死了，原来的打算「%s」需要重新考虑", self._intention)
 
+    def _render_progress_since(self, since: float, *, limit: int = 8) -> str:
+        """**自某个时刻以来的累计进展**（W5）——给"打算"当评估证据用。
+
+        为什么不能只看"最近 5 条"：她可能在同一个打算上做了 20 轮，
+        而最近 5 条里全是失败——模型就会以为"这件事我根本没做成过"，
+        然后去做别的（numen 记录过：评估器咬定"没有挖矿证据"，
+        把她赶去满世界找矿四分钟）。
+
+        所以这里按 `since` 起算，**把做成过什么、失败过什么分别列出来**。
+        """
+        if not since:
+            return ""
+        rows = [o for o in self._recent_outcomes if o.get("at", 0) >= since]
+        if not rows:
+            return ""
+        done: dict[str, int] = {}
+        failed: dict[str, int] = {}
+        for o in rows:
+            name = str(o.get("skill") or "（未知）")
+            if o.get("ok"):
+                done[name] = done.get(name, 0) + 1
+            elif not o.get("decision"):
+                # "想事情失败"不算"做事失败"，别混进来（见 W3）
+                failed[name] = failed.get(name, 0) + 1
+        parts = []
+        if done:
+            parts.append("做成过：" + "、".join(f"{k}×{v}" for k, v in sorted(done.items())[:limit]))
+        if failed:
+            parts.append("失败过：" + "、".join(f"{k}×{v}" for k, v in sorted(failed.items())[:limit]))
+        if not parts:
+            return ""
+        return (
+            f"——**自这个打算开始以来**（共 {len(rows)} 条记录）："
+            + "；".join(parts)
+            + "。\n（这是累计的账，不是最近几条——别因为最近几次失败就说'我没做成过'）\n"
+        )
+
     def _render_recent(self) -> str:
         """把"最近做过的事 + 刚死过"渲染成给 LLM 看的一小段。"""
         lines: list[str] = []
@@ -965,9 +1002,22 @@ class LifeLoop:
                     "真人这时会停下来想想：是卡在某个前置条件上（缺工具？缺材料？地形不对？），"
                     "还是该先做别的事、或者换个做法。**你也可以干脆放弃这个打算。**"
                 )
+            # **把"自打算设定以来的进展"给出来**（W5，见 docs/PLAN_v2.md）。
+            #
+            # 为什么需要：`_render_recent()` 只给**最近 5 条**，而她可能在同一个打算上
+            # 已经做了 20 轮——于是模型看不到累计证据，会咬定"我没做过这件事"。
+            #
+            # 这是 numen 记录过的真实事故（GoalSteward 的注释）：
+            #   "她可能分三次才凑够数，只看末尾就永远拼不出累计的证据——实测过一次：
+            #    第一轮挖到 64/128 那条早滚出窗口，后面几轮评估器咬定'没有挖矿证据'，
+            #    把她赶去满世界找矿四分钟。"
+            #
+            # 所以窗口**从打算设定的那一刻起算**，不是"最近几句"。
+            progress = self._render_progress_since(self._intention_since)
             intention_text = (
                 f"【你正在做的事（打算）】\n{self._intention}"
                 f"（已经做了 {self._intention_rounds} 轮）{stuck_hint}\n"
+                f"{progress}"
                 "——你可以继续推进它，也可以改主意（在 intention 里写新的打算）；"
                 "如果这件事已经做完或不想做了，intention 填 null。"
             )
