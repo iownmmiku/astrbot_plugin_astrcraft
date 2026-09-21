@@ -21,6 +21,11 @@ const mining = require('./mining');
 const building = require('./building');
 const gathering = require('./gathering');
 const blueprint = require('./blueprint');
+// **`vec3` 和 `log` 必须显式引入**——climb_out 里要用。
+// 我第一版直接用了这两个名字（以为在作用域里），实际没有 import：
+// `node --check` 抓不到（它们是合法标识符），只会在运行到那一行时 ReferenceError。
+const { vec3 } = require('../util');
+const log = require('../log');
 
 /** 参数校验小工具 */
 function requireParam(params, name, { type = 'number', min = null, max = null, def = null } = {}) {
@@ -162,17 +167,124 @@ const SKILLS = {
         maxSteps: requireParam(params, 'max_steps', { def: 32 }),
       });
       const steps = (res && res.steps) || 0;
-      if (res && res.already) {
-        return skillResult('她已经在地面上了，不用爬', { climbed: 0 });
+
+      // **爬完还要"走出去"**（A 批次，实测踩到）。
+      //
+      // `climbToSurface` 的停止条件是 `isUnderground` 为假 —— 而"只剩 1 格"时
+      // 它判 false（1 格是跳得上去的，对 chop_tree 那种场景是对的）。
+      // 但对**独立调用它脱困**来说，那还不够：她可能还在一个 1x1 的坑里，
+      // 得**走到旁边的地面**上才算出来。
+      // 实测：2 格深的坑里，它把她从 -62 抬到 -61 就报告 done 了，人还在坑里。
+      //
+      // **注意别去调 `actions.dipBelowSurface`**：那个方法挂在 engine（bot.js）上，
+      // 而技能拿到的是 actions —— 我第一版这么写，于是它永远是 undefined、
+      // 这段逻辑**根本没跑**（而且不报错，因为写成了 `actions.x ? ... : null`）。
+      // 所以这里自己算，自包含。
+      const dipHere = () => {
+        try {
+          const bot = actions.bot;
+          const p = bot.entity.position;
+          const bx = Math.floor(p.x);
+          const by = Math.floor(p.y);
+          const bz = Math.floor(p.z);
+          const hs = [];
+          for (const [dx, dz] of [
+            [6, 0],
+            [-6, 0],
+            [0, 6],
+            [0, -6],
+          ]) {
+            for (let y = by + 40; y >= by - 8; y -= 1) {
+              const b = bot.blockAt(vec3(bx + dx, y, bz + dz));
+              if (!b) break;
+              if (b.boundingBox === 'block') {
+                hs.push(y + 1);
+                break;
+              }
+            }
+          }
+          if (hs.length < 3) return null;
+          hs.sort((a, b) => a - b);
+          const surfaceY = hs[Math.floor(hs.length / 2)];
+          const depth = surfaceY - by;
+          return depth > 0 ? { depth, surfaceY, myY: by } : null;
+        } catch {
+          return null;
+        }
+      };
+      let steppedOut = false;
+      try {
+        const dip0 = dipHere();
+        if (dip0 && dip0.depth >= 1) {
+          const p = actions.bot.entity.position;
+          const bx = Math.floor(p.x);
+          const bz = Math.floor(p.z);
+          for (const [dx, dz] of [
+            [1, 0],
+            [-1, 0],
+            [0, 1],
+            [0, -1],
+          ]) {
+            const tx = bx + dx;
+            const tz = bz + dz;
+            // 那一格要"站得上去"：下面是实心、脚和头是空气
+            const floor = actions.bot.blockAt(vec3(tx, dip0.surfaceY - 1, tz));
+            const feet = actions.bot.blockAt(vec3(tx, dip0.surfaceY, tz));
+            const head = actions.bot.blockAt(vec3(tx, dip0.surfaceY + 1, tz));
+            const open = (b) => !!b && (b.boundingBox === 'empty' || b.name === 'air');
+            if (!floor || floor.boundingBox !== 'block') continue;
+            if (!open(feet) || !open(head)) continue;
+            await nav.goTo({
+              x: tx,
+              y: dip0.surfaceY,
+              z: tz,
+              range: 0.9,
+              signal: ctx.signal,
+              timeoutMs: 8000,
+            });
+            if (Math.floor(actions.bot.entity.position.y) >= dip0.surfaceY) {
+              steppedOut = true;
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        if (err && err.name === 'CancelledError') throw err;
+        log.debug(`爬出来后走出去失败：${err.message}`);
+      }
+
+      // **`skillResult` 的第一个参数是布尔，第二个是对象** ——
+      // 我第一版写成了 `skillResult('文本', {climbed})`，
+      // 于是 ok 变成了那个字符串、note 永远是 null，
+      // **结果里什么提示都没有**（实测：她爬出来了但日志里看不到任何说明）。
+      // 签名：skillResult(ok, { steps, produced, consumed, note, reason, extra })
+      // 用上面那个自包含的 dipHere（**不是** actions.dipBelowSurface——
+      // 那个挂在 engine 上，技能拿不到，写成 `actions.x ? ... : null`
+      // 还会静默失效，实测踩过）
+      const dip = dipHere();
+      if (dip && dip.depth >= 1 && !steppedOut) {
+        // 还是没到地面 —— **如实说**，别报告成功
+        return skillResult(false, {
+          note: `爬了 ${steps} 格，但还比周围地面低 ${dip.depth} 格，没走出去`,
+          reason: '坑壁挖不动、或者旁边没有能站的地方',
+          extra: { climbed: steps, depth_left: dip.depth },
+        });
+      }
+      if (res && res.already && !steppedOut) {
+        return skillResult(true, { note: '她已经在地面上了，不用爬', extra: { climbed: 0 } });
       }
       if (!res || !res.ok) {
         // **如实报告**，不假装爬出来了（她需要知道"这条路走不通"）
-        return skillResult(
-          `没能爬出来（爬了 ${steps} 格）：${(res && res.reason) || '原因不明'}`,
-          { climbed: steps, ok: false },
-        );
+        return skillResult(false, {
+          note: `没能爬出来（爬了 ${steps} 格）`,
+          reason: (res && res.reason) || '原因不明',
+          extra: { climbed: steps },
+        });
       }
-      return skillResult(`爬出来了（挖了/垫了 ${steps} 格）`, { climbed: steps, ok: true });
+      return skillResult(true, {
+        note: `爬出来了（挖了/垫了 ${steps} 格${steppedOut ? '，并走到了地面上' : ''}）`,
+        extra: { climbed: steps, stepped_out: steppedOut },
+      });
     },
   },
 

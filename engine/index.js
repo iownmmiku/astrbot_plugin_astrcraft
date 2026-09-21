@@ -1039,6 +1039,46 @@ rpc.handle('debug.resetUnstuck', () => {
   return { ok: true, note: '脱困状态已重置（节流/确认/降频/失败计数）' };
 });
 
+// **脱困诊断**：直接看 _blockingSelf 认为她被什么卡住（排查"被埋住却看不见"用）
+rpc.handle('debug.underground', () => {
+  const bot = engine.requireBot();
+  const p = bot.entity.position;
+  const bx = Math.floor(p.x);
+  const by = Math.floor(p.y);
+  const bz = Math.floor(p.z);
+  const solid = (b) => !!b && b.boundingBox === 'block';
+  const at = (x, y, z) => {
+    try {
+      const b = bot.blockAt(vec3(x, y, z));
+      return b ? { name: b.name, solid: solid(b) } : null;
+    } catch (e) {
+      return { error: e.message };
+    }
+  };
+  const surface = (x, z) => {
+    for (let y = by + 40; y >= by - 8; y -= 1) {
+      const b = bot.blockAt(vec3(x, y, z));
+      if (!b) return { y, missing: true };
+      if (b.boundingBox === 'block') return { surfaceY: y + 1, atY: y, name: b.name };
+    }
+    return { none: true };
+  };
+  const dirs = [[6, 0], [-6, 0], [0, 6], [0, -6]];
+  const samples = dirs.map(([dx, dz]) => ({ dir: `${dx},${dz}`, ...surface(bx + dx, bz + dz) }));
+  const higher = samples.filter((s) => typeof s.surfaceY === 'number' && s.surfaceY >= by + 2).length;
+  const sampled = samples.filter((s) => typeof s.surfaceY === 'number').length;
+  return {
+    position: { x: p.x, y: p.y, z: p.z },
+    blockPosition: { x: bx, y: by, z: bz },
+    ceiling: { twoAbove: at(bx, by + 2, bz), threeAbove: at(bx, by + 3, bz) },
+    samples,
+    sampled,
+    higher,
+    is_underground: sampled >= 3 && higher >= 3,
+    note: '判据：sampled>=3 且 higher>=3（higher = 那一列地表 >= 我脚底+2）',
+  };
+});
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {
