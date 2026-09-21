@@ -287,7 +287,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         except EngineUnavailable as exc:
             logger.error("Minecraft 引擎启动失败：%s", exc)
             logger.error("请检查：1) 是否已安装 Node 依赖  2) engine_dir / node_path 配置是否正确")
+            # **引擎起不来 = ENGINE_DOWN 停牌**（W2）：这时她什么都做不了，
+            # 而且必须能说清"是引擎没了"，而不是让她安静地站着。
+            if self.life:
+                self.life.note_engine_up(False)
             return
+        if self.life:
+            self.life.note_engine_up(True)
 
         if self._cfg("auto_connect", False):
             asyncio.create_task(self._auto_connect(), name="mc-auto-connect")
@@ -358,8 +364,17 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 if not self.engine.running:
                     logger.warning("检测到引擎未运行，正在重新拉起")
                     self.connected = False
+                    # **引擎没了 = ENGINE_DOWN 停牌**（W2）：这时她做不了任何事，
+                    # 而这张表让"她为什么不动"有一个明确的答案，不是安静地站着。
+                    if self.life:
+                        try:
+                            self.life.note_engine_up(False)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("标记引擎停牌失败：%s", exc)
                     try:
                         await self.engine.start()
+                        if self.life:
+                            self.life.note_engine_up(True)
                         if self._cfg("auto_connect", False):
                             await self._auto_connect(reason="引擎重启后恢复")
                     except Exception as exc:  # noqa: BLE001
@@ -663,6 +678,15 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         pos = data.get("position") or {}
         logger.info("机器人已进服：%s @ %s", data.get("username"), data.get("version"))
 
+        # **进服/复活 = 解开 DEAD 与 DISCONNECTED 两种停牌**（W2 的 Hold 表）。
+        # 在这张表之前，这两种停牌没有任何"谁来解开"的路径，
+        # 于是会变成永久停滞——正是 _auto_resume_if_expired 那个补丁要治的病。
+        if self.life:
+            try:
+                self.life.note_dead(False)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("解除死亡停牌失败：%s", exc)
+
         # **每次进游戏都重新排一份计划**（用户要的"每一次进游戏也会生成一个任务"）。
         # 旧的计划是针对"上次那个处境"排的，进服后处境可能完全不同
         # （换了位置、身上东西没了、天黑了），接着旧计划干往往第一件事就不成立。
@@ -755,6 +779,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             # 真人死后第一反应是回去捡，而 MC 里掉落物大约 5 分钟就消失。
             try:
                 self.life.note_death(pos)
+                # **同时进入 DEAD 停牌**（W2）：死着的时候她不该继续决策——
+                # 之前没有这个状态，死了之后决策层照样在跑，只是每件事都失败。
+                self.life.note_dead(True)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("记录死亡地点失败：%s", exc)
             asyncio.create_task(
@@ -1447,6 +1474,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """她现在的日程、心思与最近做过的事"""
         lines = []
         if self.life:
+            # **先回答"她为什么没在动"**（W2 的 Hold 表）。
+            # 这是这一屏最该先说的事：如果她在停牌，后面那些"日程/心思"都是过期的。
+            try:
+                lines.append(f"【能动吗】{self.life.hold_explain()}")
+                lines.append("")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("渲染停牌说明失败：%s", exc)
             lines.append(self.life.describe())
         if self.drives:
             lines.append("")

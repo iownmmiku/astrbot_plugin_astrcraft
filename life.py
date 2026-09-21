@@ -23,6 +23,7 @@ import asyncio
 import json
 import random
 import time
+from enum import Enum
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -87,6 +88,56 @@ def _clip(text: str | None, limit: int) -> str:
     if len(t) <= limit:
         return t
     return f"{t[:limit].rstrip()}…（后面还有 {len(t) - limit} 字没显示）"
+
+
+class Hold(Enum):
+    """她为什么**不能**动——**唯一答案**。
+
+    这是把原来散在 `_loop` 里的几个条件收成一张表。收之前的样子：
+
+        self._paused            # 主人按了暂停
+        self._pause_until       # 暂停超时（补丁）
+        self._busy_until        # 刚提交任务后的等待期
+        self._is_connected()    # 没进服
+        self._engine_busy()     # 引擎在忙
+
+    五个独立条件、每个都能**静默** `continue` —— 于是"她站在原地什么都不干"时，
+    日志里只有一行"跳过"，没人说得清到底是哪一个。`_auto_resume_if_expired()`
+    就是给 `_paused` 打的补丁（它自己的注释写着："早期版本只 pause、
+    靠 task.finished 事件 resume，结果工具执行失败时根本不会有任务产生，
+    于是她永久停滞"）。
+
+    现在：`current_hold()` 合成唯一答案，每种停牌都配一张"**谁来解开**"的表，
+    进/出**只在变化沿打一条日志**（停牌期间每 tick 都不刷屏）。
+    """
+
+    NONE = "none"  # 没有停牌：可以跑
+    DEAD = "dead"  # 她死了
+    DISCONNECTED = "disconnected"  # 没进服
+    PAUSED_BY_OWNER = "paused_by_owner"  # 主人在用她 / 按了暂停
+    BLOCKED = "blocked"  # 模型端点不可用
+    ENGINE_DOWN = "engine_down"  # 引擎进程没了
+
+
+# **谁来解开**——照 numen 的 releasedBy 表。缺了这张表，停牌就会变成"永久停滞"。
+HOLD_RELEASE: dict["Hold", str] = {
+    Hold.NONE: "",
+    Hold.DEAD: "复活（收到 bot.spawn）",
+    Hold.DISCONNECTED: "重新进服",
+    Hold.PAUSED_BY_OWNER: "主人恢复，或暂停超时自动恢复",
+    Hold.BLOCKED: "模型端点恢复（配好 provider 后自己解开）",
+    Hold.ENGINE_DOWN: "引擎进程起来",
+}
+
+# 给人看的一句话
+HOLD_WHY: dict["Hold", str] = {
+    Hold.NONE: "她在正常过日子",
+    Hold.DEAD: "她已经死了，在等复活",
+    Hold.DISCONNECTED: "她还没进服",
+    Hold.PAUSED_BY_OWNER: "自主行动被暂停了（主人在用她，或按了暂停）",
+    Hold.BLOCKED: "拿不到模型（provider 没配好或调用失败）",
+    Hold.ENGINE_DOWN: "引擎进程不在（node 挂了或没启动）",
+}
 
 
 class LifeLoop:
@@ -187,6 +238,13 @@ class LifeLoop:
         self._paused = False
         self._pause_reason = ""
         self._pause_until = 0.0
+        # ---- Hold（停牌）的真实状态源 ----
+        # 这里只存**事实**，判断集中在 current_hold() 一处。
+        # 原来这些条件散在 _loop 里各判各的，谁也说不清她为什么没动。
+        self._dead = False  # 死了（等复活）
+        self._engine_up = True  # 引擎进程在不在（默认乐观，由 main.py 告知）
+        self._blocked_reason = ""  # 模型端点不可用的原因（空 = 可用）
+        self._announced_hold: Hold | None = None  # 只为找"变化沿"，不参与判断
         self._busy_until = 0.0
         # 单次决策的超时。必须有：LLM 卡住时若没有超时，整个循环会**永久冻结**，
         # 而且不留任何日志——实测她因此"一次都没自己动过"，
@@ -396,6 +454,79 @@ class LifeLoop:
             )
             self.resume()
 
+    # ------------------------------------------------------------ 停牌（Hold）
+
+    def current_hold(self) -> Hold:
+        """她为什么**不能**动——唯一答案。
+
+        **别处不许再各自判断这些条件。** 想知道"她为什么没动"就调这一个。
+        顺序有意义：死 > 掉线 > 引擎没了 > 被暂停 > 模型不可用。
+        （死着的时候"没进服"是废话，所以死排最前。）
+        """
+        if self._dead:
+            return Hold.DEAD
+        if self._is_connected and not self._is_connected():
+            return Hold.DISCONNECTED
+        if not self._engine_up:
+            return Hold.ENGINE_DOWN
+        if self._paused:
+            return Hold.PAUSED_BY_OWNER
+        if self._blocked_reason:
+            return Hold.BLOCKED
+        return Hold.NONE
+
+    def hold_explain(self) -> str:
+        """一句人话：她为什么没在动 + 什么能解开它。"""
+        h = self.current_hold()
+        if h is Hold.NONE:
+            return HOLD_WHY[h]
+        why = HOLD_WHY[h]
+        rel = HOLD_RELEASE.get(h) or "（没写谁来解开——这是个 bug）"
+        detail = ""
+        if h is Hold.BLOCKED and self._blocked_reason:
+            detail = f"（{self._blocked_reason}）"
+        elif h is Hold.PAUSED_BY_OWNER and self._pause_reason:
+            detail = f"（{self._pause_reason}）"
+        return f"{why}{detail}；解开条件：{rel}"
+
+    def _announce_hold(self) -> None:
+        """**只在变化沿打日志**：停牌期间每 tick 都调也不会刷屏。
+
+        这条是 numen 的做法（`announceHold` 只找变化沿）。原来的毛病是
+        "她不动"时日志里什么都没有，或者反过来每 tick 刷一行。
+        """
+        now = self.current_hold()
+        if now == self._announced_hold:
+            return
+        prev = self._announced_hold
+        self._announced_hold = now
+        if prev is None:
+            return  # 第一次不报（启动时 NONE 很正常）
+        if now is Hold.NONE:
+            logger.info("停牌解除（原来是 %s）——她可以动了", prev.value)
+        else:
+            logger.warning("停牌：%s", self.hold_explain())
+
+    def note_dead(self, dead: bool) -> None:
+        """她死了/复活了。由 main.py 在 bot.death / bot.spawn 时调用。"""
+        self._dead = bool(dead)
+        self._announce_hold()
+
+    def note_engine_up(self, up: bool) -> None:
+        """引擎进程在不在。由 main.py 在引擎启停时调用。"""
+        self._engine_up = bool(up)
+        self._announce_hold()
+
+    def note_blocked(self, reason: str = "") -> None:
+        """模型端点不可用（拿不到 provider、调用连续失败…）。"""
+        self._blocked_reason = str(reason or "未知原因")
+        self._announce_hold()
+
+    def note_unblocked(self) -> None:
+        """模型端点恢复了。"""
+        self._blocked_reason = ""
+        self._announce_hold()
+
     @property
     def running(self) -> bool:
         return bool(self._task and not self._task.done() and not self._stopped)
@@ -463,13 +594,23 @@ class LifeLoop:
                 # 把她永久按在原地——那正是"她再也不自己动"的原因。
                 self._auto_resume_if_expired()
 
-                if self._paused:
-                    continue
-                if time.time() < self._busy_until:
+                # **停牌判断收成一处**（W2）。
+                #
+                # 原来是 5 个独立条件、各自 `continue`，而且**一句日志都没有**——
+                # 她站在原地不动时，日志里只有一行"跳过"，没人说得清是哪一个。
+                # 现在：current_hold() 合成唯一答案，进/出只在变化沿打日志。
+                self._announce_hold()
+                hold = self.current_hold()
+                if hold is not Hold.NONE:
+                    # 停牌期间不空转：等一会儿再看（_wake 会在有输入时立刻叫醒）
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), timeout=5.0)
+                        self._wake.clear()
+                    except asyncio.TimeoutError:
+                        pass
                     continue
 
-                # 必须已连接进服才开始决策（没进服时不白跑决策）
-                if self._is_connected and not self._is_connected():
+                if time.time() < self._busy_until:
                     continue
 
                 # 引擎空闲才自主行动：有任务在跑说明你（或目标系统）已经在用她

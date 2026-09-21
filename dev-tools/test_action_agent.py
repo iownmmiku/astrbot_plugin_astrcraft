@@ -128,6 +128,23 @@ text2, used2 = run(build(prov2, ex_read))
 ok("只读工具后继续跑（模型被调用多次）", prov2.calls > 1, f"模型调用 {prov2.calls} 次")
 ok("步数没有超过上限", len(used2) <= MAX_STEPS, f"调了 {len(used2)} 次")
 
+print("\n=== 提示词里的步数必须和 MAX_STEPS 一致 ===")
+# 踩过：上一轮把 MAX_STEPS 从 4 调到 6，但提示词里还写着"你只有 4 步""最多 4 步"
+# ——模型按 4 步给自己压预算，**正好抵消那次修复**，而且没人发现。
+# 现在提示词从 MAX_STEPS 插值，这个断言负责在它再次漂移时立刻炸。
+from plugin.action_agent import ACTION_PROMPT, _STEPS_TOKEN  # noqa: E402
+
+ok("提示词里没有残留占位符", _STEPS_TOKEN not in ACTION_PROMPT, _STEPS_TOKEN)
+_step_nums = re.findall(r"(\d+)\s*步", ACTION_PROMPT)
+ok("提示词里确实提到了步数（断言本身有效）", len(_step_nums) >= 1, f"找到 {_step_nums}")
+_step_bad = sorted({int(n) for n in _step_nums if int(n) != MAX_STEPS})
+ok(
+    "提示词里所有步数都等于 MAX_STEPS",
+    not _step_bad,
+    f"提示词={_step_nums}，MAX_STEPS={MAX_STEPS}"
+    + (f"，不一致的有 {_step_bad}" if _step_bad else ""),
+)
+
 print("\n=== 判据必须匹配中文「任务号」 ===")
 src = pathlib.Path(__file__).resolve().parents[2] / "plugin" / "action_agent.py"
 t = src.read_text(encoding="utf-8")
