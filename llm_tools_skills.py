@@ -295,6 +295,28 @@ class McSkillTools:
         """
         return await self._submit_skill(event, "mine_stone", {"count": int(count)}, f"挖 {count} 个圆石")
 
+    @filter.llm_tool(name="mc_climb_out")
+    async def tool_mc_climb_out(
+        self,
+        event: AstrMessageEvent,
+        max_steps: int = 32,
+    ) -> MessageEventResult:
+        """从坑里、竖井里、矿道里爬回地面（挖阶梯 + 垫脚上升 + 侧向开洞）。
+
+        **什么时候该用它**：你比周围地面低 2 格以上（跳不上去——MC 的跳跃高度只有
+        1.25 格），或者挖矿挖到地下出不来。这种情况普通走路是解决不了的：
+        走路不改动世界，而 2 格以上的台阶必须挖或垫。
+
+        它会依次尝试：挖旁边的台阶走上去 → 垫脚上升（跳起来往脚下放方块）
+        → 往侧面开一格再挖阶梯。**做不到会如实告诉你为什么**，不会假装成功。
+
+        Args:
+            max_steps(number): 最多挖/垫几格，默认 32
+        """
+        return await self._submit_skill(
+            event, "climb_out", {"max_steps": int(max_steps)}, "爬出坑/矿道"
+        )
+
     @filter.llm_tool(name="mc_supply")
     async def tool_mc_supply(self, event: AstrMessageEvent) -> MessageEventResult:
         """让机器人做一次生存补给：准备食物 + 补齐工具 + 做火把。适合出远门前用。"""

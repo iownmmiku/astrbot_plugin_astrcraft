@@ -668,9 +668,29 @@ rpc.handle(
           onTick: (info) => task.setDetail(`距目标约 ${distance(info.position, { x: Number(params.x), y: info.position.y, z: Number(params.z) }).toFixed(1)} 格`),
         });
         if (!r.arrived) {
+          // **说清病因，别只说"被挡住了"**（A 批次，见 docs/ESCAPE_ABILITIES.md）。
+          //
+          // 实测：她掉进 2 格深的坑时，move.to 只会说"可能被方块挡住或目标不可达"——
+          // 而她真正的问题是"**比周围地面低 2 格，跳不上去**"
+          // （MC 跳跃高度 1.25 格；而走路不改动世界，所以普通移动永远不挖）。
+          // 报错误导 → 她会反复重试同一个走法 → 看起来就是"卡住了"。
+          // 这和之前治过的"走不到只说水平距离"是同一类病。
+          const dip = engine.dipBelowSurface ? engine.dipBelowSurface() : null;
+          let hint =
+            '可能被方块挡住或目标不可达；可以试试先挖开挡路的东西，或换一个更近的位置';
+          if (dip && dip.depth >= 2) {
+            hint =
+              `**你比周围地面低 ${dip.depth} 格**（你在 y=${dip.myY}，周围地面在 y=${dip.surfaceY}）。` +
+              `MC 的跳跃高度只有 1.25 格，所以 ${dip.depth} 格是**跳不上去的**，` +
+              `而且走路不改动世界——普通走法永远出不来。` +
+              `**用 mc_climb_out 爬出来**（挖台阶/垫脚上升），或者自己用 mc_place 垫方块。`;
+          } else if (dip && dip.depth === 1) {
+            hint =
+              '你可能被 1 格台阶挡着——那**跳一下就上去了**，再试一次；' +
+              '如果还是不行就换条路，或者用 mc_plan_route 看看要挖哪几格';
+          }
           throw new GameError(
-            `没能到达目标：停在 ${fmtVec(r.final_position)}，距目标还有 ${r.distance_to_target} 格。` +
-              `可能被方块挡住或目标不可达；可以试试先挖开挡路的东西，或换一个更近的位置`,
+            `没能到达目标：停在 ${fmtVec(r.final_position)}，距目标还有 ${r.distance_to_target} 格。${hint}`,
           );
         }
         return r;

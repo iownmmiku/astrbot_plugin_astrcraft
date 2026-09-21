@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * 冒烟测试：直接以子进程方式拉起引擎，走真实 NDJSON 协议跑一遍关键 RPC。
  *
@@ -162,7 +162,11 @@ async function main() {
     check('未知技能被拒绝并列出可用技能', /可用技能/.test(err.message), err.message.slice(0, 60));
   }
   const list = await c.call('skill.list');
-  check('skill.list 返回 16 个技能', list.names.length === 16, list.names.join(','));
+  // **技能数会随功能增长**（climb_out 是 A 批次加的，见 docs/ESCAPE_ABILITIES.md）。
+  // 断言"至少 17 个"而不是"正好 17 个"——加技能时不用改测试，
+  // 但**少技能**（注册表坏了）仍然会被抓到。
+  // 原来写死 `=== 16`：加一个技能就红，那是在测"数字"而不是在测"功能"。
+  check('skill.list 至少返回 17 个技能', list.names.length >= 17, list.names.join(','));
 
   // ---- 3. 协议纯度：stdout 只能是 NDJSON（上面解析失败会记 fail）
   console.log('\n[3] 协议纯度');

@@ -1754,6 +1754,55 @@ class McEngine {
     this._lastHeldTool = cur;
   }
 
+  /**
+   * **我比周围地面低几格**（A 批次，见 docs/ESCAPE_ABILITIES.md）。
+   *
+   * 为什么要它：她掉进 2 格深的坑时，`move.to` 只会说"可能被方块挡住或目标不可达"——
+   * 而真正的问题是"比周围地面低 2 格、跳不上去"（MC 跳跃高度 1.25 格）。
+   * 报错误导 → 她反复重试同一个走法 → 看起来就是"卡住了"。
+   *
+   * 取四个方向 6 格外的"地表高度"（**从上往下扫**找最高的实心块，
+   * 不是从她那一层往上扫——那样实心柱子会返回她自己那一层，永远判不出高低）。
+   *
+   * @return {depth, myY, surfaceY} 或 null（读不到 / 不在坑里）
+   */
+  dipBelowSurface() {
+    const bot = this.bot;
+    if (!bot || !bot.entity) return null;
+    const p = bot.entity.position;
+    const bx = Math.floor(p.x);
+    const by = Math.floor(p.y);
+    const bz = Math.floor(p.z);
+    const heights = [];
+    for (const [dx, dz] of [
+      [6, 0],
+      [-6, 0],
+      [0, 6],
+      [0, -6],
+    ]) {
+      for (let y = by + 40; y >= by - 8; y -= 1) {
+        let b = null;
+        try {
+          b = bot.blockAt(vec3(bx + dx, y, bz + dz));
+        } catch {
+          break;
+        }
+        if (!b) break;
+        if (b.boundingBox === 'block') {
+          heights.push(y + 1); // 站在这块上面
+          break;
+        }
+      }
+    }
+    if (heights.length < 3) return null;
+    // 用中位数当"周围地面"（避免一格悬崖把结论带偏）
+    heights.sort((a, b) => a - b);
+    const surfaceY = heights[Math.floor(heights.length / 2)];
+    const depth = surfaceY - by;
+    if (depth <= 0) return null;
+    return { depth, myY: by, surfaceY };
+  }
+
   _onTaskFinished(task) {
     const payload = {
       task_id: task.id,

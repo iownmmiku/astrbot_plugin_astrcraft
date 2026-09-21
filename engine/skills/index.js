@@ -7,7 +7,15 @@
  *   - 缺参数要给出**可执行**的报错，而不是 undefined 崩溃
  */
 
-const { SkillContext, skillResult, mergeCounts, positiveOnly, driveUntil, settle } = require('./common');
+const {
+  SkillContext,
+  skillResult,
+  mergeCounts,
+  positiveOnly,
+  driveUntil,
+  settle,
+  climbToSurface,
+} = require('./common');
 const wood = require('./wood');
 const mining = require('./mining');
 const building = require('./building');
@@ -127,6 +135,44 @@ const SKILLS = {
         radius: requireParam(params, 'radius', { def: 40 }),
         maxAttempts: requireParam(params, 'max_attempts', { def: 30 }),
       });
+    },
+  },
+
+  climb_out: {
+    label: '爬出坑/矿道',
+    description:
+      '从坑里、竖井里、矿道里爬回地面：挖阶梯 + 垫脚上升 + 侧向开洞。' +
+      '掉进 2 格以上深的坑、或挖矿挖到地下出不来时用这个',
+    // **为什么要把它暴露出来**（A 批次，见 docs/ESCAPE_ABILITIES.md）：
+    // climbToSurface 早就写好了（含垫脚上升、开侧洞、挖阶梯，实测能从 20 格深的
+    // 竖井里爬出来），但**只被三处内部调用**：
+    //   wood.js:40（chop_tree 开头）、building.js:41（build_shelter 开头）、
+    //   bot.js:909（脱困反射第 4 次起）
+    // 也就是说**她自己调不到**——掉进 2 格深的坑里只能干等那个带 8 秒节流的反射。
+    // 实测：1 格深的坑能出来，2 格/3 格的出不来（MC 跳跃高度 1.25 格），
+    // 而"走路不改动世界"意味着普通移动永远不挖。所以她就被困住了。
+    params: {
+      max_steps: { type: 'number', min: 1, max: 96, def: 32 },
+    },
+    async run({ actions, nav, ctx, params }) {
+      const res = await climbToSurface({
+        actions,
+        nav,
+        ctx,
+        maxSteps: requireParam(params, 'max_steps', { def: 32 }),
+      });
+      const steps = (res && res.steps) || 0;
+      if (res && res.already) {
+        return skillResult('她已经在地面上了，不用爬', { climbed: 0 });
+      }
+      if (!res || !res.ok) {
+        // **如实报告**，不假装爬出来了（她需要知道"这条路走不通"）
+        return skillResult(
+          `没能爬出来（爬了 ${steps} 格）：${(res && res.reason) || '原因不明'}`,
+          { climbed: steps, ok: false },
+        );
+      }
+      return skillResult(`爬出来了（挖了/垫了 ${steps} 格）`, { climbed: steps, ok: true });
     },
   },
 
