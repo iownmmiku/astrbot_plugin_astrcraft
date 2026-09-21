@@ -1676,6 +1676,11 @@ class McEngine {
       error: task.error ? describeFailure(task.error) : null,
       duration_ms: task.finishedAt && task.startedAt ? task.finishedAt - task.startedAt : null,
       result: task.result,
+      // **被抢了几次**（身体层 S3/S4）：抢占是"取消 + 重新排队"，任务会接着重跑、
+      // 而且技能是按背包数量算差值的、不会白费。把这个数露出来，
+      // 被反复打断时就能如实报告，而不是让人以为"任务莫名其妙重启了"。
+      preempt_count: task.preemptCount || 0,
+      preempted_by: task.preemptedBy || null,
     };
     this.state.setCurrentTaskText(null);
     this._emit('task.finished', payload);

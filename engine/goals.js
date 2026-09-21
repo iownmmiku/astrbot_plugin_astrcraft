@@ -177,6 +177,20 @@ class TaskQueue {
         log.info(`任务 ${task.name}(${task.id}) 抢占 ${this._current.name}(${this._current.id})`);
         this._stats.preempted += 1;
         const victim = this._current;
+        // **记一次"被抢"，用于可见性与防抖动**（身体层设计 S3/S4，见 docs/BODY_LAYER.md）。
+        //
+        // 为什么需要：抢占是"取消 + 重新排队"，被抢的任务**会接着重跑**。
+        // 而技能大多是按"背包里已有的数量"算差值的（chop_tree / mine_ores /
+        // collect 都是），所以重跑**不会白费**——这一点原来完全不可见，
+        // 从外面看就是"任务莫名其妙重启了一次"。
+        // 记下来之后：任务结果里会带 preempt_count，被抢太多次就能如实报告
+        // "我被反复打断"（S4 的上限判断要用它）。
+        victim.preemptCount = (victim.preemptCount || 0) + 1;
+        victim.preemptedBy = task.name;
+        log.warn(
+          `「${victim.name}」被「${task.name}」抢走身体（第 ${victim.preemptCount} 次），` +
+            `已放回队头——重新跑会从"已经做到哪"接着做，不会白费`,
+        );
         // 回队头重排，不丢弃
         victim.status = 'pending';
         victim.startedAt = null;
