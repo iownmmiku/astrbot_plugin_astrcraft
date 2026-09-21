@@ -742,7 +742,8 @@ class McEngine {
       //   - 她自己的脱困逻辑只在"寻路失败且目标 8 格内"时才触发，够不着这种场景
       // 结果就是她被困在地下、什么都做不成，而日志里只有"路被堵死了"。
       // 放在最前面（优先级同致命级）：被埋住比溺水更常见。
-      if (this.config.get('autoUnstuck', true) && Date.now() - this._lastUnstuckAt > 8000) {        const stuckBlock = this._blockingSelf();
+      if (this.config.get('autoUnstuck', true) && Date.now() - this._lastUnstuckAt > 8000) {
+        const stuckList = this._blockingSelf();
         // 判定条件：**有方块占着她身体所在的那一格（或头顶那一格）**。
         //
         // 这里刻意**不要求"她静止不动"**：实测完全被埋住时服务器会推动她，
@@ -756,8 +757,12 @@ class McEngine {
         // 代价是"真被困时可能要等手上任务先失败"，但那个任务本来也会很快失败
         // （日志里就是"路被堵死了"），之后挖困任务立刻执行。
         const now = Date.now();
-        if (stuckBlock) {
-          const key = `${stuckBlock.x},${stuckBlock.y},${stuckBlock.z}`;
+        if (stuckList && stuckList.length) {
+          const stuckBlock = stuckList[0];
+          const key = stuckList
+            .map((c) => `${c.x},${c.y},${c.z}`)
+            .sort()
+            .join('|');
           const confirmed = this._unstuckPending && this._unstuckPending.key === key;
           if (!confirmed) {
             this._unstuckPending = { key, at: now };
@@ -788,19 +793,55 @@ class McEngine {
             }
             this._unstuckTimes.push(now);
             this._lastUnstuckAt = now;
-            const desc = `${stuckBlock.name}(${stuckBlock.x},${stuckBlock.y},${stuckBlock.z})`;
-            log.warn(`确认被 ${desc} 卡住，挖开它`);
+            const desc = stuckList
+              .map((c) => `${c.name}(${c.x},${c.y},${c.z})`)
+              .join(' + ');
+            log.warn(`确认被 ${desc} 卡住，挖开它（${stuckList.length} 格）`);
             this._submitReflex(
               '挖开卡住自己的方块',
               async ({ signal }) => {
-                this.state.note(`被 ${desc} 卡住了，挖开它`);
-                await this.actions.dig({
-                  x: stuckBlock.x,
-                  y: stuckBlock.y,
-                  z: stuckBlock.z,
-                  signal,
-                  collect: true,
-                });
+                // **把"占着自己身体的那几格"一次全挖掉。**
+                //
+                // 踩过：只挖头那一格，脚还堵着 → 人仍然卡住 → 要等下一轮 2 秒确认
+                // 再挖脚，实测 25 秒都没脱身。真人被埋住是一次把身上几格清干净。
+                //
+                // 每一格执行前都复核：从"检测到卡住"到"任务真的跑起来"之间隔了一拍，
+                // 这一拍里她可能已经被别的动作挪走了。原来不复核的后果实测是
+                // "挖困自救失败：dirt(-52,60,119) 距离 8.7 格，超出可挖距离"——
+                // 一次注定失败的挖掘，还被计成"自救失败"、加速进入静默期。
+                let dugAny = 0;
+                for (const cell of stuckList) {
+                  if (signal && signal.aborted) throw new CancelledError();
+                  const bp = bot.entity.position;
+                  const near =
+                    Math.abs(bp.x - (cell.x + 0.5)) <= 2.5 &&
+                    Math.abs(bp.z - (cell.z + 0.5)) <= 2.5 &&
+                    Math.abs(bp.y - cell.y) <= 2.5;
+                  if (!near) {
+                    log.debug(`挖困自救：${cell.name} 已经不贴着了，跳过`);
+                    continue;
+                  }
+                  const nowBlock = bot.blockAt(vec3(cell.x, cell.y, cell.z));
+                  if (!nowBlock || nowBlock.boundingBox !== 'block') {
+                    log.debug(`挖困自救：${cell.name} 那格已经不是实心了，跳过`);
+                    continue;
+                  }
+                  this.state.note(`被 ${cell.name} 卡住了，挖开它`);
+                  try {
+                    await this.actions.dig({
+                      x: cell.x,
+                      y: cell.y,
+                      z: cell.z,
+                      signal,
+                      collect: true,
+                    });
+                    dugAny += 1;
+                  } catch (err) {
+                    if (err instanceof CancelledError) throw err;
+                    log.debug(`挖困自救：挖 ${cell.name} 失败（${err.message}）`);
+                  }
+                }
+                if (!dugAny) log.debug('挖困自救：一格都没挖成（都不贴身了）');
               },
               'normal',
               {
@@ -838,7 +879,8 @@ class McEngine {
       // 这里做两件事：在游戏里说一句求助，并把情况写进状态简报让 LLM 知道
       // （它可以决定"回出生点重新来过"这种策略）。
       if (this.config.get('autoUnstuck', true) && Date.now() - this._lastHelpAt > 60000) {
-        const stuckBlock = this._blockingSelf();
+        const stuckList = this._blockingSelf();
+        const stuckBlock = Array.isArray(stuckList) ? stuckList[0] : stuckList;
         const hasTool = this.actions.inventoryMap && Object.keys(this.actions.inventoryMap()).length > 0;
         if (stuckBlock && !hasTool && this.bot.chat) {
           this._lastHelpAt = Date.now();
@@ -1342,7 +1384,20 @@ class McEngine {
       const hb = HAND_DIGGABLE.test(b.name) ? 0 : 1;
       return ha - hb || a.prio - b.prio;
     });
-    return candidates[0];
+    // **返回"要挖的所有格子"，而不是只挑一个。**
+    //
+    // 踩过：被埋住时头和脚两格都是实心，但只挖了头那一格 → 人还卡着 →
+    // 要等下一轮 2 秒确认再挖脚，而测试里 25 秒都没脱身。
+    // 真人被埋住是**一次把身上几格全清掉**，不是一格一格慢慢来。
+    const selfCells = candidates.filter((c) => c.prio <= 1);
+    if (selfCells.length) return selfCells;
+    // 四面 × 两层 = 最多 8 个"围住"的方块；全满才算真的没有出路（困在袋子里）
+    const walls = candidates.filter((c) => c.prio === 2);
+    if (walls.length >= 8) {
+      log.debug('四面加上下都被围死了（困在袋子里），挖开一面');
+      return [walls[0]];
+    }
+    return null;
   }
 
   /**

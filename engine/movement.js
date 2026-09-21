@@ -292,16 +292,64 @@ class Navigator {
     }
     // **失败要"带价签"**：不只是说走不到，还要说清楚"要挖开哪几格才能过去"。
     //
-    // 这是 参考实现 的做法——"没有干净的路时，它会列出几条带价签的候选路线
+    // 这是"带价签的候选路线"的做法——"没有干净的路时，它会列出几条带价签的候选路线
     // （各要挖什么、放什么）"，让模型自己决定值不值得动世界。
     // 只报"地形把路堵死了"的话，模型除了放弃没有别的选择。
     const needs = this._describeRouteNeeds(pos, { x, z });
+    // **高度差必须说在最前面，而且要说人话。**
+    //
+    // 实测踩过的坑（很严重）：她在 y=51 的地下，目标工作台在 y=122 的地表，
+    // 但原来的消息只报水平距离——
+    //   "走不到 (-67, 122)：停在 (-55.5, 51, 119)，还差 11.9 格"
+    // 模型看到"还差 11.9 格"以为快到了，于是**每 2 分钟重试一次，永远出不来**。
+    // 真实情况是：目标在她头顶 71 格，需要挖阶梯上去——而这句话原来的消息里
+    // 一个字都没提。
+    const dy = Number.isFinite(Number(y)) && y !== null && y !== undefined ? Number(y) - pos.y : null;
+    let vertical = '';
+    if (dy !== null && Math.abs(dy) >= 4) {
+      vertical =
+        dy > 0
+          ? `**目标在你上方 ${Math.round(dy)} 格**（你 y=${pos.y.toFixed(0)}，目标 y=${Number(y).toFixed(0)}）——` +
+            `先想办法上去：挖阶梯向上（mc_mine 挖脚下的方块往上走）、或者找洞/水/梯子。` +
+            `**在地底是走不到地表的，这不是"再走几步"的事。**`
+          : `**目标在你下方 ${Math.round(-dy)} 格**——要先往下挖（挖阶梯，不要直挖竖井）。`;
+    }
+    // **同一个目标反复失败要说出来**：不然模型会一直重试同一个动作。
+    const tries = this._noteFailedGoal({ x, y, z });
+    const repeat =
+      tries >= 3
+        ? `**这已经是第 ${tries} 次尝试走到这里失败了**——别再重复同样的做法，换个思路：` +
+          `挖开路 / 换个更近的目标 / 或者干脆做别的事。`
+        : '';
     throw new PathError(
-      `走不到 (${x}, ${z})：停在 ${fmtVec(pos)}，还差 ${remain.toFixed(1)} 格。` +
+      `走不到 (${x}, ${z})：停在 ${fmtVec(pos)}，水平还差 ${remain.toFixed(1)} 格。` +
+        (vertical ? `\n${vertical}` : '') +
+        (repeat ? `\n${repeat}` : '') +
         (needs
-          ? `挡路的大概是 ${needs}。要过去得先挖开它们（用 dig 工具），或者换一个目标。`
-          : `这一带可能完全被堵死，换个更近的目标或先自己挖条路。`),
+          ? `\n挡路的大概是 ${needs}。要过去得先挖开它们（用 dig 工具），或者换一个目标。`
+          : `\n这一带可能完全被堵死，换个更近的目标或先自己挖条路。`),
     );
+  }
+
+  /**
+   * 记一次"走到这个目标失败"，返回累计次数。
+   *
+   * 为什么需要：她原来会**对着同一个走不到的目标每 2 分钟重试一次**，
+   * 因为每次的报错看起来都是"新的一次失败"，没有任何东西告诉她"这已经是第 5 次了"。
+   * 现在把次数报进错误消息里，模型才有依据换做法。
+   */
+  _noteFailedGoal(target) {
+    const key = `${Math.round(Number(target.x) || 0)},${Math.round(Number(target.z) || 0)}`;
+    const now = Date.now();
+    if (!this._failedGoals) this._failedGoals = new Map();
+    // 10 分钟没再试同一个目标就忘掉（避免永久拉黑一个地方）
+    for (const [k, v] of this._failedGoals) {
+      if (now - v.at > 600000) this._failedGoals.delete(k);
+    }
+    const prev = this._failedGoals.get(key);
+    const entry = { at: now, count: (prev ? prev.count : 0) + 1 };
+    this._failedGoals.set(key, entry);
+    return entry.count;
   }
 
   /**
