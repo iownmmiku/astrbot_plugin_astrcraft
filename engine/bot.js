@@ -853,13 +853,27 @@ class McEngine {
                 if (useClimb) {
                   this.state.note('挖开身边没用，试着往上挖阶梯出去');
                   const { climbToSurface } = require('./skills/common');
-                  const ok = await climbToSurface({
+                  const res = await climbToSurface({
                     actions: this.actions,
                     nav: this.nav,
                     ctx: { signal, checkAborted: () => { if (signal && signal.aborted) throw new CancelledError(); } },
                     maxSteps: 32,
                   });
-                  if (!ok) throw new Error('往上挖阶梯没能到地表');
+                  // **注意 `climbToSurface` 返回的是对象，不是布尔。**
+                  // 踩过：写成 `const ok = await climbToSurface(...); if (!ok)` ——
+                  // 对象永远为真，于是"爬没帮上忙"永远判不出来，她会一直卡在
+                  // "往上挖阶梯"这条路上，再也不回去挖开身边的方块。
+                  // 而且它在"头顶没有天花板"时会**直接返回 already=true 但什么都没做**，
+                  // 被埋住（脚+头是泥土、头顶是空气）恰好就是这种情形。
+                  if (!res || !res.ok || res.already) {
+                    // 爬没帮上忙 → **重置计数，下次回到"挖开"分支**
+                    this._unstuckTimes = [];
+                    throw new Error(
+                      res && res.already
+                        ? '不在"地下"（头顶没有天花板），爬阶梯帮不上忙，改回挖开身边的方块'
+                        : `往上挖阶梯没成：${(res && res.reason) || '原因不明'}`,
+                    );
+                  }
                   return { ok: true, climbed: true };
                 }
                 // **把"占着自己身体的那几格"一次全挖掉。**

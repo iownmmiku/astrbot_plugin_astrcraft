@@ -428,8 +428,22 @@ function isDangerousBlock(name) {
 }
 
 /**
- * 她是否在地下（头顶连续两格是实心）。
- * 只判一格不够——站在树下或屋檐下也会"头顶有方块"，那不是地下。
+ * 她是否"需要往上爬才能出去"。
+ *
+ * **这个判据踩过一个很严重的坑，写清楚免得再犯。**
+ *
+ * 原来的定义是"头顶连续两格是实心"——那只能判"有天花板"的情况。
+ * 而她真正被困的那种情形**恰恰头顶是空气**：她原地直挖出一个竖井
+ * （日志里的"挖 18 格"），井壁是实心的、井口一直通到地表。
+ * 于是 `isUnderground` 判定"不在地下" → `climbToSurface` 直接返回
+ * `{ok:true, already:true}` **什么都不做** → 她永远留在井底。
+ * 这就是"挖下去回不到地表"的根因。
+ *
+ * 正确的判据是"**靠走能不能出去**"，近似成两件事：
+ *   ① 头顶被堵住（有天花板）→ 在地下
+ *   ② 她比周围的地面低（在坑/竖井/矿洞里）→ 在地下
+ * ② 用周围几列的"地表高度"来量：如果四个方向 6 格外的地表都比她高，
+ * 说明她在下面，需要往上爬。
  */
 function isUnderground(bot) {
   if (!bot || !bot.entity) return false;
@@ -438,7 +452,42 @@ function isUnderground(bot) {
   const by = Math.floor(p.y);
   const bz = Math.floor(p.z);
   const solid = (b) => !!b && b.boundingBox === 'block';
-  return solid(blockAt(bot, bx, by + 2, bz)) && solid(blockAt(bot, bx, by + 3, bz));
+  // ① 有天花板
+  if (solid(blockAt(bot, bx, by + 2, bz)) && solid(blockAt(bot, bx, by + 3, bz))) return true;
+  // ② 比周围地面低（竖井/坑/矿洞）
+  let higher = 0;
+  let sampled = 0;
+  for (const [dx, dz] of [
+    [6, 0],
+    [-6, 0],
+    [0, 6],
+    [0, -6],
+  ]) {
+    const surf = surfaceHeightAt(bot, bx + dx, bz + dz, by);
+    if (surf === null) continue;
+    sampled += 1;
+    if (surf >= by + 2) higher += 1;
+  }
+  // 四个方向里至少三个方向的地面都比她高 2 格以上 → 她在坑里
+  return sampled >= 3 && higher >= 3;
+}
+
+/**
+ * 找 (x,z) 那一列的**地表高度**（站得上去的那一层 y）。
+ *
+ * **必须从上往下扫。** 第一版我从她所在的高度往上扫，返回"第一块实心"——
+ * 而实心柱子从她那一层开始就是实心的，于是永远返回她自己那层，
+ * 判不出"周围地面比我高"，竖井照样检测不到（白改一轮）。
+ * 从上往下扫，找到的最高那块实心才是地表。
+ */
+function surfaceHeightAt(bot, x, z, fromY) {
+  const top = fromY + 40;
+  for (let y = top; y >= fromY - 8; y -= 1) {
+    const b = blockAt(bot, x, y, z);
+    if (!b) return null; // 区块没加载
+    if (b.boundingBox === 'block') return y + 1; // 站在这块上面
+  }
+  return null;
 }
 
 /**
@@ -492,7 +541,21 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
           await actions.dig({ x: tx, y: by + 2, z: tz, signal: ctx.signal, collect: true });
         }
         // 走进去：pathfinder 会自动跳上这 1 格台阶
-        await nav.goTo({ x: tx, y: null, z: tz, range: 1, signal: ctx.signal, timeoutMs: 10000 });
+        //
+        // **这里必须带上高度（y: by + 1），否则永远爬不上去。**
+        // 踩过：原来写的是 `{x: tx, y: null, z: tz, range: 1}` —— 目标是"旁边那一格"，
+        // 而她本来就在 1 格范围内，`goTo` **立刻判定"已到达"就返回了**，
+        // 一次都没真的往上走。日志里就是"爬出矿道：24 格（ok=false）"：
+        // 挖了 24 级台阶、一级都没踩上去。
+        await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 10000 });
+        // **用位置验证"真的升高了"，不信 goTo 的返回值。**
+        // 它可能因为"附近有可站立点"之类的判断原地成功返回——
+        // 实测那样会 24 级台阶一级都没踩上，而 climbed 却在涨。
+        const nowY = Math.floor(bot.entity.position.y);
+        if (nowY <= by) {
+          log.debug(`挖了台阶但没上去（${by} → ${nowY}），换个方向或换办法`);
+          continue;
+        }
         climbed += 1;
         advanced = true;
         break;
@@ -503,32 +566,139 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     }
 
     if (!advanced) {
-      // 四个方向都不通：原地往上挖两格再跳（垂直脱困）
-      try {
-        const up1 = blockAt(bot, bx, by + 2, bz);
-        const up2 = blockAt(bot, bx, by + 3, bz);
-        if (up1 && up1.boundingBox === 'block' && up1.diggable && !isDangerousBlock(up1.name)) {
+      // **四个方向都挖不出阶梯——这是竖井（1 格宽）的典型情形。**
+      //
+      // 原来的做法是"原地往上挖两格再跳一下"，那**根本出不去**：
+      // 跳起来只是暂时离地，落下来还是井底。真人有两个办法，这里都做：
+      //   ① **垫脚上升**：挖掉头顶那格 → 跳 → 趁在空中往脚下那格放一块 → 站上去
+      //   ② **先往侧面开一格**（挖出一个落脚点）→ 之后就有空间挖正常阶梯了
+      // 先试 ①（快），没方块可垫就试 ②。
+      const up1 = blockAt(bot, bx, by + 2, bz);
+      if (up1 && up1.boundingBox === 'block' && up1.diggable && !isDangerousBlock(up1.name)) {
+        try {
           await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: true });
-          if (up2 && up2.boundingBox === 'block' && up2.diggable && !isDangerousBlock(up2.name)) {
-            await actions.dig({ x: bx, y: by + 3, z: bz, signal: ctx.signal, collect: true });
-          }
-          await nav.jump();
-          climbed += 1;
-          continue;
+        } catch (err) {
+          if (err instanceof CancelledError) throw err;
         }
-      } catch (err) {
-        if (err instanceof CancelledError) throw err;
-        log.debug(`垂直脱困失败：${err.message}`);
       }
+      if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
+        climbed += 1;
+        continue;
+      }
+      if (await widenShaft({ actions, nav, ctx, bx, by, bz })) {
+        log.debug('竖井里没方块可垫，改成往侧面开一格，之后再挖阶梯');
+        continue;
+      }
+      // 两条路都不行：**如实停下**，别假装在爬
       return {
         ok: false,
         steps: climbed,
-        reason: '四个方向都挖不动（可能被基岩/岩浆/领地保护挡住）',
+        reason:
+          '在竖井里往上爬失败：既没有方块可以垫脚（垫脚上升），' +
+          '侧面的方块也挖不动（开侧洞）。可以让她先 mc_collect 拿点方块，或者直接放弃这个矿洞',
       };
     }
   }
 
   return { ok: !isUnderground(bot), steps: climbed, reason: '挖了很多格还没见到天' };
+}
+
+/**
+ * **垫脚上升**：跳起来往自己脚下那格放一块，站上去。成功返回 true。
+ *
+ * 这是真人从 1 格宽竖井里出来的标准办法（"tower up"）：
+ * 竖井里没有落脚点可挖，只能**自己造一个**。
+ *
+ * 要点：
+ *   1. 得先有方块（背包里有石头/泥土都行）
+ *   2. 必须**趁跳起来的时候**放——站在地上放，那格是她自己占着的，服务端会拒
+ *   3. 放完要等一下让她落在那块上
+ */
+async function pillarUpOne({ actions, ctx, bx, by, bz }) {
+  const bot = actions.bot;
+  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
+  const block = CANDIDATES.find((n) => actions.countItem(n) > 0);
+  if (!block) return false;
+  try {
+    // **跳起来，然后等"她真的离地了"再放。**
+    //
+    // 踩过：只 `jump` 130ms 就放，那时她还在原地 —— 服务端直接拒
+    // （"Server refused to place: the block is still…"），因为那一格被她自己占着。
+    // 真人的手法是**跳到最高点附近**放，这时身体已经离开那一格了。
+    bot.setControlState('jump', true);
+    let airborne = false;
+    for (let i = 0; i < 12; i += 1) {
+      await delay(50, { signal: ctx.signal });
+      const p = bot.entity.position;
+      // 离地 0.7 格以上，那一格就空出来了
+      if (!bot.entity.onGround && p.y - by >= 0.7) {
+        airborne = true;
+        break;
+      }
+    }
+    bot.setControlState('jump', false);
+    if (!airborne) {
+      log.debug('垫脚上升：没跳起来（可能头顶被挡），改用别的办法');
+      return false;
+    }
+    // 趁在空中往脚下那格放（reach:false —— 空中不能去寻路）
+    await actions.place({ x: bx, y: by, z: bz, item: block, signal: ctx.signal, reach: false });
+    await delay(260, { signal: ctx.signal });
+    // 验证真的站上去了：脚下那块应该是她刚放的那块
+    const below = blockAt(bot, bx, by, bz);
+    if (below && below.name === block) return true;
+    log.debug(`垫脚上升没成（脚下是 ${below ? below.name : '读不到'}）`);
+    return false;
+  } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    log.debug(`垫脚上升失败：${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * **开侧洞**：把竖井侧面挖一格，造出一个落脚点，之后就能挖正常阶梯了。
+ *
+ * 为什么需要：竖井里四个方向的"斜上方"那一格**下面没有地板**，
+ * 走进去只会掉回来。先在**自己这一层**往侧面挖掉一格，那一格的地板
+ * （井壁往下那块）是实心的 → 她就能站过去 → 从那里挖阶梯就成立。
+ */
+async function widenShaft({ actions, nav, ctx, bx, by, bz }) {
+  const bot = actions.bot;
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ]) {
+    const tx = bx + dx;
+    const tz = bz + dz;
+    const wall = blockAt(bot, tx, by, tz);
+    const wallHead = blockAt(bot, tx, by + 1, tz);
+    const floor = blockAt(bot, tx, by - 1, tz);
+    // 要能挖，而且那一格**下面必须有地板**（否则站过去就掉下去）
+    if (!wall || wall.boundingBox !== 'block' || !wall.diggable || isDangerousBlock(wall.name)) continue;
+    if (!floor || floor.boundingBox !== 'block') continue;
+    try {
+      await actions.dig({ x: tx, y: by, z: tz, signal: ctx.signal, collect: true });
+      if (wallHead && wallHead.boundingBox === 'block' && wallHead.diggable && !isDangerousBlock(wallHead.name)) {
+        await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: true });
+      }
+      // 站过去（同样要带高度，否则"已到达"就返回了，人没动）
+      await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 8000 });
+      // 同样验证真的挪过去了
+      const np = bot.entity.position;
+      if (Math.abs(np.x - (tx + 0.5)) > 1.6 || Math.abs(np.z - (tz + 0.5)) > 1.6) {
+        log.debug('开侧洞：挖开了但没挪过去，换个方向');
+        continue;
+      }
+      return true;
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      log.debug(`开侧洞失败（换方向）：${err.message}`);
+    }
+  }
+  return false;
 }
 
 module.exports = {
