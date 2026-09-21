@@ -230,5 +230,24 @@ ok(
 )
 ok("改成自己盯手上的工具", "_toolBreakTick" in eng)
 
+print("\n=== 箱子满：从真实报错文本里认（W4 最后一种事件）===")
+# 引擎侧**没有"箱子满了"这个状态**，所以不能凭空发事件。
+# 真实信号只有一个：服务端在放不进去时回的报错文本。
+# 认不出就不报——宁可漏报，也不要把"没有箱子"说成"箱子满了"
+# （那会让她去清理一个根本不存在的箱子）。
+from plugin.main import MinecraftPlugin as _P  # noqa: E402
+
+_full = _P._looks_like_full
+ok("认得 'container is full'", _full("container is full") is True)
+ok("认得 'No space left'", _full("No space left in container") is True)
+ok("认得中文「没有空间」", _full("箱子里没有空间了") is True)
+ok("认得中文「装不下」", _full("东西装不下") is True)
+ok("认得中文「满了」", _full("这个箱子满了") is True)
+ok("**不把「没有箱子」误判成满了**", _full("附近没有箱子") is False, "那会让她去清一个不存在的箱子")
+ok("**不把「够不着」误判成满了**", _full("距离 8.7 格，超出可交互距离") is False)
+ok("空报错不算", _full("") is False)
+ok("None 不算", _full(None) is False)
+ok("源码里确实用了它", "_looks_like_full" in mn and '"chest_full"' in mn)
+
 print(f"\n=== 结果：{passed} 通过，{failed} 失败 ===")
 sys.exit(1 if failed else 0)

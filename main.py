@@ -790,6 +790,29 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         except Exception as exc:  # noqa: BLE001
             logger.debug("工具损坏事件入队失败：%s", exc)
 
+    @staticmethod
+    def _looks_like_full(error: str) -> bool:
+        """这条报错像不像"容器满了"（W4）。
+
+        **只认明确说了"满/没有空间"的文本**，认不出就返回 False——
+        宁可漏报，也不要把"没有箱子"、"够不着"这类错误都说成"箱子满了"
+        （那会让她去清理一个根本不存在的箱子）。
+        """
+        low = str(error or "").lower()
+        if not low:
+            return False
+        patterns = (
+            "full",
+            "no space",
+            "not enough space",
+            "container is full",
+            "没有空间",
+            "装不下",
+            "放不下",
+            "满了",
+        )
+        return any(p in low for p in patterns)
+
     async def _on_player_nearby(self, data: dict) -> None:
         """有人走到她附近 → 主动打个招呼（主动社交）。
 
@@ -954,6 +977,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     self.life.note_world_event(
                         "task_failed", f"「{name}」没做成{f'：{why}' if why else ''}"
                     )
+                    # **箱子满**（W4 的最后一种世界事件）。
+                    #
+                    # 引擎侧**没有"箱子满了"这个状态**，所以不能凭空发事件。
+                    # 但有一个**真实信号**：服务端在放不进去时会回一条错误文本
+                    # （"container is full" / "没有空间" / "放不下"）。
+                    # 就从这条文本里认——认不出就不报，不猜。
+                    if why and self._looks_like_full(why):
+                        self.life.note_world_event(
+                            "chest_full", f"箱子装不下了（{why[:40]}），得先清一清或者换一个"
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("任务结果入队失败：%s", exc)
 
