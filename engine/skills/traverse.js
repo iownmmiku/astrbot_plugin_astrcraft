@@ -131,31 +131,60 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
     if (dx === 0 && dz === 0) break;
     const tx = bx + dx;
     const tz = bz + dz;
-    // 前方脚下那一格：空着就放一块（这就是"铺路"）
-    const ahead = bot.blockAt(vec3(tx, by, tz));
-    if (!ahead) break;
-    if (!isAir(ahead)) {
-      // 已经实心了 —— 可能只要走上去就行（1 格台阶）
-      const up = bot.blockAt(vec3(tx, by + 1, tz));
-      if (isAir(up) && ahead.boundingBox === 'block') {
+    // **铺路要放在"她脚下的支撑层"（by - 1），不是她脚那一层（by）** ——
+    // 这是我第一版写错的地方，实测后果：放了 1 块就走不过去（x 只动了 0.5）。
+    //
+    // 为什么：要站在 (tx, by) 这一格上，**下面 (tx, by-1) 必须是实心**。
+    // 放在 `by` 等于把方块塞进她自己的身体高度——那一格本来是空的，
+    // 填上之后她反而站不进去了（pathfinder 判"站不上去"）。
+    // 真人搭桥也是这么做的：**往脚下的那一层垫**，然后走过去。
+    const supportY = by - 1;
+    const support = bot.blockAt(vec3(tx, supportY, tz));
+    if (!support) break;
+    if (support.boundingBox === 'block') {
+      // 支撑层已经是实心的 → 这一格不用垫，直接走上去
+      const feet = bot.blockAt(vec3(tx, by, tz));
+      const head = bot.blockAt(vec3(tx, by + 1, tz));
+      if (isAir(feet) && isAir(head)) {
         try {
-          await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
+          await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
+          continue;
         } catch (err) {
           if (err && err.name === 'CancelledError') throw err;
           break;
         }
-        continue;
+      }
+      // 脚下被实心占着（比如 1 格台阶）→ 试着跳上去
+      const up = bot.blockAt(vec3(tx, by + 1, tz));
+      if (isAir(up)) {
+        try {
+          await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
+          continue;
+        } catch (err) {
+          if (err && err.name === 'CancelledError') throw err;
+          break;
+        }
       }
       break;
     }
-    // 下面那一格如果是岩浆/水，垫上去也危险 → 跳过
-    const below = bot.blockAt(vec3(tx, by - 1, tz));
-    if (below && isDangerousBlock(below.name)) {
+    if (isDangerousBlock(support.name)) {
+      // 支撑层是岩浆/水 —— 垫上去也站不住
       skippedDanger += 1;
       break;
     }
+    // 她自己的身体高度那一格必须空着（不然放下去她会被卡住）
+    const feetNow = bot.blockAt(vec3(tx, by, tz));
+    const headNow = bot.blockAt(vec3(tx, by + 1, tz));
+    if (!isAir(feetNow) || !isAir(headNow)) break;
     try {
-      await actions.place({ x: tx, y: by, z: tz, item: blockName, signal: ctx.signal, reach: true });
+      await actions.place({
+        x: tx,
+        y: supportY,
+        z: tz,
+        item: blockName,
+        signal: ctx.signal,
+        reach: true,
+      });
       done += 1;
       ctx.progress(`铺路 ${done}/${n} 格`);
     } catch (err) {
@@ -163,7 +192,7 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       log.debug(`铺第 ${done + 1} 格失败：${err.message}`);
       break;
     }
-    // 站到刚铺的那块上
+    // 站到刚铺的那块上（她仍然在 by 这一层，只是脚下有东西了）
     try {
       await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
     } catch (err) {
