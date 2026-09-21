@@ -215,6 +215,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         self.engine.on("discovery.milestone", self._on_discovery)
         # 技能任务完成 → 在游戏里吱一声（否则玩家只看到"已开始"，永远不知道结果）
         self.engine.on("task.finished", self._on_task_finished)
+        # 有人走到她附近 → 主动打个招呼（真人不等人先开口）
+        self.engine.on("player.nearby", self._on_player_nearby)
 
         self.goals = GoalManager(
             engine_call=self._engine_call,
@@ -287,6 +289,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 引擎监管：崩了自动拉起（引擎进程是长期依赖，不能等用户手动重启）
         self._supervise_task = asyncio.create_task(self._supervise_loop(), name="mc-engine-supervise")
 
+        # 配置里若有"不生效"的项，明确说出来——静默忽略最坑人
+        if not self._cfg("enable_action_queue", True):
+            logger.warning(
+                "enable_action_queue=false 不会生效：长动作必须异步返回 task_id，"
+                "否则会阻塞对话并破坏「按需激活工具」机制。此项已固定为开启",
+            )
+
         # 兜底：即使 on_astrbot_loaded 钩子没触发（某些版本/加载路径下可能不触发），
         # 也要在稍后把工具绑定补上——initialize 执行时工具往往还没注册完。
         for delay in (5, 15, 40):
@@ -340,6 +349,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                                     await self._auto_connect(reason="监管发现游戏掉线，尝试恢复连接")
                             except Exception:  # noqa: BLE001
                                 pass
+                    # 顺手把心情推给引擎（情绪表达：动机水位 → 走路节奏）。
+                    # 放在这里是因为它每 20 秒跑一次、而且必然在"引擎活着"时执行，
+                    # 不用另开定时器。
+                    try:
+                        await self.push_mood()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("推送心情失败（不影响其它功能）：%s", exc)
                     continue
                 if not self.engine.running:
                     logger.warning("检测到引擎未运行，正在重新拉起")
@@ -510,6 +526,53 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("下发引擎配置失败（安全设置可能未生效）：%s", exc)
 
+    async def push_mood(self) -> None:
+        """把她的**真实心情**推给引擎，接到走路节奏上（情绪表达）。
+
+        原来引擎里的"悠闲/精神"是随机数，跟她此刻想干什么毫无关系。
+        现在动机水位一下来，她走路的样子就跟着心情变：
+        悠闲欲高 → 走得慢、常停下来看；着急（血量低 / 天要黑）→ 爱跑。
+        """
+        if not self.engine or not self.engine.running or not self.drives:
+            return
+        try:
+            snap = self.drives.snapshot()
+        except Exception:  # noqa: BLE001
+            return
+        # snapshot 的结构是 {top: "explore", levels: {explore: 0.0, ...}, bias: {}}
+        levels = snap.get("levels") if isinstance(snap, dict) else None
+        top = str(snap.get("top") or "") if isinstance(snap, dict) else ""
+        if not isinstance(levels, dict) or not levels:
+            return
+        key = max(levels.items(), key=lambda kv: float(kv[1] or 0))[0]
+        # 标签（"悠闲欲"/"探索欲"…）在 Drive 定义里
+        label = key
+        try:
+            for d in getattr(self.drives, "drives", []) or []:
+                if getattr(d, "key", None) == key:
+                    label = getattr(d, "label", key)
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        mood = {
+            "drive": key,
+            "label": label,
+            "intensity": round(float(levels.get(key) or 0), 2),
+        }
+        # 紧急情况直接调高 urgency：血量低或快天黑了
+        try:
+            brief = await self._get_brief(max_age=5.0)
+        except Exception:  # noqa: BLE001
+            brief = ""
+        urgency = 0.0
+        if "天黑" in brief or "血量只有" in brief or "饿" in brief:
+            urgency = 0.9
+        mood["urgency"] = urgency
+        try:
+            await self.engine.call("config.update", {"mood": mood}, timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("推送心情失败（不影响其它功能）：%s", exc)
+
     async def _auto_connect(self, reason: str = "自动连接"):
         async with self._connect_lock:
             if self.connected:
@@ -637,6 +700,29 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 )
             else:
                 logger.info("过日子循环已在配置中关闭（enable_life_loop=false）")
+
+    async def _on_player_nearby(self, data: dict) -> None:
+        """有人走到她附近 → 主动打个招呼（主动社交）。
+
+        她原来只会被动回应：别人先说话她才答。真人不这样——有人走进视野，
+        你会抬头看一眼，熟人还会先说一句。这个回调做的就是这件事。
+
+        **措辞交给她自己**：这里只说"谁来了、离多近"，具体说什么由她的
+        人格和当下心情决定（走 life.share_event 那条路，带冷却与限流）。
+        """
+        player = str(data.get("player") or "").strip()
+        if not player:
+            return
+        dist = data.get("distance")
+        who = f"{player}（{dist} 格外）" if dist is not None else player
+        logger.info("注意到有人过来了：%s", who)
+        if self.life:
+            await self.life.share_event(
+                kind="social",
+                text=f"你注意到 {player} 走到你附近了（{dist} 格外）。抬头看了一眼",
+                force=False,
+            )
+        await self._notify_subscribers(f"👀 她注意到有人过来：{who}")
 
     async def _on_bot_death(self, data: dict) -> None:
         pos = data.get("position") or {}

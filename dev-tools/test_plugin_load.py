@@ -56,7 +56,7 @@ def read_plugin_name() -> str:
         m = re.search(r"^name:\s*(\S+)\s*$", text, re.MULTILINE)
         if m:
             return m.group(1)
-    return "astrbot_plugin_mc_player"
+    return "astrbot_plugin_astrcraft"
 
 
 def setup_sandbox(plugin_name: str) -> Path:

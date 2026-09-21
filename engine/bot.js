@@ -54,6 +54,8 @@ class McEngine {
     this._glancing = false;
     // 被方块卡住的自救节流
     this._lastUnstuckAt = 0;
+    // **注意到的玩家**：名字 → {greetedAt, near}（主动社交的冷却用）
+    this._seenPlayers = new Map();
     // MLG（落地水/垫方块）的节流
     this._lastMlgAt = 0;
     this._mlgRunning = false;
@@ -269,6 +271,74 @@ class McEngine {
     return !!this._chunksReady;
   }
 
+  /**
+   * 接收她的**真实心情**，接到动作上（情绪表达）。
+   *
+   * 原来"悠闲/精神"是引擎里的随机数，跟她此刻想干什么毫无关系。
+   * 现在插件会把动机水位推下来，走路节奏就跟着心情变：
+   * 悠闲欲高就走得慢、常停；着急（血量低、天要黑）就爱跑。
+   */
+  setMood(mood) {
+    this._mood = mood || null;
+    try {
+      if (this.nav && this.nav._gait && typeof this.nav._gait.setMood === 'function') {
+        this.nav._gait.setMood(mood);
+      }
+    } catch (err) {
+      log.debug(`设置心情失败（不影响其它功能）：${err.message}`);
+    }
+  }
+
+  /** 当前心情（诊断视图用） */
+  get mood() {
+    return this._mood || null;
+  }
+
+  /**
+   * **注意到有人来了** —— 主动社交的前提。
+   *
+   * 她原来只会被动回应：别人先说话她才答。真人不这样——有人走进你的视野，
+   * 你会抬头看一眼，熟人还会打个招呼。这里做的就是这件事：
+   * 每隔一会儿看一眼附近有没有玩家，有就发一个 `player.nearby` 事件，
+   * 由插件决定要不要说点什么（带着她的人格和当下的心情）。
+   *
+   * 每个玩家有**打招呼冷却**（默认 10 分钟），不然会变成"一见面就复读"。
+   * 玩家走远了（超过 24 格）就把冷却清掉——下次再来还会打招呼。
+   */
+  _noticeNearbyPlayers() {
+    const bot = this.bot;
+    if (!bot || !bot.entity || !bot.players) return;
+    const me = bot.entity.position;
+    const now = Date.now();
+    for (const [name, p] of Object.entries(bot.players)) {
+      if (!p || !p.entity || name === bot.username) continue;
+      const d = distance(me, p.entity.position);
+      const state = this._seenPlayers.get(name) || { greetedAt: 0, near: false };
+      if (d <= 16) {
+        if (!state.near) {
+          state.near = true;
+          // 刚进入视野：如果超过冷却没打过招呼，就提醒一次
+          if (now - state.greetedAt > 600000) {
+            state.greetedAt = now;
+            this.state.note(`${name} 过来了（${d.toFixed(0)} 格）`);
+            this._emit('player.nearby', {
+              player: name,
+              distance: Number(d.toFixed(1)),
+              position: {
+                x: Number(p.entity.position.x.toFixed(1)),
+                y: Number(p.entity.position.y.toFixed(1)),
+                z: Number(p.entity.position.z.toFixed(1)),
+              },
+            });
+          }
+        }
+      } else if (d > 24) {
+        state.near = false; // 走远了：下次再来重新算
+      }
+      this._seenPlayers.set(name, state);
+    }
+  }
+
   _wireBotEvents(bot) {
     bot.on('chat', (username, message) => {
       if (username === bot.username) return;
@@ -431,6 +501,12 @@ class McEngine {
         this.state.tick();
       } catch (err) {
         log.debug(`状态轮询异常：${err.message}`);
+      }
+      // 顺手看一眼有没有人过来（主动社交的前提）
+      try {
+        this._noticeNearbyPlayers();
+      } catch (err) {
+        log.debug(`玩家接近检测异常：${err.message}`);
       }
     }, 2000);
     // 主动心跳：见 _keepAliveTick 的说明。这是防止"服务器生成区块时判定失联"的关键。
@@ -1412,6 +1488,8 @@ class McEngine {
       },
       // **性能**：最近一次事件循环阻塞（"卡"的直接指标）
       last_lag: this._lastLagWarn || null,
+      // **心情**：插件推下来的真实心情（已经接到走路节奏上）
+      mood: this._mood || null,
       // **结论**：为什么她可能不动
       idle_reasons: reasons,
       verdict: reasons.length ? reasons.join('；') : '一切正常，她应该能动',

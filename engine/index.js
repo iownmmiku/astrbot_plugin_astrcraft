@@ -531,6 +531,11 @@ rpc.handle(
   'config.update',
   wrap(async (params) => {
     const values = engine.config.update(params || {});
+    // 心情也走这条通道下来（`mood: {label, drive, intensity, urgency}`）。
+    // 它严格说不是"配置"，但复用同一条推送通道最省事，而且热更新立刻生效。
+    if (params && params.mood !== undefined) {
+      engine.setMood(params.mood);
+    }
     return { ok: true, config: values };
   }),
 );

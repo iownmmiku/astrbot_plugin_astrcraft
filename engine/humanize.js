@@ -117,15 +117,45 @@ function idlePauseMs() {
 
 /**
  * 速度选择：真人不会一直冲刺。
- * 距离远、且"有精神"时才冲刺；靠近目标、或随机到"悠闲"时就走着去。
+ * 距离远、且"有精神"时才冲刺；靠近目标、或心情悠闲时就走着去。
+ *
+ * **"心情"来自她的真实状态，不是随机数。**
+ * 原来是 `Math.random() < 0.35` 决定"悠闲还是正常"——那只是随机抖动，
+ * 和她此刻想干什么完全无关。现在插件会把她的动机水位（悠闲欲 / 探索欲…）
+ * 推下来，走路节奏就跟着心情变：
+ *   - 悠闲欲高 → 走得慢、常停、很少冲
+ *   - 探索欲高 → 爱跑、停顿少
+ * 拿不到心情时退回随机（保持原来的观感，不会变机械）。
  */
 class Gait {
   constructor() {
     this._mood = Math.random() < 0.35 ? 'leisurely' : 'normal';
     this._moodUntil = Date.now() + 20000 + Math.random() * 40000;
+    /** 外部推下来的心情：{label, drive, intensity, urgency} */
+    this._external = null;
+  }
+
+  /**
+   * 接收她的真实心情（由引擎在 config.update 时调用）。
+   * @param {{label?:string, drive?:string, intensity?:number, urgency?:number}} mood
+   */
+  setMood(mood) {
+    this._external = mood && typeof mood === 'object' ? mood : null;
+    if (!this._external) return;
+    // 心情直接决定基调：悠闲欲高就是"leisurely"，其余按强度分档
+    const drive = String(this._external.drive || '');
+    const urgency = Number(this._external.urgency);
+    if (Number.isFinite(urgency) && urgency > 0.7) this._mood = 'hurried';
+    else if (/悠闲|leisure/.test(drive) || /悠闲/.test(String(this._external.label || ''))) {
+      this._mood = 'leisurely';
+    } else if (/探索|explore/.test(drive)) this._mood = 'normal';
+    else this._mood = 'normal';
+    // 有真实心情时就不再随机切换，直到心情被清掉
+    this._moodUntil = Date.now() + 120000;
   }
 
   refresh() {
+    if (this._external) return; // 真实心情优先，不随机
     if (Date.now() > this._moodUntil) {
       this._mood = Math.random() < 0.35 ? 'leisurely' : 'normal';
       this._moodUntil = Date.now() + 20000 + Math.random() * 40000;
@@ -137,6 +167,7 @@ class Gait {
     this.refresh();
     if (distance < 5) return false; // 近了就不冲了，真人也是
     if (this._mood === 'leisurely') return Math.random() < 0.25; // 悠闲时偶尔小跑一下
+    if (this._mood === 'hurried') return distance > 8 ? Math.random() < 0.95 : Math.random() < 0.7;
     return distance > 12 ? Math.random() < 0.85 : Math.random() < 0.5;
   }
 

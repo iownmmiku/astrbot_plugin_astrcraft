@@ -37,8 +37,8 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent.parent
 sys.path.insert(0, str(_REPO))
 
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_mc_player")
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_mc_player_config.json")
+PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
+CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
 
 TEST_PORT = 25566
 RCON_PORT = 25576
@@ -151,7 +151,7 @@ async def main() -> int:
 
     mod = importlib.import_module(f"{PLUGIN_DIR.name}.main")
     from astrbot.core.provider.func_tool_manager import FunctionToolManager
-    from astrbot_plugin_mc_player.game_agent import GameChatAgent, GameEventShim
+    from astrbot_plugin_astrcraft.game_agent import GameChatAgent, GameEventShim
 
     tools = collect_tools(mod.MinecraftPlugin)
     print(f"发现 {len(tools)} 个工具\n")

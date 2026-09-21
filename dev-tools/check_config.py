@@ -32,8 +32,8 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent.parent
 sys.path.insert(0, str(_REPO))
 
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_mc_player_config.json")
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_mc_player")
+CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
+PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
 
 problems: list[str] = []
 warnings: list[str] = []
@@ -203,7 +203,7 @@ async def main() -> int:
 
     # ---------------------------------------------------------- 6. 数据目录
     print("\n[6] 数据目录（记忆与驱动的落盘位置）")
-    data_dir = Path(r"C:\Users\miku\.astrbot\data\plugin_data\astrbot_plugin_mc_player")
+    data_dir = Path(r"C:\Users\miku\.astrbot\data\plugin_data\astrbot_plugin_astrcraft")
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         probe = data_dir / ".write_probe"

@@ -1,4 +1,4 @@
-﻿name: astrbot_plugin_astrcraft
+name: astrbot_plugin_astrcraft
 display_name: Astrcraft（Minecraft 里的 AI 同伴）
 short_desc: 让 AstrBot 的机器人在 Minecraft 里像一个真玩家那样自己过日子——砍树挖矿盖房子、打猎做饭、和你聊天
 desc: |
@@ -26,15 +26,11 @@ desc: |
   引擎的 stdout 只走协议、日志全走 stderr，所以插件和引擎可以分别重启。
 
   注意：默认使用离线账号，只能进入 `online-mode=false` 的服务器。
-version: 0.9.0
+version: 1.0.0
 author: iownmmiku
 repo: https://github.com/iownmmiku/astrbot_plugin_astrcraft
 astrbot_version: ">=4.17,<5"
-support_platforms:
-  - aiocqhttp
-  - telegram
-  - discord
-  - qq_official
+support_platforms: []
 tags:
   - Minecraft
   - 游戏

@@ -41,8 +41,8 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent.parent
 sys.path.insert(0, str(_REPO))
 
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_mc_player")
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_mc_player_config.json")
+PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
+CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
 
 problems: list[str] = []
 passed = 0
@@ -142,7 +142,7 @@ async def main() -> int:
         bad(f"测试前提不成立：首参是 {first}，不是 self")
 
     # 顺便验证：这正是 AstrBot 执行工具时会炸的形态
-    from astrbot_plugin_mc_player.game_agent import GameEventShim
+    from astrbot_plugin_astrcraft.game_agent import GameEventShim
 
     shim = GameEventShim("测试玩家")
     try:
@@ -188,7 +188,7 @@ async def main() -> int:
     ok("引擎已启动")
 
     # ---------------------------------------------------------- 3. 真实执行
-    from astrbot_plugin_mc_player.game_agent import GameChatAgent
+    from astrbot_plugin_astrcraft.game_agent import GameChatAgent
 
     agent = GameChatAgent(plugin)
     probes = [n for n in ("mc_skills", "mc_status", "mc_players") if n in tool_methods]

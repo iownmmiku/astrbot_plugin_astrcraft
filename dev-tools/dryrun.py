@@ -31,8 +31,8 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent.parent
 sys.path.insert(0, str(_REPO))
 
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_mc_player_config.json")
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_mc_player")
+CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
+PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
 
 problems: list[str] = []
 
