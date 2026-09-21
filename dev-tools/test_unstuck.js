@@ -94,21 +94,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // 石头徒手挖不动，而真人这时是"先用手刨开软的那面"。
   // 用泥土才能验证"优先挖得动的方块"这个设计。
   console.log('\n[A] 把头顶那一格填成泥土（模拟"挖矿把自己封在洞里"）');
+  // **测试要验证自己的场景真的造出来了**——前面踩过太多次"场景没生效、
+  // 结果把测试失败误判成功能坏了"（最典型的是 /fill 在区块没加载时静默无效）。
+  await call('debug.resetUnstuck'); // 清掉上一次留下的节流窗口
   await rcon.command(`setblock ${p.x} ${p.y + 1} ${p.z} minecraft:dirt`);
   await rcon.command(`setblock ${p.x} ${p.y} ${p.z} minecraft:dirt`);
   await sleep(1000);
+  const setupA = await call('block.at', { x: p.x, y: p.y + 1, z: p.z });
+  if (!setupA || setupA.name !== 'dirt') {
+    console.log(`    ⚠️ 场景没造出来（头顶那格是 ${setupA ? setupA.name : '读不到'}）——测试结论不可信`);
+  }
 
   const before = await call('state.get', { detail: 'brief' });
   console.log(`    填好后她的 y = ${before.block_position.y}`);
 
-  console.log('    等她自救（最多 25 秒）…');
+  // **等"完全脱身"（脚和头都是空气），而不是只等头顶。**
+  // 原来只等头顶通了就进入场景 B，而她可能还卡在脚那格 →
+  // B 重新读到的坐标是歪的 → B 的判定跟着歪。这就是偶发 2/3 的来源之一。
+  console.log('    等她自救（最多 40 秒，要等到脚和头都通）…');
   let freed = false;
-  for (let i = 0; i < 25; i += 1) {
+  for (let i = 0; i < 40; i += 1) {
     await sleep(1000);
-    const b = await call('block.at', { x: p.x, y: p.y + 1, z: p.z });
-    if (b && b.name === 'air') {
+    const b1 = await call('block.at', { x: p.x, y: p.y + 1, z: p.z });
+    const b2 = await call('block.at', { x: p.x, y: p.y, z: p.z });
+    if (b1 && b1.name === 'air' && b2 && b2.name === 'air') {
       freed = true;
-      console.log(`    第 ${i + 1} 秒：头顶已经通了（${b.name}）`);
+      console.log(`    第 ${i + 1} 秒：脚和头都通了`);
       break;
     }
   }
@@ -125,11 +136,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('\n[B] 把脚和头两格都填成泥土（完全埋住）');
   const st2 = await call('state.get', { detail: 'brief' });
   const q = st2.block_position;
+  await call('debug.resetUnstuck'); // 清掉场景 A 留下的节流窗口（这是偶发的另一个来源）
   await rcon.command(`setblock ${q.x} ${q.y} ${q.z} minecraft:dirt`);
   await rcon.command(`setblock ${q.x} ${q.y + 1} ${q.z} minecraft:dirt`);
   await sleep(1000);
+  // 同样先验证场景真的造出来了
+  const setupB = await call('block.at', { x: q.x, y: q.y, z: q.z });
+  if (!setupB || setupB.name !== 'dirt') {
+    console.log(`    ⚠️ 场景没造出来（脚那格是 ${setupB ? setupB.name : '读不到'}）——测试结论不可信`);
+  }
   let freed2 = false;
-  for (let i = 0; i < 25; i += 1) {
+  for (let i = 0; i < 40; i += 1) {
     await sleep(1000);
     const b1 = await call('block.at', { x: q.x, y: q.y + 1, z: q.z });
     const b2 = await call('block.at', { x: q.x, y: q.y, z: q.z });

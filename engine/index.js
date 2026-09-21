@@ -1006,6 +1006,19 @@ rpc.handle('debug.blocking', () => {
 // 于是让下次真出现时能一眼看清是哪一格、被判成了什么。
 rpc.handle('debug.obstacles', (params = {}) => engine.nav.auditObstacles(params.radius));
 
+// **重置脱困状态**（测试用）：把节流/二次确认/降频/失败计数全部清掉。
+// 为什么需要：脱困反射有 8 秒节流、2 秒二次确认、连续失败 3 次降频 60 秒——
+// 这些是**正确的**防护，但会让"连续测两个被困场景"互相干扰：
+// 第二个场景可能整段测试都撞在第一个场景留下的节流窗口里。
+rpc.handle('debug.resetUnstuck', () => {
+  engine._lastUnstuckAt = 0;
+  engine._unstuckPending = null;
+  engine._unstuckTimes = [];
+  engine._unstuckGiveUpUntil = 0;
+  engine._unstuckFailures = 0;
+  return { ok: true, note: '脱困状态已重置（节流/确认/降频/失败计数）' };
+});
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {
