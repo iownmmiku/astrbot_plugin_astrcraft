@@ -1571,29 +1571,100 @@ class McEngine {
    * @param {'critical'|'normal'} level critical = 溺水/岩浆/着火，必须立即抢占；
    *                                      normal  = 饿/低血/被围，做完手上的事再说
    */
-  _submitReflex(name, run, level = 'normal', hooks = {}) {
+  /**
+   * **统一出价入口**（身体层设计 S2，见 docs/BODY_LAYER.md）。
+   *
+   * 在它之前，"本能"和"LLM 的任务"走两条不同的路进队列，各自的优先级写法不一样，
+   * 所以**没有一个地方能回答"现在到底该谁动"**。S2 把入口统一成一个，
+   * 并且用一张**出价表**（数值越大越优先）来表达"谁更该拿身体"。
+   *
+   * 出价表（照 numen 的分层，按本项目的场景调过）：
+   *   10 坠落(MLG，走 100ms 专用循环，不经过这里)
+   *    9 溺水换气   8 岩浆/着火   7 被怪贴脸(≤3格)
+   *    6 低血后撤   5 进食       4 脱困(被埋住)
+   *    3 远处反击   2 用户指令   1 LLM 的任务   0 捡东西/插火把
+   *
+   * @param {number} bid 出价，越大越优先
+   */
+  _bid({ name, run, bid, kind = 'reflex', hooks = {}, preemptible = true }) {
+    // 同名的任务已经在跑就不重复提交（原来就有，保留）
     const cur = this.queue.current;
-    // 同名反射任务已经在跑就不重复提交
     if (cur && cur.name === name) return null;
-    const priority = level === 'critical' ? PRIORITY.CRITICAL : PRIORITY.REFLEX;
+    const priority = this._priorityForBid(bid);
     const task = this.queue.submit({
       name,
       run,
       priority,
-      preemptible: level === 'critical',
-      kind: 'reflex',
+      // **preemptible 的语义是"允许被出价更高的抢"**。
+      //
+      // 这里原来写的是 `preemptible: level === 'critical'` —— **反了**：
+      // 结果是 critical 本能（溺水/岩浆）反而可以被抢，
+      // 而 normal 本能**不能被任何东西抢**，于是一个低优先级的普通反射
+      // 会把 critical 本能挡在外面（实测就是这么写的，不是推测）。
+      // 正确的做法：默认都可被抢；真正"不能被打断"的只有 MLG，
+      // 而它根本不经过队列（走 100ms 专用循环）。
+      preemptible,
+      kind,
+      meta: { bid },
     });
-    // 结果回调：让调用方知道这次自救成功了没有（用于"连续失败就退避"）
+    this._bidLog = this._bidLog || [];
+    this._bidLog.push({ at: Date.now(), name, bid, priority, preempted: null });
+    if (this._bidLog.length > 100) this._bidLog.splice(0, 50);
+    log.debug(`出价：${name}（bid=${bid} → priority=${priority}）`);
     if (task && (hooks.onDone || hooks.onFailed)) {
       try {
         task.promise
           .then(() => hooks.onDone && hooks.onDone())
-          .catch(() => hooks.onFailed && hooks.onFailed());
+          .catch((err) => hooks.onFailed && hooks.onFailed(err));
       } catch {
         /* 拿不到 promise 就算了，不影响主流程 */
       }
     }
     return task;
+  }
+
+  /** 出价 → 队列优先级（数值越小越优先） */
+  _priorityForBid(bid) {
+    const b = Number(bid);
+    if (!Number.isFinite(b)) return PRIORITY.REFLEX;
+    if (b >= 9) return PRIORITY.CRITICAL; // 溺水/岩浆：最高
+    if (b >= 7) return PRIORITY.CRITICAL + 5; // 贴脸/后撤
+    if (b >= 4) return PRIORITY.REFLEX; // 进食/脱困
+    if (b >= 3) return PRIORITY.REFLEX + 5; // 远处反击
+    if (b >= 2) return PRIORITY.USER; // 用户指令
+    if (b >= 1) return PRIORITY.SKILL; // LLM 的任务
+    return PRIORITY.IDLE; // 捡东西/插火把
+  }
+
+  /** 本能名 → 出价（见 _bid 的说明） */
+  _bidOf(name) {
+    const n = String(name);
+    if (n.includes('水面')) return 9; // 溺水换气
+    if (n.includes('岩浆') || n.includes('着火')) return 8;
+    if (n.startsWith('反击')) return 7; // 贴脸时调用方会用 7，远处 3
+    if (n.includes('血量过低')) return 6;
+    if (n.startsWith('吃 ')) return 5;
+    if (n.includes('挖开') || n.includes('阶梯')) return 4; // 脱困
+    if (n.includes('掉落物')) return 0;
+    if (n.includes('火把')) return 0;
+    return 3;
+  }
+
+  _submitReflex(name, run, level = 'normal', hooks = {}) {
+    // **统一走 _bid**（身体层设计 S2）：出价由 _bidOf(name) 查表得出，
+    // 不再用 `critical/normal` 这种粗档位各自算优先级——
+    // 那样两条入队路径的优先级写法不一致，没人能回答"现在该谁动"。
+    const bid = level === 'critical' ? Math.max(7, this._bidOf(name)) : this._bidOf(name);
+    return this._bid({
+      name,
+      run,
+      bid,
+      kind: 'reflex',
+      hooks,
+      // 默认都可被出价更高的抢。原来这里是 `level === 'critical'`，**语义反了**：
+      // 见 _bid 里的说明。
+      preemptible: true,
+    });
   }
 
   _onTaskFinished(task) {
