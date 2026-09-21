@@ -198,9 +198,17 @@ async function wanderLookingFor(names, { actions, nav, ctx, radius = 48, maxHops
   for (let hop = 0; hop < maxHops; hop += 1) {
     ctx.checkAborted();
 
-    // 先看看当前位置附近（高度差不超过 4 格，避免盯上十几格高悬空的树冠）
+    // **先把她的位置取出来，别在回调里现读。**
+    //
+    // 实测这是她最高频的失败（记忆里 "Cannot read properties of null (reading 'y')"
+    // 出现了 46 次，砍树和收集各占一半）：她死了正在重生时 `bot.entity` 是 null，
+    // 而 `findBlock` 的 matching 回调会被调用成百上千次——只要有一次撞上
+    // 那个空窗期，整个任务就崩在 `bot.entity.position.y` 上。
+    // 取一次存下来，既避免这个问题，也少几百次属性查找。
+    if (!bot.entity) throw new Error('她现在不在游戏里（可能正在重生），稍后再试');
+    const hereY = bot.entity.position.y;
     const found = bot.findBlock({
-      matching: (b) => b && names.includes(b.name) && Math.abs(b.position.y - bot.entity.position.y) <= 4,
+      matching: (b) => b && names.includes(b.name) && Math.abs(b.position.y - hereY) <= 4,
       maxDistance: radius,
     });
     if (found) {

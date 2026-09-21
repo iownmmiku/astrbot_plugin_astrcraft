@@ -54,6 +54,20 @@ KIND_LABEL = {
 MAX_ENTRIES = 400
 
 
+def normalize_text(text: str) -> str:
+    """把一句话归一化成"同类型的事长什么样"，用于判重。
+
+    去掉数字、括号里的细节、空白——这样
+    「挖矿失败：走到 (12, -58, 40) 被挡住了」和
+    「挖矿失败：走到 (99, -12, 7) 被挡住了」会被认成同一件事。
+    """
+    t = str(text or "")
+    t = re.sub(r"-?\d+(?:\.\d+)?", "N", t)  # 数字 → N
+    t = re.sub(r"[（(][^）)]*[)）]", "", t)  # 括号里的细节去掉
+    t = re.sub(r"\s+", "", t)  # 空白去掉
+    return t
+
+
 @dataclass
 class MemoryEntry:
     kind: str
@@ -63,6 +77,8 @@ class MemoryEntry:
     tags: list[str] = field(default_factory=list)
     # 发生时的上下文快照（位置/维度等），供"回想起当时的处境"
     context: dict = field(default_factory=dict)
+    # **同一件事重复发生过几次**（见 remember 里的判重）
+    count: int = 1
 
     def __post_init__(self):
         if not self.weight:
@@ -80,6 +96,7 @@ class MemoryEntry:
             weight=float(d.get("weight", 1)),
             tags=list(d.get("tags") or []),
             context=dict(d.get("context") or {}),
+            count=int(d.get("count", 1) or 1),
         )
 
 
@@ -101,8 +118,19 @@ class MemoryStore:
             if not self._path.exists():
                 return
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            self._entries = [MemoryEntry.from_json(d) for d in (data.get("entries") or [])]
-            logger.info("已载入 %s 条 Minecraft 记忆", len(self._entries))
+            raw = [MemoryEntry.from_json(d) for d in (data.get("entries") or [])]
+            # **载入时就归并一次**：老版本攒下来的重复条目（实测 392 条里
+            # 只有 173 条不同）在这里一次性合并，不用等下次 prune。
+            self._entries = self._consolidate(raw)
+            if len(self._entries) != len(raw):
+                self._dirty = True
+                logger.info(
+                    "已载入 %s 条 Minecraft 记忆（归并了 %s 条重复）",
+                    len(self._entries),
+                    len(raw) - len(self._entries),
+                )
+            else:
+                logger.info("已载入 %s 条 Minecraft 记忆", len(self._entries))
         except Exception as exc:  # noqa: BLE001
             logger.warning("载入记忆失败（从空开始）：%s", exc)
             self._entries = []
@@ -125,15 +153,46 @@ class MemoryStore:
             logger.warning("保存记忆失败：%s", exc)
 
     def _prune(self) -> list[MemoryEntry]:
+        """超上限时**先归并、再淘汰**。
+
+        原来只做"留最近的 + 留最重要的"，多出来的**直接丢掉**——等于把
+        "这件事发生过很多次"这个信息一起丢了。实测她的记忆库 392 条里
+        只有 173 条不同（65% 是重复），全是同一个失败攒出来的。
+
+        现在分两步：
+          1. **归并**：同一个 kind 里文字归一化后相同的，合成一条并把 count 累加
+             （"砍树失败 ×29" 比 29 条一模一样的话有用得多，也占得少得多）
+          2. 还不够就按"最近 + 最重要"淘汰
+        """
+        self._entries = self._consolidate(self._entries)
         if len(self._entries) <= self._max:
             return self._entries
-        # 按 importance 排序保留：重要的 + 最近的
         recent = sorted(self._entries, key=lambda e: e.at, reverse=True)[: self._max // 2]
         important = sorted(self._entries, key=lambda e: e.weight, reverse=True)[: self._max // 2]
         merged = {id(e): e for e in recent + important}
         kept = sorted(merged.values(), key=lambda e: e.at)
         self._entries = kept
         return kept
+
+    @staticmethod
+    def _consolidate(entries: list[MemoryEntry]) -> list[MemoryEntry]:
+        """把同 kind + 同归一化文本的条目合成一条（保留最早的 at、累加 count）。"""
+        by_key: dict[tuple[str, str], MemoryEntry] = {}
+        out: list[MemoryEntry] = []
+        for e in entries:
+            key = (e.kind, normalize_text(e.text))
+            first = by_key.get(key)
+            if first is None:
+                by_key[key] = e
+                out.append(e)
+                continue
+            # 合成：次数累加，时间取最近，权重取最大（重要的事不该被稀释）
+            first.count += e.count
+            first.at = max(first.at, e.at)
+            first.weight = max(first.weight, e.weight)
+            if not first.context and e.context:
+                first.context = e.context
+        return out
 
     # ------------------------------------------------------------ 写入
 
@@ -149,15 +208,46 @@ class MemoryStore:
     ) -> MemoryEntry | None:
         """记一件事。
 
-        @param dedupe_window 同样的文本在这个时间窗内只记一次（防止事件风暴刷记忆）
+        **判重分两层**（早期只有第一层，结果同一个失败攒了 29 条）：
+          1. 短时间内（默认 60 秒）完全相同的文本 → 直接丢弃（防事件风暴）
+          2. **归一化后相同的文本**（数字/括号细节不同也算同一件事）→
+             不新增条目，而是把已有那条的 `count +1`、刷新时间、必要时提高权重
+
+        为什么第二层重要：实测她的记忆库 392 条里只有 173 条不同——
+        "砍树失败：Cannot read properties of null" 重复了 29 次，
+        "挖石头失败：连续多次没有进展" 重复了 21 次。这些重复把真正有用的
+        记忆挤出了上限，而且每轮塞进提示词的都是同一句话的 29 个副本。
+
+        `count` 本身是**有用的信息**：失败 29 次说明这件事有系统性问题，
+        比"失败过一次"值得注意得多（渲染时会显示"发生过 N 次"）。
         """
         text = (text or "").strip()
         if not text:
             return None
         now = time.time()
+        # 第一层：时间窗内**同 kind** 且完全相同的，直接丢。
+        # （要比 kind：同一句话可能既是"死亡"又是"意外"，那是两件事，
+        #   实测不加这一条会把不同类型的事件互相吃掉）
         for e in reversed(self._entries[-20:]):
-            if e.text == text and now - e.at < dedupe_window:
+            if e.kind == kind and e.text == text and now - e.at < dedupe_window:
                 return None
+
+        # 第二层：归一化后相同 → 合并进已有条目（不新增）
+        norm = normalize_text(text)
+        if norm:
+            for e in reversed(self._entries):
+                if e.kind != kind:
+                    continue
+                if normalize_text(e.text) != norm:
+                    continue
+                e.count += 1
+                e.at = now
+                # 反复发生的事会"变重"，但设上限避免一条噪音压过一切
+                e.weight = min(9.0, max(e.weight, float(weight) if weight is not None else e.weight) + 0.15)
+                if context:
+                    e.context = dict(context)
+                self._dirty = True
+                return e
 
         entry = MemoryEntry(
             kind=kind,
@@ -245,7 +335,10 @@ class MemoryStore:
             ago = _humanize_age(abs(now - e.at))
             label = KIND_LABEL.get(e.kind, "")
             prefix = f"{ago}前" if ago else "刚才"
-            lines.append(f"- {prefix}（{label}）{e.text}")
+            # **重复次数要显示出来**：失败 29 次和失败 1 次是两回事，
+            # 前者说明这件事有系统性问题（该换做法了），后者只是运气不好。
+            times = f"（发生过 {e.count} 次）" if e.count > 1 else ""
+            lines.append(f"- {prefix}（{label}）{e.text}{times}")
         return "\n".join(lines)
 
 
