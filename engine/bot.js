@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /**
  * Minecraft 引擎主体：把 mineflayer、寻路、动作、技能、状态跟踪装配到一起。
  *
@@ -1135,14 +1135,44 @@ class McEngine {
     if (block) {
       try {
         this.state.note(`要从 ${drop} 格高摔下来，往脚下垫方块`);
-        await Promise.race([
-          this.actions.place({ x: bx, y: by - 1, z: bz, item: block, signal, reach: false }),
-          delay(400, { signal }).then(() => {
-            throw new Error('垫方块超时（坠落中不能等）');
-          }),
-        ]);
-        log.warn(`MLG：垫方块自救（落差 ${drop} 格）`);
-        return true;
+        // **坠落中要反复试，而不是只试一次。**
+        //
+        // 她每 tick 都在往下掉，"脚下那一格"一直在变；服务端收到包时她的位置
+        // 已经不同了，一次尝试命中的概率很低。真人在竖井里掉下去也是一边掉
+        // 一边狂点右键，总有一格垫得正好。
+        // 每次都用 400ms 硬超时（**不能让它去寻路**，见上面的说明）。
+        //
+        // 注意：这一版**还没验证成功过**（实测 1 格宽竖井里 30 格坠落仍然摔死）。
+        // 留着是因为它只可能更好，而且失败会如实记进 mlg_note。
+        let placed = false;
+        for (let i = 0; i < 6 && !placed; i += 1) {
+          const pp = bot.entity.position;
+          try {
+            await Promise.race([
+              this.actions.place({
+                x: Math.floor(pp.x),
+                y: Math.floor(pp.y) - 1,
+                z: Math.floor(pp.z),
+                item: block,
+                signal,
+                reach: false,
+              }),
+              delay(400, { signal }).then(() => {
+                throw new Error('垫方块超时（坠落中不能等）');
+              }),
+            ]);
+            placed = true;
+          } catch (err) {
+            this._mlgNote = `垫方块第 ${i + 1} 次没成：${err.message}`;
+            await delay(90, { signal }).catch(() => {});
+          }
+          if (bot.entity.onGround) break;
+        }
+        if (placed) {
+          log.warn(`MLG：垫方块自救（落差 ${drop} 格）`);
+          this._mlgNote = '✅ 垫方块成功';
+          return true;
+        }
       } catch (err) {
         log.debug(`垫方块自救失败：${err.message}`);
       }
