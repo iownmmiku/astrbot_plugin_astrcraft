@@ -942,6 +942,40 @@ rpc.handle(
   }),
 );
 
+// **倒水专项调试**：桶要的是 `use_item` 包（对着空气使用），
+// 而 `use.block` 走的是 `block_place`（对着方块右键）。两者不一样。
+// 这个入口专门用来验证"到底哪种包能让服务端倒出水"。
+rpc.handle(
+  'debug.usebucket',
+  wrap(async (params = {}) => {
+    const bot = engine.requireBot();
+    const mode = String(params.mode || 'item'); // item | block
+    const item = String(params.item || 'water_bucket').replace(/^minecraft:/, '');
+    await engine.actions.holdItem({ item });
+    // 看向正下方（pitch = -90°）
+    await bot.look(bot.entity.yaw, -Math.PI / 2, true);
+    const before = engine.actions.countItem('water_bucket');
+    const beforeEmpty = engine.actions.countItem('bucket');
+    if (mode === 'item') {
+      bot.activateItem();
+    } else {
+      const below = bot.blockAt(vec3(Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y) - 1, Math.floor(bot.entity.position.z)));
+      if (!below) throw new GameError('脚下那格读不到');
+      await bot.activateBlock(below);
+    }
+    await new Promise((r) => setTimeout(r, 400));
+    return {
+      mode,
+      held: bot.heldItem ? bot.heldItem.name : null,
+      water_buckets_before: before,
+      water_buckets_after: engine.actions.countItem('water_bucket'),
+      empty_buckets_before: beforeEmpty,
+      empty_buckets_after: engine.actions.countItem('bucket'),
+      pitch: Number(bot.entity.pitch.toFixed(2)),
+    };
+  }),
+);
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {

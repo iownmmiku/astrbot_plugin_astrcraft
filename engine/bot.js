@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 /**
  * Minecraft 引擎主体：把 mineflayer、寻路、动作、技能、状态跟踪装配到一起。
  *
@@ -1098,21 +1098,31 @@ class McEngine {
       try {
         this.state.note(`要从 ${drop} 格高摔下来，往脚下倒水`);
         await this.actions.holdItem({ item: 'water_bucket' });
+        this._mlgNote = 'holdItem ok';
         // 看向正下方那一格（水会倒在那儿）
         const below = bot.blockAt(vec3(bx, by - 1, bz));
         if (below) await bot.lookAt(below.position.offset(0.5, 1, 0.5), true);
+        this._mlgNote = `lookAt ok（pitch=${bot.entity.pitch.toFixed(2)}）`;
         bot.activateItem();
+        this._mlgNote = 'activateItem 已发';
         await delay(200, { signal });
         // 验证水真的出现了（这一步很重要：不验证就会"报成功但没救到命"）
         const w = bot.blockAt(vec3(bx, by - 1, bz));
         if (w && (w.name === 'water' || w.name === 'flowing_water')) {
           log.warn(`MLG：倒水成功（落差 ${drop} 格）`);
+          this._mlgNote = '✅ 倒水成功';
           return true;
         }
-        log.warn(`MLG：倒水了但脚下没出现水（落差 ${drop} 格）`);
+        this._mlgNote = `activateItem 发了但脚下没水（那里是 ${w ? w.name : '读不到'}）`;
+        log.warn(`MLG：倒水了但脚下没出现水（落差 ${drop} 格）｜${this._mlgNote}`);
       } catch (err) {
-        log.debug(`倒水自救失败：${err.message}`);
+        // **用 warn 而不是 debug**：这条路径的失败必须看得见，
+        // 否则"MLG 没生效"会变成一个查不出原因的谜（已经踩过一次）。
+        this._mlgNote = `倒水自救失败：${err.message}`;
+        log.warn(`MLG：倒水自救失败（落差 ${drop}）｜${err.message}`);
       }
+    } else {
+      this._mlgNote = '身上没有水桶';
     }
     // 2) 没水就垫方块：往正下方放一块（能挡一下，减少摔落高度）
     //
@@ -1485,6 +1495,7 @@ class McEngine {
         mlg_last_air_vy: this._lastAirVy ?? null,
         mlg_last_danger: this._lastDanger ?? null,
         mlg_running: !!this._mlgRunning,
+        mlg_note: this._mlgNote || null,
       },
       // **性能**：最近一次事件循环阻塞（"卡"的直接指标）
       last_lag: this._lastLagWarn || null,

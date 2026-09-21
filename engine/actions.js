@@ -1625,20 +1625,22 @@ class Actions {
       }
     }
     try {
-      // **对着方块右键，两种包都试一遍。**
+      // **对着方块右键，还是"对空气使用"？要看手上是什么。**
       //
-      // 实测教训：水桶要"倒出来"，服务端处理的是"对着方块使用物品"那个包
-      // （mineflayer 的 `activateBlock`），而不是"对空气使用"（`activateItem`）。
-      // 我一度按"是不是方块物品"来二选一，结果水桶被分到 activateItem，
-      // 调用返回成功、**世界里一滴水都没有**。
-      // 现在先试 activateBlock（对绝大多数右键行为都正确），
-      // 失败了再退到 activateItem（弓、末影珍珠这类确实要它）。
+      // 实测结论（用 `debug.usebucket` 逐个包试出来的）：
+      //   - **水桶**：只有 `activateItem`（`use_item` 包）能让服务端倒出水。
+      //     用 `activateBlock`（`block_place`）桶**永远不会变空**、一滴水都没有。
+      //     而且必须在**空中**倒——站在地面上倒，水会落在她自己站的那一格，
+      //     服务端直接拒绝。
+      //   - **方块**：`activateBlock` 才是对的（要指定贴哪一面）。
+      // 所以这里按"是不是方块物品"来分派，而不是"先试一个再退另一个"。
+      const held = bot.heldItem;
+      const isBlockItem = held && require('minecraft-data')(bot.version).blocksByName[held.name];
       await bot.lookAt(block.position.offset(0.5, 1, 0.5), true);
-      try {
-        await bot.activateBlock(block);
-      } catch (firstErr) {
-        log.debug(`activateBlock 失败（${firstErr.message}），改用 activateItem`);
+      if (held && !isBlockItem) {
         bot.activateItem();
+      } else {
+        await bot.activateBlock(block);
       }
     } catch (err) {
       throw new ActionError(`使用 ${block.name} 失败：${describeFailure(err)}`);
