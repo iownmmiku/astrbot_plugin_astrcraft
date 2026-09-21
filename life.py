@@ -234,6 +234,14 @@ class LifeLoop:
         # 到上限就进 BLOCKED 停牌并说清楚，而不是每 8 秒无限重试
         # （实测那样能连着几十次，她一直在"想事情"却什么都没做）。
         self._decide_retry_limit = 2
+        # ---- 永不空闲（W7）----
+        # **只对"同一件事反复失败"退避**，不对所有决策退避。
+        # 上一轮那个 `min_decide_gap = 6`（一刀切）已经拆掉：
+        # 它治错了病——病根是"重新规划太频繁"，而副作用是"没事做时也要干等 6 秒"。
+        self._idle_rounds = 0  # 连续"这一轮什么都没做成"的次数
+        self._idle_since = 0.0  # 从什么时候开始连续没事做
+        self._last_idle_note_at = 0.0  # 上次把"没事做"说出去的时间（别刷屏）
+        self._backoff_until = 0.0  # 失败退避到什么时候
         self._share_cooldown = share_cooldown
         self._last_share_at = 0.0
         self._last_decide_at = 0.0
@@ -304,6 +312,81 @@ class LifeLoop:
         if len(self._recent_outcomes) > 8:
             self._recent_outcomes = self._recent_outcomes[-8:]
         logger.warning("记下一次决策失败（%s）：%s", kind, reason)
+
+    # ------------------------------------------------------------ 永不空闲（W7）
+
+    def _should_back_off(self) -> bool:
+        """该不该退避一下？**只对"同一件事反复失败"退避**，不对所有决策退避。
+
+        这是 W7 的核心：用户要"没有任务就立刻发起一个"，
+        所以**不能**像上一轮那样对所有决策一律压 6 秒。
+        真正该歇一会儿的只有一种情况——同一个技能在短时间内反复失败
+        （说明她卡住了，再立刻重试还是同样结果，只会刷日志）。
+        """
+        now = time.time()
+        if now < self._backoff_until:
+            return True
+        # 同一个技能失败 3 次以上 → 歇 30 秒（`_recent_failures` 是 W3 之前就有的）
+        counts = self._failure_counts()
+        if counts and max(counts.values()) >= 3:
+            self._backoff_until = now + 30.0
+            logger.info(
+                "失败退避 30 秒（同一件事已经失败 %d 次：%s）——"
+                "这不是'没事做'，是它卡住了，立刻重试只会得到同样结果",
+                max(counts.values()),
+                "、".join(sorted(counts)[:3]),
+            )
+            return True
+        return False
+
+    def _note_busy_round(self) -> None:
+        """这一轮**有事做**（执行了计划的一步）→ 清掉"没事做"的计数。"""
+        self._idle_rounds = 0
+        self._idle_since = 0.0
+
+    def note_idle_round(self, why: str = "") -> None:
+        """这一轮**什么都没做成**——记下来，而且**要说出去**（W7）。
+
+        为什么必须可见：用户看到的是"她站在原地"，而日志里什么都没有。
+        真人也一样：没事干的时候会嘟囔一句，不会像死机一样杵着。
+        但也不能每轮都喊——所以有冷却（默认 60 秒说一次）。
+        """
+        self._idle_rounds += 1
+        if not self._idle_since:
+            self._idle_since = time.time()
+        now = time.time()
+        if now - self._last_idle_note_at < 60.0:
+            return
+        self._last_idle_note_at = now
+        mins = (now - self._idle_since) / 60.0
+        detail = f"（{why}）" if why else ""
+        logger.warning(
+            "她已经连续 %d 轮没做成任何事%s，持续 %.1f 分钟——**这不是停牌**，"
+            "是「能跑但确实没活」（IDLE_NO_WORK）",
+            self._idle_rounds,
+            detail,
+            mins,
+        )
+        self.state_note(f"我暂时想不出该做什么{detail}")
+
+    def state_note(self, text: str) -> None:
+        """往状态简报里写一句（给 LLM 和 /mc状态 看）。"""
+        try:
+            self._on_activity(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("写状态简报失败：%s", exc)
+
+    def idle_explain(self) -> str:
+        """她是不是"能跑但没事做"——给 /mc状态 用。"""
+        if self.current_hold() is not Hold.NONE:
+            return ""  # 停牌有停牌的说法，别混
+        if self._idle_rounds <= 0:
+            return ""
+        mins = (time.time() - self._idle_since) / 60.0 if self._idle_since else 0.0
+        return (
+            f"她已经连续 {self._idle_rounds} 轮没做成事（约 {mins:.1f} 分钟）。"
+            "**她没有停牌，是确实没事做**——可以给她一个目标，或者看看是不是卡在某个失败上"
+        )
 
     def note_task_result(self, name: str, ok: bool, error: str = "") -> None:
         """记录一次任务结果（由插件在 task.finished 时调用）。
@@ -614,21 +697,19 @@ class LifeLoop:
                 if self._stopped:
                     break
 
-                # **承诺机制：两次决策之间有一个最小间隔。**
+                # **失败感知退避（W7），取代上一轮那个"一刀切 6 秒"。**
                 #
-                # 为什么要这个（这是"乱走乱挖"的主要来源）：
-                # `task.finished` 会立刻唤醒她继续想，而模型用**短动作**干活时
-                # （一次 mc_goto / mc_craft 一两秒就完），于是她的决策节奏变成
-                # **每几秒一次**。每决策一次就可能改主意 → 玩家看到的就是
-                # "她一直在乱走、换个没完"。
+                # 上一轮我加过 `min_decide_gap = 6`（对所有决策一律压 6 秒），
+                # 用来治"乱走乱挖"。但那个药方是错的：病根是**重新规划太频繁
+                # （每决策一次就改主意）**，不是"手上没活"。一刀切压间隔的副作用是
+                # **她没事做的时候也要干等 6 秒**——而用户明确要求"没有任务就立刻发起一个"。
                 #
-                # 真人的节奏不是这样：做完一个小动作不会立刻重新规划人生。
-                # 这里设一个下限（默认 6 秒），让一个"打算"至少能连续执行几步。
-                # 长任务不受影响——它们在跑的时候本来就不会走到这里（见下面的 busy）。
-                gap = self._min_decide_gap
-                since = time.time() - (self._last_decide_at or 0)
-                if gap > 0 and since < gap:
-                    await asyncio.sleep(min(gap - since, 3.0))
+                # 现在的分工：
+                #   - "别频繁改主意" 交给**计划连续性**（见下面的计划优先）
+                #   - 时间退避**只用于"同一件事反复失败"**（真的卡住了才歇）
+                #   - 其余情况**一律立刻行动**，不等待
+                if self._should_back_off():
+                    await asyncio.sleep(2.0)
                     continue
 
                 self.drives.tick()
@@ -660,6 +741,26 @@ class LifeLoop:
                 # 引擎空闲才自主行动：有任务在跑说明你（或目标系统）已经在用她
                 busy = await self._engine_busy()
                 if busy:
+                    continue
+
+                # **计划优先：有计划就直接执行下一步，不调模型（W7 的核心）。**
+                #
+                # 为什么必须放在 agent 之前：agent 正常可用时**每轮都会返回 True**
+                # （"这一轮我处理了"），于是它下面的 `_pop_plan_step()` 永远轮不到
+                # ——**计划机制在 agent 可用时是死代码**。而它正是那条
+                # "不花 token 的路"。用户要的"没有任务就立刻发起一个"，
+                # 最省的做法就是先把已经想好的下一步做掉。
+                step = self._pop_plan_step()
+                if step is not None:
+                    decision = self._decision_from_step(step)
+                    logger.info(
+                        "按计划执行（还剩 %d 步）：%s（技能 %s）——不调模型",
+                        len(self._plan),
+                        decision.activity,
+                        decision.skill,
+                    )
+                    self._note_busy_round()
+                    await self._act(decision)
                     continue
 
                 # **首选：让 LLM 用工具直接驱动她**（让模型直接用工具）。
@@ -725,32 +826,25 @@ class LifeLoop:
                         # **成功一次就把"模型不可用"解开**：说明端点其实好的。
                         if self._blocked_reason:
                             self.note_unblocked()
+                        # **agent 跑了一轮**，但它可能什么都没提交（只是看了看、
+                        # 或者想不出该干嘛）。这算不算"没事做"由 agent 自己上报
+                        # （它知道有没有提交任务），这里只负责在"计划空 + 没提交"
+                        # 时把空闲记下来 —— 见下面 agent 返回后的判定。
+                        if not self._plan and not await self._engine_busy():
+                            self.note_idle_round("agent 这一轮没有提交任何任务")
+                        else:
+                            self._note_busy_round()
                         continue
 
-                # **有计划就直接执行下一步，不再问 LLM。**
+                # 走到这里说明：没停牌、引擎空闲、**计划也空了**、agent 也帮不上
+                # （不可用，或者它这一轮什么都没做）。
                 #
-                # 这是"让她连续行动"的关键：早期每做一件事都要重新问一次 LLM
-                # （一次往返十几秒到几十秒），于是她做完一步就呆站着想下一步，
-                # 看起来一点都不连贯。现在 LLM 一次给出**有序的几步计划**，
-                # 循环里直接按顺序执行，中间不再有等待。
-                step = self._pop_plan_step()
-                if step is not None:
-                    decision = self._decision_from_step(step)
-                    logger.info(
-                        "按计划执行（还剩 %d 步）：%s（技能 %s）",
-                        len(self._plan),
-                        decision.activity,
-                        decision.skill,
-                    )
-                    await self._act(decision)
-                    continue
-
+                # **旧路径的 decide()**：agent 完全不可用时退回"挑技能"的老办法。
+                # （原来上面还有一段"有计划就执行下一步"，已经挪到 agent 之前了
+                # —— 放在这里它在 agent 可用时是死代码。）
+                #
                 # 决策必须带超时。LLM 卡住时若一直等，循环会永久冻结且不留日志，
                 # 表现成"她启动了却什么都不做"，排查时毫无线索。
-                #
-                # **超时之后要尽快重试，不能等满一个完整间隔**。
-                # 实测：决策超时 90 秒 + 间隔 90 秒 = 她有 3 分钟完全不动，
-                # 用户看到的就是"她还是不能自己活动"。所以超时后只等 8 秒再想一次。
                 try:
                     decision = await asyncio.wait_for(self.decide(), timeout=self._decide_timeout)
                     self._decide_timeouts = 0
@@ -781,8 +875,11 @@ class LifeLoop:
                     continue
 
                 if decision is None:
+                    # 旧路径也没想出任何事 → 同样是"能跑但没事做"（W7）
+                    self.note_idle_round("想不出该做什么")
                     continue
 
+                self._note_busy_round()
                 await self._act(decision)
             except asyncio.CancelledError:
                 raise
@@ -1651,8 +1748,17 @@ class LifeLoop:
         elif not self.running:
             lines.append("（过日子循环未运行）")
         else:
-            nxt = max(0, int(self._decide_interval - (time.time() - self._last_decide_at)))
-            lines.append(f"（每 {int(self._decide_interval)} 秒想一次自己在干嘛；下次约 {nxt} 秒后）")
+            # **"没事做"和"停牌"要分开说**（W7）。
+            # 停牌有停牌的说法（见 main.py 的【能动吗】那一行）；
+            # 这里说的是"她能跑，但确实没活"——这一种以前是完全不可见的。
+            idle = self.idle_explain()
+            if idle:
+                lines.append(f"（{idle}）")
+            else:
+                # **不再说"每 N 秒想一次"**：W7 之后没有那个固定间隔了，
+                # 没任务就立刻接着做。写着一个不存在的间隔只会误导排查。
+                plan = f"，计划里还剩 {len(self._plan)} 步" if self._plan else ""
+                lines.append(f"（有事就立刻做，没有固定间隔{plan}）")
 
         if self.current:
             ago = int(time.time() - self.current.at)
