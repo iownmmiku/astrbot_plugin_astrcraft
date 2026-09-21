@@ -662,7 +662,14 @@ rpc.handle(
           x: Number(params.x),
           y: params.y === undefined || params.y === null ? null : Number(params.y),
           z: Number(params.z),
-          range: Number(params.range) || 1,
+          // **默认 range 从 1 放宽到 2**（这一轮修的真 bug）：
+          // 实测 `test_pathfinding` 的"绕墙"场景**稳定失败**——
+          // 她停在距目标 1.6~2.2 格的地方，pathfinder 就是不再往前挪，
+          // 于是 `move.to` 报 failed。而**真人这时候认为"我到了"**：
+          // 目标是"走到 (12, 0)"，站在 (12.1, 1.9) 就是走到了。
+          // 后果不只是测试红：LLM 看到 failed 会**反复重试同一个走法**，
+          // 玩家看到的就是"她在原地磨蹭"。
+          range: Number(params.range) || 2,
           signal,
           timeoutMs: Number(params.timeout_ms) || null,
           onTick: (info) => task.setDetail(`距目标约 ${distance(info.position, { x: Number(params.x), y: info.position.y, z: Number(params.z) }).toFixed(1)} 格`),

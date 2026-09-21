@@ -380,6 +380,11 @@ class TaskQueue {
       started_at: task.startedAt,
       finished_at: task.finishedAt,
       error: task.error ? String(task.error.message || task.error) : null,
+      // **结果也要存**（见 describe 的说明）：不存的话事后查不到"它到底做了什么、
+      // 为什么没做成"——而 `task.finished` 通知里是有的，两边不一致会误导排查。
+      result: task.result === undefined ? null : task.result,
+      detail: task._detail ? task._detail() : null,
+      meta: task.meta || {},
     });
     if (this._history.length > 50) this._history.splice(0, this._history.length - 50);
   }
@@ -392,11 +397,30 @@ class TaskQueue {
     return null;
   }
 
+  /**
+   * 查任务：当前 / 排队 / 最近历史都能查到。
+   *
+   * **历史里也要能查到结果**——这一点踩过坑：
+   * 原来 `_remember` 只存了 task_id/name/status/时间/error，**没存 result**，
+   * 而 `describe` 在命中历史时**硬编码 `result: null`** ✗
+   * 后果：同一个任务，`task.finished` 通知里**带着完整结果**
+   * （`note`/`reason`/`extra` 都有），而事后 `task.status` 查出来 `result` 是 null ✗
+   * 排查时我据此两次误判（以为技能没返回东西、以为 `|| {}` 把 null 变空了）。
+   * 现在两边都带上 result/detail/meta。
+   */
   describe(taskId) {
     const t = this.find(taskId);
     if (t) return t.toJSON();
     const h = [...this._history].reverse().find((x) => x.task_id === taskId);
-    if (h) return { ...h, detail: null, result: null, meta: {} };
+    if (h) {
+      return {
+        ...h,
+        detail: h.detail ?? null,
+        // **不要硬编码 null**：历史里存了什么就返回什么
+        result: h.result === undefined ? null : h.result,
+        meta: h.meta || {},
+      };
+    }
     return null;
   }
 
