@@ -984,6 +984,23 @@ rpc.handle(
 rpc.handle('viewer.status', () => engine.viewerInfo());
 rpc.handle('viewer.stop', () => engine.stopViewer());
 
+// **脱困诊断**：直接看 _blockingSelf 认为她被什么卡住（排查"被埋住却看不见"用）
+rpc.handle('debug.blocking', () => {
+  const bot = engine.requireBot();
+  const out = engine._blockingSelf();
+  const p = bot.entity.position;
+  return {
+    position: { x: p.x, y: p.y, z: p.z },
+    blocking: out,
+    unstuck_times: (engine._unstuckTimes || []).length,
+    last_unstuck_seconds_ago: engine._lastUnstuckAt
+      ? Number(((Date.now() - engine._lastUnstuckAt) / 1000).toFixed(0))
+      : null,
+    reflex_running: !!engine._currentReflexRunning,
+    pending: engine._unstuckPending || null,
+  };
+});
+
 rpc.handle('skill.list', () => ({ skills: skills.describeAll(), names: skills.names() }));
 
 rpc.handle('task.status', (params = {}) => {

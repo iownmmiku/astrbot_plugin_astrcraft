@@ -769,37 +769,99 @@ class McEngine {
             log.debug(`疑似被 ${stuckBlock.name} 卡住，再确认一次`);
           } else if (now - this._unstuckPending.at >= 2000) {
             this._unstuckPending = null;
-            // **连续失败就长时间退避。**
-            // 实测最糟的情形：她被石头困住又没有镐，这个反射每 8 秒提交一次、
-            // 每次立刻失败，日志里一分钟十几次——玩家看到的就是"她在乱挖"。
-            // 失败 3 次就停 5 分钟，别再把日志和她的动作刷满。
+            // **不"放弃"，而是"升级办法"——绝不静默。**
+            //
+            // 原来这里是：5 次失败 → 静默 5 分钟，还在游戏里说一句"怎么挖都出不去，
+            // 先不管了"。那是个**掩盖**：日志干净了，但**她仍然卡在那里**，
+            // 而且这 5 分钟里没有任何东西在处理这件事——玩家看到的就是"她死机了"。
+            //
+            // 真玩家被困住会**换办法**，按顺序试：
+            //   1) 挖开挡着自己的方块（贴身，最可能有效）——前几次
+            //   2) **往上挖阶梯**（被困在地下时这才是正解，不是继续挖身边那面墙）
+            //   3) 都不行 → 降频持续尝试（每 60 秒一次），并且**明确告诉 LLM**
+            //      "我被困在 X、试过什么、都不行"，让它能据此做决策
+            //      （比如回出生点重新开始、或者求助用户）
+            // 全程**不静默**——卡住这件事必须一直可见。
+            this._unstuckTimes = (this._unstuckTimes || []).filter((t) => now - t <= 300000);
+            const tries = this._unstuckTimes.length;
+            // **降频闸门**：连续失败时会设一个短的静默窗口（60 秒），
+            // 但那只是"别刷屏"，不是"放弃"——过了就继续试，而且会换办法。
             if (now < (this._unstuckGiveUpUntil || 0)) {
               return;
             }
-            // **成功也算"挣扎"**：实测她在石头/泥土堆里会"挖开一格→挪一下→又被卡住"，
-            // 每 8 秒循环一次、连着十几分钟，看起来就是一直在乱挖乱走。
-            // 所以这里用"5 分钟内尝试次数"做闸门，而不是只看失败。
-            this._unstuckTimes = (this._unstuckTimes || []).filter((t) => now - t <= 300000);
-            if (this._unstuckTimes.length >= 5) {
-              this._unstuckGiveUpUntil = now + 300000;
-              this._unstuckTimes = [];
-              log.warn('5 分钟内挖困自救 5 次仍未脱身，静默 5 分钟');
+            // 第 4 次起改走"往上挖阶梯"
+            const useClimb = tries >= 3;
+            // 第 7 次起降频到 60 秒一次（还在试，只是不那么频繁刷）
+            if (tries >= 6 && now - (this._lastUnstuckAt || 0) < 60000) {
+              return;
+            }
+            if (tries >= 6) {
+              log.warn(`挖困自救已经试了 ${tries} 次都没脱身，改成每 60 秒试一次（不放弃）`);
+              this.state.note(
+                `⚠️ 我被困在 (${stuckBlock.x}, ${stuckBlock.y}, ${stuckBlock.z}) 附近出不去：` +
+                  `挖开身边的方块、往上挖阶梯都试过了。需要帮助，或者换个思路（比如回出生点重新开始）`,
+              );
               try {
-                bot.chat('……怎么挖都出不去，先不管了。');
+                bot.chat('我被困住了……挖了半天都出不去，有人能来帮帮我吗？');
               } catch {
                 /* 聊天失败不致命 */
               }
-              return;
             }
             this._unstuckTimes.push(now);
             this._lastUnstuckAt = now;
             const desc = stuckList
               .map((c) => `${c.name}(${c.x},${c.y},${c.z})`)
               .join(' + ');
-            log.warn(`确认被 ${desc} 卡住，挖开它（${stuckList.length} 格）`);
+            // **"挖不动"是另一类问题，不能当成"再挖一次"。**
+            //
+            // 她空手被埋在石头里时，挖是永远挖不动的——继续提交挖掘任务只会
+            // 每 8 秒失败一次。这时该做的是**如实说出来**（LLM 能看到就能决定
+            // 求助用户 / 回出生点重来），而不是假装在自救。
+            const anyDiggable = stuckList.some((c) => c.diggable !== false);
+            if (!anyDiggable) {
+              log.warn(`被 ${desc} 埋住，但身上没有能挖它的工具——如实求助，不假装自救`);
+              this.state.note(
+                `🚨 我被 ${desc} 埋住了，而且身上**没有能挖开它的工具**——自己出不去。` +
+                  `需要人帮忙，或者换个办法（比如放弃这里的进度、回出生点重新开始）`,
+              );
+              if (now - (this._lastHelpAt || 0) > 60000) {
+                this._lastHelpAt = now;
+                try {
+                  bot.chat('救命……我被埋在石头里了，手上又没有镐子，出不去。');
+                } catch {
+                  /* 聊天失败不致命 */
+                }
+              }
+              // 记一次"挣扎"（避免每秒重复喊），但**不设静默期**：情况一直可见
+              this._unstuckTimes.push(now);
+              this._lastUnstuckAt = now;
+              return;
+            }
+            log.warn(
+              useClimb
+                ? `确认被 ${desc} 卡住 —— 前几次挖开都没用，改成往上挖阶梯`
+                : `确认被 ${desc} 卡住，挖开它（${stuckList.length} 格）`,
+            );
             this._submitReflex(
-              '挖开卡住自己的方块',
+              useClimb ? '往上挖阶梯脱困' : '挖开卡住自己的方块',
               async ({ signal }) => {
+                // **升级方案：往上挖阶梯。**
+                //
+                // 为什么这是对的第二步：被埋在地下时，身边那面墙后面可能还是石头、
+                // 再挖一格又是石头——一直挖身边只会把洞挖大，人还在下面。
+                // 往上挖阶梯能**一层层走到地表**，那才是"出去"。
+                if (useClimb) {
+                  this.state.note('挖开身边没用，试着往上挖阶梯出去');
+                  const { climbToSurface } = require('./skills/common');
+                  const ok = await climbToSurface({
+                    actions: this.actions,
+                    nav: this.nav,
+                    ctx: { signal, checkAborted: () => { if (signal && signal.aborted) throw new CancelledError(); } },
+                    maxSteps: 32,
+                  });
+                  if (!ok) throw new Error('往上挖阶梯没能到地表');
+                  return { ok: true, climbed: true };
+                }
                 // **把"占着自己身体的那几格"一次全挖掉。**
                 //
                 // 踩过：只挖头那一格，脚还堵着 → 人仍然卡住 → 要等下一轮 2 秒确认
@@ -845,14 +907,27 @@ class McEngine {
               },
               'normal',
               {
-                onFailed: () => {
+                onFailed: (err) => {
                   this._unstuckFailures = (this._unstuckFailures || 0) + 1;
+                  // **连续失败不是"放弃"，是"该换办法了"。**
+                  //
+                  // 原来是连续 3 次失败就静默 5 分钟——同样是掩盖：她还在里面，
+                  // 只是没人管了。现在改成**降频 + 升级**：
+                  // 继续试（每 60 秒一次），而且下一次会自动走"往上挖阶梯"那条路
+                  // （见上面 tries >= 3 的分支），同时把情况写给 LLM 看。
                   if (this._unstuckFailures >= 3) {
-                    this._unstuckGiveUpUntil = Date.now() + 300000;
                     this._unstuckFailures = 0;
-                    log.warn('挖困连续失败 3 次（多半是缺工具），5 分钟内不再尝试');
+                    this._unstuckGiveUpUntil = Date.now() + 60000; // 只降频 60 秒，不放弃
+                    log.warn(
+                      `挖困连续失败 3 次（多半是缺工具），降频到 60 秒一次继续试；` +
+                        `下一次会改走"往上挖阶梯"。原因：${err ? err.message : '未知'}`,
+                    );
+                    this.state.note(
+                      `⚠️ 挖困自救连续失败（${err ? String(err.message).slice(0, 40) : '缺工具'}）。` +
+                        `我还在里面，接下来会试着往上挖阶梯`,
+                    );
                     try {
-                      bot.chat('……被困住了，手上又没有能挖的工具，先歇会儿。');
+                      bot.chat('……被石头困住了，手上又没有能挖的工具。我试试往上挖。');
                     } catch {
                       /* 聊天失败不致命 */
                     }
@@ -1345,6 +1420,14 @@ class McEngine {
       }
     };
     // 自己所在格 + 头顶（最优先，因为不挖开就动不了）
+    //
+    // **注意这里不过滤"挖得动吗"。**
+    //
+    // 踩过：原来要求 `canDigThis` 才认，结果"被埋在石头里、身上又没镐"这个
+    // **最坏的情况直接返回 null** —— 她明明被埋住，诊断却说"一切正常，她应该能动"，
+    // 而且那句"我需要帮助"的提示永远不会触发（实测：埋在石头里 70 秒，
+    // 日志里一条脱困记录都没有）。这是最难的情况，恰恰最不能被漏掉。
+    // 现在如实返回，并带上 `diggable` 标记，由调用方决定"能挖就挖、挖不动就求助"。
     for (const ty of [byHead, byFeet]) {
       let b = null;
       try {
@@ -1352,10 +1435,16 @@ class McEngine {
       } catch {
         continue;
       }
-      if (!b || b.boundingBox !== 'block' || !b.diggable) continue;
+      if (!b || b.boundingBox !== 'block') continue;
       if (BAD.includes(b.name)) continue;
-      if (!canDigThis(b)) continue;
-      candidates.push({ x: bx, y: ty, z: bz, name: b.name, prio: ty === byHead ? 0 : 1 });
+      candidates.push({
+        x: bx,
+        y: ty,
+        z: bz,
+        name: b.name,
+        prio: ty === byHead ? 0 : 1,
+        diggable: !!b.diggable && canDigThis(b),
+      });
     }
     // 四个水平方向（脚和头两层）：被围住时也能开一条路出去
     for (const [dx, dz] of [
@@ -1371,10 +1460,18 @@ class McEngine {
         } catch {
           continue;
         }
-        if (!b || b.boundingBox !== 'block' || !b.diggable) continue;
+        // 同样**不过滤"挖得动吗"**：困在石头柱里、身上又没镐时，
+        // 这些"挖不动的墙"恰恰是她唯一的处境信息。过滤掉就等于看不见她被困。
+        if (!b || b.boundingBox !== 'block') continue;
         if (BAD.includes(b.name)) continue;
-        if (!canDigThis(b)) continue;
-        candidates.push({ x: bx + dx, y: ty, z: bz + dz, name: b.name, prio: 2 });
+        candidates.push({
+          x: bx + dx,
+          y: ty,
+          z: bz + dz,
+          name: b.name,
+          prio: 2,
+          diggable: !!b.diggable && canDigThis(b),
+        });
       }
     }
     if (!candidates.length) return null;
@@ -1612,9 +1709,12 @@ class McEngine {
         const held = cur.startedAt ? (now - cur.startedAt) / 1000 : 0;
         if (held > 90) reasons.push(`「${cur.name}」已经跑了 ${held.toFixed(0)} 秒还没结束（可能卡住了）`);
       }
-      // 3) 反射在退避吗
+      // 3) 脱困在降频吗（**注意：降频不等于放弃**——过了窗口会继续试，而且换办法）
       if (this._unstuckGiveUpUntil && now < this._unstuckGiveUpUntil) {
-        reasons.push(`挖困自救退避中（还有 ${((this._unstuckGiveUpUntil - now) / 1000).toFixed(0)} 秒）`);
+        reasons.push(
+          `脱困降频中（还有 ${((this._unstuckGiveUpUntil - now) / 1000).toFixed(0)} 秒；` +
+            `过了会继续试，下次改走"往上挖阶梯"）`,
+        );
       }
       // 4) 血量/饱食危险吗
       if (bot.health !== null && bot.health <= 6) reasons.push(`血量只剩 ${bot.health}，她在硬撑`);
