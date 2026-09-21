@@ -24,6 +24,8 @@ import json
 import random
 import time
 from enum import Enum
+
+from .inbox import Delivery, Inbox
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -165,6 +167,7 @@ class LifeLoop:
         skill_catalog_provider: Callable[[], Awaitable[list[dict]]] | None = None,
         on_share: Callable[[str], Awaitable[None]] | None = None,
         on_activity: Callable[[LifeDecision], Awaitable[None]] | None = None,
+        inbox=None,
         is_connected: Callable[[], bool] | None = None,
         state_provider: Callable[[], Awaitable[dict]] | None = None,
         decide_interval: float = 90.0,
@@ -242,6 +245,18 @@ class LifeLoop:
         self._idle_since = 0.0  # 从什么时候开始连续没事做
         self._last_idle_note_at = 0.0  # 上次把"没事做"说出去的时间（别刷屏）
         self._backoff_until = 0.0  # 失败退避到什么时候
+        # ---- 输入队列（W4，见 docs/PLAN_v2.md）----
+        # 主人的话与世界事件**共用**这一个队列。没有它的时候：
+        # 她跑长任务时主人说话她听不见；世界事件只有下一轮决策时才知道。
+        self.inbox = inbox if inbox is not None else Inbox()
+        # 本轮要接上的"排着的事"（FOLLOW_UP），由循环在"她本来要停"时填。
+        self._pending_follow_up: str = ""
+        # 急件叫醒：叫的是"来问吧"，**不递事件**——
+        # 正确性从不依赖叫醒（队列的 ready()/has_urgent() 随时可问、答案一致）。
+        try:
+            self.inbox.on_urgent(lambda: self._wake.set())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("登记急件叫醒失败：%s", exc)
         self._share_cooldown = share_cooldown
         self._last_share_at = 0.0
         self._last_decide_at = 0.0
@@ -314,6 +329,116 @@ class LifeLoop:
         logger.warning("记下一次决策失败（%s）：%s", kind, reason)
 
     # ------------------------------------------------------------ 永不空闲（W7）
+
+    # ------------------------------------------------------------ 输入队列（W4）
+
+    def _drain_steer_text(self) -> str:
+        """**取插话并渲染**——在"下次调模型之前"注入（W4）。
+
+        对应 numen 的 STEER：一批工具结算后、下次调模型之前注入。
+        我们的等价点是"每次组装提示词的时候"——agent 每一轮都会重新组装提示词，
+        所以这里就是安全的注入点（不会插在 assistant 的 tool_calls 中间）。
+
+        **取走即出队**：不重复注入同一条。
+        """
+        try:
+            taken = self.inbox.take_steer()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("取插话失败：%s", exc)
+            return ""
+        if not taken:
+            return ""
+        lines = Inbox.render(taken)
+        note = self.inbox.take_dropped_note()
+        body = "\n".join(lines)
+        if note:
+            body += f"\n{note}"
+        logger.info("注入 %d 条插话（主人说话/世界事件）", len(taken))
+        return f"【刚刚发生的事（你要先看这个）】\n{body}\n"
+
+    def _take_follow_up_text(self) -> str:
+        """取接续——**只在她本来要停的时候**用（W4）。
+
+        和插话的区别：插话是"她要继续干活，顺便告诉她新情况"；
+        接续是"她本来要停下来了，正好有件事可以接着做"。
+        """
+        try:
+            taken = self.inbox.take_follow_up()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("取接续失败：%s", exc)
+            return ""
+        if not taken:
+            return ""
+        return "\n".join(Inbox.render(taken))
+
+    def _run_control(self) -> str:
+        """执行控制条目——**只在完全空闲时**（W4）。
+
+        为什么只在完全空闲：整理记忆/清空上下文会**改变她正在看的历史**，
+        干活干到一半做这个等于把图纸抽走。所以它们排在队首当屏障，
+        等她真的没事了再执行。
+        """
+        if not self.inbox.head_is_control():
+            return ""
+        try:
+            taken = self.inbox.take_control()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("取控制条目失败：%s", exc)
+            return ""
+        if not taken:
+            return ""
+        done = []
+        for e in taken:
+            if e.type == "clear":
+                # 清空：丢掉计划、清单和打算——下一次决策从干净的状态开始
+                self.clear_plan("主人要求清空上下文")
+                self._todos = []
+                self._intention = ""
+                self._intention_rounds = 0
+                self._intention_since = 0.0
+                done.append("清空计划和清单")
+            elif e.type == "compact":
+                # 整理记忆：把同类条目合并（W5 之后是"只增补"的合并，不会丢信息）
+                try:
+                    if self.memory is not None:
+                        self.memory.prune()
+                        done.append("整理记忆")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("整理记忆失败：%s", exc)
+            else:
+                done.append(f"（不认识的控制器 {e.type}，跳过）")
+        text = "、".join(done) if done else ""
+        if text:
+            logger.info("执行控制条目：%s", text)
+        return text
+
+    def note_owner_said(self, text: str) -> None:
+        """主人说了一句话——**入队**，不是直接执行（W4）。
+
+        由 main.py 在收到消息时调用。这样她跑长任务时主人说话也**不会丢**：
+        话躺在队列里，等她到安全注入点（下次组装提示词）就会看到。
+        """
+        entry = self.inbox.push("owner", text)
+        if entry is not None:
+            logger.info("主人的话入队：%s", text[:60])
+
+    def note_world_event(self, kind: str, text: str, *, urgent: bool = False) -> None:
+        """世界事件入队（受伤/工具坏/箱子满/任务完成…）。由 main.py 在引擎事件时调用。"""
+        entry = self.inbox.push(kind, text, urgent=urgent)
+        if entry is not None:
+            logger.debug("世界事件入队（%s）：%s", kind, text[:60])
+
+    def inbox_summary(self) -> str:
+        """给 /mc状态 用：队列里还排着什么。"""
+        n = len(self.inbox)
+        if not n:
+            return "队列空"
+        kinds: dict[str, int] = {}
+        for e in self.inbox.entries:
+            kinds[e.type] = kinds.get(e.type, 0) + 1
+        detail = "、".join(f"{k}×{v}" for k, v in kinds.items())
+        urgent = "（有急件）" if self.inbox.has_urgent() else ""
+        return f"排队 {n} 条{urgent}：{detail}"
 
     def _should_back_off(self) -> bool:
         """该不该退避一下？**只对"同一件事反复失败"退避**，不对所有决策退避。
@@ -780,6 +905,31 @@ class LifeLoop:
                 if busy:
                     continue
 
+                # **控制条目只在完全空闲时执行**（W4）。
+                #
+                # 走到这里 = 没停牌 + 引擎空闲 + 计划空 —— 也就是"她确实没事做"。
+                # 整理记忆/清空上下文会改变她正在看的历史，干活干到一半做等于抽走图纸，
+                # 所以它们排在队首当屏障，等到这一刻才执行。
+                if self.inbox.head_is_control():
+                    what = self._run_control()
+                    if what:
+                        self.state_note(f"我{what}了")
+                    continue
+
+                # **接续：只在她本来要停的时候接上**（W4）。
+                #
+                # 和插话的区别：插话是"她还要继续干活，顺便告诉她新情况"；
+                # 接续是"她本来要停下来了，正好有件事可以接着做"。
+                # 没有这一步的话，队列里躺着"砍树做完了""箱子满了"这类事，
+                # 而她会因为"计划空 + 没任务"被判成没事做（IDLE_NO_WORK）。
+                follow_up = self._take_follow_up_text()
+                if follow_up:
+                    logger.info("接上排队的后续事项，继续干活")
+                    self._note_busy_round()
+                    self._pending_follow_up = follow_up
+                else:
+                    self._pending_follow_up = ""
+
                 # **计划优先：有计划就直接执行下一步，不调模型（W7 的核心）。**
                 #
                 # 为什么必须放在 agent 之前：agent 正常可用时**每轮都会返回 True**
@@ -864,11 +1014,18 @@ class LifeLoop:
                         if self._blocked_reason:
                             self.note_unblocked()
                         # **agent 跑了一轮**，但它可能什么都没提交（只是看了看、
-                        # 或者想不出该干嘛）。这算不算"没事做"由 agent 自己上报
-                        # （它知道有没有提交任务），这里只负责在"计划空 + 没提交"
-                        # 时把空闲记下来 —— 见下面 agent 返回后的判定。
-                        if not self._plan and not await self._engine_busy():
-                            self.note_idle_round("agent 这一轮没有提交任何任务")
+                        # 或者想不出该干嘛）。
+                        #
+                        # **判"没事做"必须把队列也算进去**（W4）：队列里躺着
+                        # "砍树做完了""箱子满了"这类排着的事，那就不叫没事做
+                        # ——下一步就会接上它们。只看"计划空 + 没提交任务"
+                        # 会把"有活排队"误判成空闲。
+                        if (
+                            not self._plan
+                            and not await self._engine_busy()
+                            and len(self.inbox) == 0
+                        ):
+                            self.note_idle_round("agent 这一轮没有提交任何任务，队列也空")
                         else:
                             self._note_busy_round()
                         continue
@@ -912,8 +1069,10 @@ class LifeLoop:
                     continue
 
                 if decision is None:
-                    # 旧路径也没想出任何事 → 同样是"能跑但没事做"（W7）
-                    self.note_idle_round("想不出该做什么")
+                    # 旧路径也没想出任何事 → 同样是"能跑但没事做"（W7）。
+                    # 但**队列不空就不算**（W4）：还有排着的事要办。
+                    if len(self.inbox) == 0:
+                        self.note_idle_round("想不出该做什么，队列也空")
                     continue
 
                 self._note_busy_round()
@@ -1293,10 +1452,21 @@ class LifeLoop:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("检索知识库失败：%s", exc)
 
+        # **插话注入点**（W4）：主人的话和世界事件在"组装提示词"这一刻注入——
+        # 这是我们的安全注入点（agent 每一轮都重新组装提示词，
+        # 不会插在 assistant 的 tool_calls 中间）。
+        # 对应 numen 的 STEER："一批工具结算后、下次调模型之前"。
+        steer_text = self._drain_steer_text()
+        # **接续**（W4）：只在她本来要停时才取（循环那边已经判定过了）。
+        # 和插话分开写，是因为两者的语义不同：
+        #   插话 = "你继续干活，但先知道这件事"
+        #   接续 = "你本来要停了，正好有件事接着做"
+        follow_text = getattr(self, "_pending_follow_up", "") or ""
+        follow_block = f"【排着的事（做完手头这个就接着办）】\n{follow_text}\n\n" if follow_text else ""
         prompt = f"""【当前状态】
 {brief}
 
-{self._intention or ''}
+{steer_text}{follow_block}{self._intention or ''}
 
 {self.render_todos()}
 

@@ -30,6 +30,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .bridge_client import EngineClient, EngineConfig, EngineError, EngineUnavailable
+from .inbox import Inbox
 from .perception import format_brief, format_event, format_skill_result, format_state, format_task_status
 from .goals import GoalManager
 from .persona import MinecraftPersona
@@ -240,10 +241,14 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             is_connected=lambda: self.connected,
             state_provider=self._life_state_snapshot,
             decide_interval=float(self._cfg("life_decide_interval", 20) or 20),
-            # 两次决策之间的最小间隔（"承诺机制"）：避免她被"任务完成"反复唤醒、
-            # 每几秒改一次主意（那是"乱走乱挖"的主要来源）。0 = 关掉。
+            # 两次决策之间的最小间隔。**W7 之后它已经不在主循环里用了**
+            # （一刀切压间隔治错了病：病根是"重新规划太频繁"，不是"手上没活"），
+            # 现在只留给"失败感知退避"。保留这个参数是为了兼容旧配置。
             min_decide_gap=float(self._cfg("life_min_decide_gap", 6) or 0),
             share_cooldown=float(self._cfg("life_share_cooldown", 600) or 600),
+            # **输入队列**（W4）：主人的话与世界事件共用这一个队列，
+            # 落盘在插件数据目录下，跨重启活着。
+            inbox=Inbox(self._data_dir / "inbox.json"),
         )
         self.life.bind_data_dir(self._data_dir)
         # 决策阶段的"先查看再决定"：给她一套只读感知工具。
@@ -886,6 +891,24 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("唤醒过日子循环失败：%s", exc)
 
+        # **任务结果也入队**（W4）：这样"砍树做完了""挖矿失败了"会**排着**，
+        # 在她本来要停的时候接上（FOLLOW_UP）——
+        # 而不是只靠 wake() 让她重新想一遍（那样她可能想去做别的，
+        # 排着的结果就永远没人处理）。
+        if self.life:
+            try:
+                name = str(data.get("name") or "任务")
+                status = str(data.get("status") or "")
+                if status == "done":
+                    self.life.note_world_event("task_done", f"「{name}」做完了")
+                elif status in ("failed", "cancelled"):
+                    why = str(data.get("error") or "").strip()
+                    self.life.note_world_event(
+                        "task_failed", f"「{name}」没做成{f'：{why}' if why else ''}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("任务结果入队失败：%s", exc)
+
         # 把结果写进"失败记忆"：决策层要知道"这个技能刚失败过"，
         # 否则会出现实测过的死循环（同一个技能连失败几十次、持续一小时）。
         if self.life:
@@ -972,6 +995,19 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return
 
         await self._notify_subscribers(f"💬 [{sender}] {message}")
+
+        # **主人说的话入队**（W4）：不管她当时在干嘛，这句话都**不会丢**。
+        #
+        # 在这之前：她跑长任务时主人说话**她听不见**——消息只走"回复"这条路
+        # （`_reply_in_game`），而那条路和她的自主循环是两套东西。
+        # 现在话会躺在队列里，等她到安全注入点（下次组装提示词）就会看到。
+        # **注意：这里不做"要不要回复"的判断**——入队是"让她知道"，
+        # 回不回复是另一回事（下面的 `_should_reply`）。
+        if self.life:
+            try:
+                self.life.note_owner_said(f"{sender} 说：{message}")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("主人的话入队失败：%s", exc)
 
         # 社交也是经历：记下来（她是"认识这个人"的）
         if self.memory:
@@ -1606,6 +1642,14 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if self.life and self.life.current:
             lines.append("")
             lines.append(f"她自己在做：{self.life.current.activity}")
+        # **队列里排着什么**（W4）：主人的话和世界事件都从这里进去。
+        # 看得见这个才知道"她为什么还没处理我说的话"。
+        if self.life:
+            try:
+                lines.append("")
+                lines.append(f"【待办队列】{self.life.inbox_summary()}")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("渲染队列摘要失败：%s", exc)
         # **用量台账**（W6）：一次决策到底花多少 token、缓存有没有生效。
         # 没有这行数据就没法谈"不烧 token"——提示词分层省了多少也看不出来。
         try:
