@@ -108,6 +108,9 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
   }
 
   // ---- 水平铺路：往她面朝的方向，逐格在"前方脚下那一层"放方块 ----
+  // **先打一条日志**（排查用）：上一轮实测失败时 `why` 是空的，
+  // 连"有没有进到这个分支"都不知道，只能靠读代码猜。
+  log.info(`铺路 forward：进入分支（count=${n}，item=${item || '自动'}）`);
   const blockName = pickPaveBlock(actions, item);
   if (!blockName) {
     return skillResult(false, {
@@ -118,6 +121,9 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
   }
   let done = 0;
   let skippedDanger = 0;
+  // **"往前走过去了"也算进展**（原来只数"垫了几块"，
+  // 于是"地面本来就是实的、她走过去了"会被算成"没进展"→ 报失败）
+  let walked = 0;
   /** **每一步为什么停**——失败信息必须说清断在哪，不能只有一句笼统的话 */
   const why = [];
   for (let i = 0; i < n; i += 1) {
@@ -130,6 +136,10 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
     const yaw = bot.entity.yaw || 0;
     const dx = Math.round(-Math.sin(yaw));
     const dz = Math.round(-Math.cos(yaw));
+    // **每一步都打日志**（排查用）：能直接看到"读到什么、往哪放、放了没"
+    log.info(
+      `铺路 forward 第 ${i + 1}/${n} 次：我在 (${bx}, ${by}, ${bz}) yaw=${yaw.toFixed(2)} → 方向 (${dx}, ${dz})`,
+    );
     if (dx === 0 && dz === 0) {
       why.push('朝向算不出方向（yaw 异常）');
       break;
@@ -145,6 +155,16 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
     // 真人搭桥也是这么做的：**往脚下的那一层垫**，然后走过去。
     const supportY = by - 1;
     const support = bot.blockAt(vec3(tx, supportY, tz));
+    const feetNow0 = bot.blockAt(vec3(tx, by, tz));
+    const headNow0 = bot.blockAt(vec3(tx, by + 1, tz));
+    // **把分支判断的输入全打出来**（排查用）：上一轮只知道"循环跑了 5 次、
+    // 5 毫秒就结束、why 是空的"，看不出走了哪条路。现在能直接看到
+    // support 是什么、脚/头是什么、于是走了哪个分支。
+    log.info(
+      `  目标 (${tx}, ${by}, ${tz})：support(${supportY})=${support ? `${support.name}/${support.boundingBox}` : 'null'}` +
+        ` feet=${feetNow0 ? `${feetNow0.name}/${feetNow0.boundingBox}` : 'null'}` +
+        ` head=${headNow0 ? `${headNow0.name}/${headNow0.boundingBox}` : 'null'}`,
+    );
     // **每一步都要能说清"断在哪"**（这一轮加的）。
     // 之前所有 `break` 共用一句"前面不是空的，或者放了没站上去"——
     // 实测排查时**根本看不出是哪一步断的**，只能靠猜。
@@ -158,26 +178,49 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       const feet = bot.blockAt(vec3(tx, by, tz));
       const head = bot.blockAt(vec3(tx, by + 1, tz));
       if (isAir(feet) && isAir(head)) {
+        // **走完必须验证"她真的挪了"** ——
+        // 这里踩过一个和 climbToSurface 里一模一样的坑：
+        // 目标格只有 1 格远，而 `range: 0.9` 会**判"已到达"、goTo 瞬间返回**，
+        // 于是循环空转 N 次、她一步没动，最后报"原因不明"。
+        // 实测日志：5 次迭代全在 5 毫秒内完成（说明根本没 await 到东西）。
+        const before = { x: bot.entity.position.x, z: bot.entity.position.z };
         try {
-          await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
-          continue;
+          await nav.goTo({ x: tx, y: by, z: tz, range: 0.5, signal: ctx.signal, timeoutMs: 6000 });
         } catch (err) {
           if (err && err.name === 'CancelledError') throw err;
           why.push(`支撑层已实心，但走不过去：${err.message.slice(0, 50)}`);
           break;
         }
+        const after = bot.entity.position;
+        const moved = Math.hypot(after.x - before.x, after.z - before.z);
+        if (moved < 0.4) {
+          why.push(
+            `支撑层已实心，但没能走过去（只挪了 ${moved.toFixed(2)} 格；` +
+              `目标 (${tx}, ${by}, ${tz})，可能被挡住或者寻路判"已到达"）`,
+          );
+          break;
+        }
+        walked += 1; // **走过去也算进展**（原来只数"垫了几块"，走过去不算 → 报"没进展"）
+        ctx.progress(`往前走了 ${walked} 格（地面本来就是实的）`);
+        continue;
       }
       // 脚下被实心占着（比如 1 格台阶）→ 试着跳上去
       const up = bot.blockAt(vec3(tx, by + 1, tz));
       if (isAir(up)) {
         try {
-          await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
-          continue;
+          await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.5, signal: ctx.signal, timeoutMs: 6000 });
         } catch (err) {
           if (err && err.name === 'CancelledError') throw err;
           why.push(`想跳上 1 格台阶但没上去：${err.message.slice(0, 50)}`);
           break;
         }
+        const np = bot.entity.position;
+        if (Math.floor(np.y) <= by) {
+          why.push(`想跳上 1 格台阶但没上去（还在 y=${by}）`);
+          break;
+        }
+        walked += 1;
+        continue;
       }
       why.push(
         `前方 (${tx}, ${by}, ${tz}) 被 ${feet && feet.name} 占着，上面 (${by + 1}) 也被 ${up && up.name} 占着——没有落脚点`,
@@ -216,8 +259,9 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       break;
     }
     // 站到刚铺的那块上（她仍然在 by 这一层，只是脚下有东西了）
+    const bp = { x: bot.entity.position.x, z: bot.entity.position.z };
     try {
-      await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 6000 });
+      await nav.goTo({ x: tx, y: by, z: tz, range: 0.5, signal: ctx.signal, timeoutMs: 6000 });
     } catch (err) {
       if (err && err.name === 'CancelledError') throw err;
       why.push(
@@ -225,8 +269,17 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       );
       break;
     }
+    // 同样验证"真的挪了"（goTo 可能判"已到达"就返回，见上面的说明）
+    const ap = bot.entity.position;
+    if (Math.hypot(ap.x - bp.x, ap.z - bp.z) < 0.4) {
+      why.push(
+        `铺好了但没能走过去（只挪了 ${Math.hypot(ap.x - bp.x, ap.z - bp.z).toFixed(2)} 格）`,
+      );
+      break;
+    }
   }
-  if (!done) {
+  // **只要"垫了"或者"走过去了"都算有进展**
+  if (!done && !walked) {
     return skillResult(false, {
       note: `没能铺路：${why.length ? why[why.length - 1] : '原因不明'}`,
       reason: why.length ? why[why.length - 1] : '铺路没有进展',
@@ -235,10 +288,10 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
   }
   return skillResult(true, {
     note:
-      `往前铺了 ${done} 格（用 ${blockName}）` +
-      (why.length ? `；走到第 ${done + 1} 格时停了：${why[why.length - 1]}` : ''),
+      (done ? `往前铺了 ${done} 格（用 ${blockName}）` : `往前走了 ${walked} 格（地面本来就是实的）`) +
+      (why.length ? `；再往前时停了：${why[why.length - 1]}` : ''),
     consumed: { [blockName]: done },
-    extra: { paved: done, direction: 'forward', item: blockName, why },
+    extra: { paved: done, walked, direction: 'forward', item: blockName, why },
   });
 }
 
