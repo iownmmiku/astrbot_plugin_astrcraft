@@ -21,11 +21,15 @@ import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent.parent
-sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(Path(r"D:\AstrBot\backend\app")))
+sys.path.insert(0, str(_HERE))
 
-from plugin import life as L  # noqa: E402
+import _paths  # noqa: E402
+
+# life.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_life_rhythm")
+
+_paths.load_plugin()
+from astrcraft_plugin import life as L  # noqa: E402
 
 passed = 0
 failed = 0

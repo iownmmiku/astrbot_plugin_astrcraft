@@ -8,13 +8,13 @@
   - 事件回调在真实数据下抛异常
   - terminate() 不能真正回收子进程（会导致 AstrBot 里残留僵尸进程）
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\test_integration.py
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/test_integration.py
 可选环境变量：
   MC_TEST_PORT=25566   连哪个服务器（默认不连，只测引擎通道）
   MC_TEST_CONNECT=1    是否真的进服
-  MC_ENGINE_DIR=...    指定引擎目录
+  MC_ENGINE_DIR=...    指定引擎目录（默认用仓库里的 engine/）
 """
 
 from __future__ import annotations
@@ -32,8 +32,13 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-ENGINE_DIR = Path(os.environ.get("MC_ENGINE_DIR", _REPO / "bot"))
+sys.path.insert(0, str(_HERE))
+
+import _paths  # noqa: E402
+from _paths import ENGINE_DIR as _DEFAULT_ENGINE_DIR  # noqa: E402
+
+# 引擎默认就在仓库里的 engine/（历史脚本写的是不存在的 <repo>/bot）。
+ENGINE_DIR = Path(os.environ.get("MC_ENGINE_DIR") or _DEFAULT_ENGINE_DIR)
 
 problems: list[str] = []
 def ok(msg):
@@ -101,12 +106,9 @@ async def main() -> int:
         return 2
 
     # 按 AstrBot 的方式导入插件
-    sys.path.insert(0, str(_REPO))
-    sys.path.insert(0, os.environ.get("ASTRBOT_APP", r"D:\AstrBot\backend\app"))
+    _paths.require_astrbot("test_integration")
     try:
-        import importlib
-
-        main_mod = importlib.import_module("plugin.main")
+        main_mod = _paths.plugin_module("main")
     except Exception:  # noqa: BLE001
         print("❌ 无法导入插件模块：")
         traceback.print_exc()

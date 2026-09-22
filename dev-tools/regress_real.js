@@ -35,7 +35,7 @@ const bad = (m, d = '') => {
   console.log(`  ❌ ${m}${d ? ` — ${d}` : ''}`);
 };
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
 });

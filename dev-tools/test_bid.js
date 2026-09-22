@@ -16,7 +16,7 @@
  */
 
 const path = require('path');
-const { TaskQueue, PRIORITY } = require(path.join(__dirname, '..', 'goals'));
+const { TaskQueue, PRIORITY } = require(path.join(__dirname, '..', 'engine', 'goals'));
 
 let pass = 0;
 let fail = 0;
@@ -33,7 +33,7 @@ const ok = (m, c, d = '') => {
 // 把 McEngine 原型上的三个方法借过来测（不构造整个引擎）
 const { McEngine } = (() => {
   // bot.js 是 CommonJS，导出的类名要看文件末尾
-  const m = require(path.join(__dirname, '..', 'bot.js'));
+  const m = require(path.join(__dirname, '..', 'engine', 'bot.js'));
   return m && m.McEngine ? { McEngine: m.McEngine } : { McEngine: null };
 })();
 
@@ -85,6 +85,12 @@ console.log('\n=== 出价 → 队列优先级（数值越小越优先）===');
 console.log('\n=== 抢占语义没写反（这是重点）===');
 (async () => {
   const e = makeEngine();
+  // **关掉防抖动**：这一节要测"抢占语义没写反"，
+  // 而 S4 的防抖动会**故意**拦下抢占（最小占用时间/冷却/次数上限）
+  // ——那是它的正确行为。要测抢占本身就得先关掉它。
+  e.queue.minOccupancyMs = 0;
+  e.queue.preemptCooldownMs = 0;
+  e.queue.maxPreemptsPerTask = 99;
   // 先提交一个"低出价的普通反射"（捡掉落物，出价 0）
   //
   // **假任务要理会取消信号**：抢占是"软取消"——被抢的任务从 await 点解开才让出。

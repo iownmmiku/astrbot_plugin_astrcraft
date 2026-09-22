@@ -10,7 +10,7 @@
  *      导致上一层悬空、21 块墙都放不上去——这种错必须在测试里拦住）
  */
 
-const { validateSpec, countMaterials, listPlacements, PRESETS } = require('../skills/blueprint');
+const { validateSpec, countMaterials, listPlacements, PRESETS } = require('../engine/skills/blueprint');
 
 let pass = 0;
 let fail = 0;

@@ -9,9 +9,9 @@
   - 工具结果以 role=tool 的消息喂回了上下文
   - 最终返回模型的话
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\test_game_agent.py
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/test_game_agent.py
 """
 
 from __future__ import annotations
@@ -27,8 +27,13 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
+
+import _paths  # noqa: E402
+
+# game_agent 依赖 astrbot（astrbot.core.provider.entities 等）。
+_paths.require_astrbot("test_game_agent")
+_paths.load_plugin()
 
 problems: list[str] = []
 passed = 0
@@ -147,7 +152,7 @@ class FakePlugin:
 async def main() -> int:
     print("=== 游戏内对话代理测试 ===\n")
 
-    from plugin.game_agent import GameChatAgent, GameEventShim
+    from astrcraft_plugin.game_agent import GameChatAgent, GameEventShim
 
     # ---------------------------------------------------------- 1. 工具调用循环
     print("[1] 玩家说「砍树」→ 模型决定调工具 → 工具被执行 → 回话")

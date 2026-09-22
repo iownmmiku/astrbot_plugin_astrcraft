@@ -20,9 +20,12 @@
 import sys
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.tokens import Usage, TokenLedger  # noqa: E402
+import _paths  # noqa: E402
+
+_paths.load_plugin()
+from astrcraft_plugin.tokens import Usage, TokenLedger  # noqa: E402
 
 passed = 0
 failed = 0
@@ -139,7 +142,7 @@ led_empty = TokenLedger()
 ok("没有记录时给人话", "还没有" in led_empty.describe(), led_empty.describe())
 
 print("\n=== 接入点确实存在（防止只写了模块没接上）===")
-root = pathlib.Path(__file__).resolve().parents[2] / "plugin"
+root = _paths.REPO
 aa = (root / "action_agent.py").read_text(encoding="utf-8")
 ga = (root / "game_agent.py").read_text(encoding="utf-8")
 mn = (root / "main.py").read_text(encoding="utf-8")

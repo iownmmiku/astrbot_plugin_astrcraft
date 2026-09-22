@@ -12,10 +12,11 @@
   E. 过日子循环：真的做出决策并提交技能
   F. 错误路径：未连接/缺材料等情况下如实报错，不假装成功
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\test_all_tools.py
-（需要本地测试服在 25566 端口运行：node tools/reset_world.js --full）
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  $env:ASTRBOT_DATA='<AstrBot>/data'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/test_all_tools.py
+（需要本地测试服在 25566 端口运行：node dev-tools/reset_world.js --full）
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import functools
 import inspect
 import io
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -34,11 +36,18 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
 
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
+import _paths  # noqa: E402
+
+# 全量验证要对着**已安装的**插件副本与**真实的** AstrBot 配置跑：
+# 位置因机器而异，所以只从环境变量读，**不写死任何人的家目录**。
+#   $env:ASTRBOT_DATA='<AstrBot>/data'
+_ASTRBOT_DATA = os.environ.get("ASTRBOT_DATA", "").strip()
+ASTRBOT_DATA = Path(_ASTRBOT_DATA).expanduser() if _ASTRBOT_DATA else None
+
+PLUGIN_DIR = ASTRBOT_DATA / "plugins" / "astrbot_plugin_astrcraft" if ASTRBOT_DATA else None
+CONFIG_PATH = ASTRBOT_DATA / "config" / "astrbot_plugin_astrcraft_config.json" if ASTRBOT_DATA else None
 
 TEST_PORT = 25566
 RCON_PORT = 25576
@@ -138,7 +147,33 @@ def collect_tools(plugin_cls) -> dict:
 
 
 async def main() -> int:
+    if ASTRBOT_DATA is None:
+        print(
+            "⏭  SKIP：全量验证要对着**已安装的**插件副本与**真实的** AstrBot 配置跑，"
+            "需要知道 AstrBot 的数据目录。\n"
+            "    环境变量 ASTRBOT_DATA 没设（脚本里不写死任何人的家目录），所以现在无从验证。\n"
+            "    设置后重试：\n"
+            "      $env:ASTRBOT_DATA='<AstrBot>/data'\n"
+            "    它会去读：\n"
+            "      <AstrBot>/data/config/astrbot_plugin_astrcraft_config.json\n"
+            "      <AstrBot>/data/plugins/astrbot_plugin_astrcraft"
+        )
+        sys.exit(0)
+
+    # 插件导入要 astrbot；AstrBot 源码目录只认环境变量 ASTRBOT_APP。
+    _paths.require_astrbot("test_all_tools")
+    _paths.load_plugin()
+
     print("=== 全量验证：真实服务器 + 每个工具真跑 ===\n")
+
+    if not CONFIG_PATH.exists():
+        print(f"❌ 配置文件不存在：{CONFIG_PATH}")
+        print("   （确认 ASTRBOT_DATA 指的是 AstrBot 的 data 目录）")
+        return 2
+    if not PLUGIN_DIR.exists():
+        print(f"❌ 已安装的插件目录不存在：{PLUGIN_DIR}")
+        print("   （先把插件装进 AstrBot，或确认 ASTRBOT_DATA 指的是 AstrBot 的 data 目录）")
+        return 2
 
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     cfg["server_port"] = TEST_PORT          # 用本地测试服，不动用户的服
@@ -151,7 +186,10 @@ async def main() -> int:
 
     mod = importlib.import_module(f"{PLUGIN_DIR.name}.main")
     from astrbot.core.provider.func_tool_manager import FunctionToolManager
-    from astrbot_plugin_astrcraft.game_agent import GameChatAgent, GameEventShim
+
+    # 已安装副本的目录名就是 AstrBot 里的插件名，别把它写死在这里
+    _game_agent = importlib.import_module(f"{PLUGIN_DIR.name}.game_agent")
+    GameChatAgent, GameEventShim = _game_agent.GameChatAgent, _game_agent.GameEventShim
 
     tools = collect_tools(mod.MinecraftPlugin)
     print(f"发现 {len(tools)} 个工具\n")

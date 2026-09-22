@@ -6,7 +6,7 @@ const path = require('path');
 
 class C {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'debug' },
     });

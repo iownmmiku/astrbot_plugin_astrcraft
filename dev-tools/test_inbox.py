@@ -22,9 +22,12 @@ import time
 import pathlib
 import tempfile
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.inbox import (  # noqa: E402
+import _paths  # noqa: E402
+
+_paths.load_plugin()
+from astrcraft_plugin.inbox import (  # noqa: E402
     BATCH_MIN,
     DEFAULT_CAP,
     MAX_AGE,

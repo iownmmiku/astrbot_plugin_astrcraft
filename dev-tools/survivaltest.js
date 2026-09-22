@@ -34,7 +34,7 @@ function check(name, ok, detail = '') {
 
 class Client {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
     });
@@ -151,7 +151,9 @@ async function main() {
   console.log(`服务器 ${argPort}，目标工具等级：${TIER}\n`);
 
   const c = new Client();
-  await c.call('connect', { host: '127.0.0.1', port: argPort, version: VERSION, username: 'AstrBotSurv' }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await c.call('connect', { host: '127.0.0.1', port: argPort, version: VERSION, username: 'AstrBotSurv', spawnProtectionRadius: 0 }, 60000);
   await sleep(5000);
 
   const st0 = await c.call('state.get', { detail: 'brief' });

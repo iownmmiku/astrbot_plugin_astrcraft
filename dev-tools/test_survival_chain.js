@@ -23,7 +23,7 @@ const PORT = 25566;
 
 class C {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
     });
@@ -118,7 +118,9 @@ async function waitTask(c, id, ms) {
   const USER = 'SurvBot' + Math.floor(Math.random() * 9000);
   console.log('=== 生存链验证（正常地形）===\n');
 
-  await c.call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await c.call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(5000);
 
   const st0 = await c.call('state.get', { detail: 'brief' });

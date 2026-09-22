@@ -9,9 +9,9 @@
 （记忆检索不出相关的、驱动力永远不动、人格读成空）。
 所以必须有测试把中间值断言下来，不能靠肉眼看。
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\test_life.py
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/test_life.py
 """
 
 from __future__ import annotations
@@ -29,8 +29,14 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
+
+import _paths  # noqa: E402
+
+# life.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_life")
+
+_paths.load_plugin()
 
 problems: list[str] = []
 passed = 0
@@ -94,10 +100,10 @@ class FakeContext:
 async def main() -> int:
     print("=== 人格 / 记忆 / 驱动力 / 过日子 模块测试 ===\n")
 
-    from plugin.persona import MinecraftPersona
-    from plugin.memory import MemoryStore
-    from plugin.drives import DriveSystem
-    from plugin.life import LifeLoop
+    from astrcraft_plugin.persona import MinecraftPersona
+    from astrcraft_plugin.memory import MemoryStore
+    from astrcraft_plugin.drives import DriveSystem
+    from astrcraft_plugin.life import LifeLoop
 
     tmp = Path(tempfile.mkdtemp(prefix="mc-life-test-"))
     print(f"临时数据目录：{tmp}\n")
@@ -257,7 +263,7 @@ async def main() -> int:
             bad(f"满足后动机没回落：{before} → {after}")
 
         # 人格偏置：懒猫应该更偏向"悠闲"
-        from plugin.drives import TRAIT_BIAS
+        from astrcraft_plugin.drives import TRAIT_BIAS
 
         drives2 = DriveSystem(tmp)
         drives2.apply_personality("你是一只很懒的猫，能躺着不坐着，讨厌干活")

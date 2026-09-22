@@ -18,9 +18,17 @@ import sys
 import time
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.life import HOLD_RELEASE, HOLD_WHY, Hold, LifeLoop  # noqa: E402
+import _paths  # noqa: E402
+
+# **需要 AstrBot 运行时**：`life.py` 在模块顶层就 `from astrbot.api import logger`，
+# 没有它连 import 都过不去。用 `require_astrbot` 而不是让它抛
+# `ModuleNotFoundError`——环境缺失要**大声说清缺什么**，而不是伪装成"测试失败"。
+_paths.require_astrbot("test_hold")
+
+_paths.load_plugin()
+from astrcraft_plugin.life import HOLD_RELEASE, HOLD_WHY, Hold, LifeLoop  # noqa: E402
 
 passed = 0
 failed = 0

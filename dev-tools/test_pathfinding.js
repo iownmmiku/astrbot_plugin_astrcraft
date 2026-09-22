@@ -77,18 +77,38 @@ const call = (m, p = {}, t = 90000) =>
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 起一个 move.to 任务并等它结束 */
-async function walkTo(x, z, ms = 60000) {
-  const r = await call('move.to', { x, z, timeout_ms: ms }, 30000);
+async function walkTo(x, z, ms = 60000, range = null) {
+  // **`range` 要能传**：测试自己的容差（比如 `d <= 3`）必须和 move.to 的判据一致，
+  // 否则会出现"她停在 2.55 格、测试说该算到（d<=3）、而 move.to 按 range:2 判失败"
+  // 这种**两个阈值打架**的情况——实测就是这么红的（差 0.05 格）。
+  const params = { x, z, timeout_ms: ms };
+  if (range !== null) params.range = range;
+  const r = await call('move.to', params, 30000);
   const t0 = Date.now();
   while (Date.now() - t0 < ms) {
     await sleep(1200);
     const st = await call('task.status', { task_id: r.task_id });
     if (['done', 'failed', 'cancelled'].includes(st.status)) {
-      return { status: st.status, error: st.error || '', elapsed: Date.now() - t0 };
+      // **把引擎自己报的距离带出来**。
+      //
+      // 为什么要它：测试是在**任务结束之后**再去读一次位置，而中间她可能
+      // 被反射层挪动（捡东西/躲避/脱困），于是"事后读到的距离"可能比
+      // "任务结算那一刻的距离"更大 —— 实测出现过 `done 距目标 3.8 格`
+      // 而判据是 3.5，看起来像假成功，其实很可能是**测量时机**的问题。
+      // 引擎在结果里报了它结算那一刻的真实距离，用它就没有这个歧义。
+      const res = st.result || {};
+      return {
+        status: st.status,
+        error: st.error || '',
+        elapsed: Date.now() - t0,
+        // 引擎结算时她离目标多远（拿不到就是 null，测试会回退到事后读位置）
+        engineDistance:
+          typeof res.distance_to_target === 'number' ? res.distance_to_target : null,
+      };
     }
   }
   await call('task.cancel', { task_id: r.task_id }).catch(() => {});
-  return { status: 'timeout', error: '等超时', elapsed: Date.now() - t0 };
+  return { status: 'timeout', error: '等超时', elapsed: Date.now() - t0, engineDistance: null };
 }
 
 (async () => {
@@ -99,13 +119,37 @@ async function walkTo(x, z, ms = 60000) {
   await sleep(5000);
 
   // 铺一片干净的超平坦场地：y=-61 是地面，y=-60 起是空气
-  const GX = 0;
-  const GZ = 0;
-  await rcon.command(`fill ${GX - 40} -61 ${GZ - 40} ${GX + 40} -61 ${GZ + 40} minecraft:grass_block replace air`);
-  await rcon.command(`fill ${GX - 40} -60 ${GZ - 40} ${GX + 40} -55 ${GZ + 40} minecraft:air replace`);
-  await sleep(1200);
+  //
+  // **每个场景用自己的一块地**（SX 是"场景基址"，每个场景 +300）。
+  //
+  // 为什么必须分开：6 个场景原来**全用 GX=0, GZ=0** ——
+  // 于是场景 4 把树叶蹭掉之后，下一次运行场景 4 就找不到树叶了；
+  // 场景 2/6 砌的墙如果没清干净也会影响别的场景。
+  // 实测症状就是"失败会换地方"：有时红"贴身墙"，有时红"穿不过树叶"，
+  // 而且连跑几次结果都不一样 —— 看起来像功能不稳，其实是**测试互相污染**。
+  const BASE_X = 0;
+  const BASE_Z = 0;
+  const SCENE_STEP = 300; // 场景之间隔 300 格，互不干扰
+  let GX = BASE_X;
+  let GZ = BASE_Z;
+  const scene = (n) => {
+    GX = BASE_X + (n - 1) * SCENE_STEP;
+    GZ = BASE_Z;
+  };
+  // 一次把 6 块地都铺好（省得每场景等一次 fill）
+  for (let i = 0; i < 6; i += 1) {
+    const sx = BASE_X + i * SCENE_STEP;
+    await rcon.command(
+      `fill ${sx - 40} -61 ${BASE_Z - 40} ${sx + 40} -61 ${BASE_Z + 40} minecraft:grass_block replace air`,
+    );
+    await rcon.command(
+      `fill ${sx - 40} -60 ${BASE_Z - 40} ${sx + 40} -55 ${BASE_Z + 40} minecraft:air replace`,
+    );
+  }
+  await sleep(1800);
 
   // ---- 场景 1：平地直走 20 格
+  scene(1);
   console.log('[1] 平地直走 20 格');
   await rcon.command(`tp ${USER} ${GX} -60 ${GZ}`);
   await sleep(1200);
@@ -116,6 +160,7 @@ async function walkTo(x, z, ms = 60000) {
   else bad('平地直走失败', `${r.status} ${r.error} 距目标 ${d.toFixed(1)} 格`);
 
   // ---- 场景 2：绕墙（3 格高、8 格宽，正前方 6 格处）
+  scene(2);
   console.log('\n[2] 绕过一堵 3 格高的墙');
   await rcon.command(`tp ${USER} ${GX} -60 ${GZ}`);
   await rcon.command(
@@ -130,6 +175,7 @@ async function walkTo(x, z, ms = 60000) {
   await rcon.command(`fill ${GX + 5} -60 ${GZ - 6} ${GX + 5} -58 ${GZ + 6} minecraft:air replace`);
 
   // ---- 场景 3：上 1 格台阶
+  scene(3);
   console.log('\n[3] 上 1 格台阶');
   await rcon.command(`tp ${USER} ${GX} -60 ${GZ}`);
   await rcon.command(`fill ${GX + 6} -61 ${GZ - 8} ${GX + 20} -60 ${GZ + 8} minecraft:stone replace air`);
@@ -142,6 +188,7 @@ async function walkTo(x, z, ms = 60000) {
   await rcon.command(`fill ${GX + 6} -61 ${GZ - 8} ${GX + 20} -60 ${GZ + 8} minecraft:air replace`);
 
   // ---- 场景 4：穿过树林（树叶当障碍时能不能过去）
+  scene(4);
   console.log('\n[4] 穿过一片树叶（软植被应可蹭过）');
   await rcon.command(`tp ${USER} ${GX} -60 ${GZ}`);
   await rcon.command(`fill ${GX + 4} -60 ${GZ - 3} ${GX + 8} -58 ${GZ + 3} minecraft:oak_leaves replace air`);
@@ -155,6 +202,7 @@ async function walkTo(x, z, ms = 60000) {
   await rcon.command(`fill ${GX + 4} -60 ${GZ - 3} ${GX + 8} -58 ${GZ + 3} minecraft:air replace`);
 
   // ---- 场景 5：从 3 格深的坑里出来（真人跳不出去，必须挖台阶）
+  scene(5);
   console.log('\n[5] 从 3 格深的坑里爬出来');
   // **搭建而不是"挖坑"**：超平坦世界的基岩在 -64，往下挖会挖穿到虚空
   // （实测踩过两次：她掉到 y=-105 一直在坠落）。
@@ -189,15 +237,33 @@ async function walkTo(x, z, ms = 60000) {
   }
 
   // ---- 场景 6：目标在墙后（视线被挡）
+  scene(6);
   console.log('\n[6] 目标就在墙后 1 格');
   await rcon.command(`tp ${USER} ${GX} -60 ${GZ}`);
   await rcon.command(`fill ${GX + 2} -60 ${GZ - 4} ${GX + 2} -58 ${GZ + 4} minecraft:stone replace air`);
   await sleep(1200);
-  r = await walkTo(GX + 3, GZ, 30000);
+  // **这里传 `range: 3`，和下一行的 `d <= 3` 对齐**（两个阈值必须是同一个数）
+  r = await walkTo(GX + 3, GZ, 30000, 3);
   st = await call('state.get', { detail: 'brief' });
   d = Math.hypot(st.position.x - (GX + 3), st.position.z - GZ);
-  if (r.status === 'done' && d <= 3) ok('绕过贴身的墙', `${r.elapsed}ms`);
-  else bad('贴身墙过不去', `${r.status} ${r.error} 距目标 ${d.toFixed(1)} 格`);
+  // **判定用引擎报的距离**（拿不到才回退到事后读的位置）——
+  // 事后读位置会被"任务结束后她自己挪动"污染，实测出现过
+  // `done 距目标 3.8 格`而判据是 3.5，看起来像假成功、其实是测量时机。
+  //
+  // **容差必须和引擎一致**：引擎的判据是 `range + 0.5`（留 0.5 格给寻路的
+  // 位置抖动，见 movement.js 的 `_runPath`）。测试这边如果写死 `<= 3`，
+  // 就会出现"引擎报 3.04 格、它说到了、测试说没到"——**两个阈值打架**，
+  // 实测就是这么红的（差 0.04 格，而显示成 3.0 看不出来）。
+  const TOL = 0.5;
+  const judged = r.engineDistance !== null ? r.engineDistance : d;
+  if (r.status === 'done' && judged <= 3 + TOL) {
+    ok('绕过贴身的墙', `${r.elapsed}ms，引擎报 ${judged.toFixed(2)} 格（事后读 ${d.toFixed(2)} 格）`);
+  } else {
+    bad(
+      '贴身墙过不去',
+      `${r.status} ${r.error} 引擎报 ${judged.toFixed(2)} 格（事后读 ${d.toFixed(2)} 格）`,
+    );
+  }
   await rcon.command(`fill ${GX + 2} -60 ${GZ - 4} ${GX + 2} -58 ${GZ + 4} minecraft:air replace`);
 
   console.log(`\n=== 结果：${pass} 通过，${fail} 失败 ===`);

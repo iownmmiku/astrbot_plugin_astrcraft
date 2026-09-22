@@ -83,17 +83,73 @@ const DEFAULTS = {
    * 设太大会出现"她在干活时你问不到状态、也喊不停她"。
    * 实测误设成 30000 时，长任务运行中 `ping` 要等 25~27 秒才返回
    * （ping 本身是纯同步函数，不可能是它自己慢）。
-   * 远距离寻路不靠加大这个值，而靠已有的分段寻路（_goToSegmented）兜底。
+   *
+   * **为什么是 1800 而不是 4000**（与 movement.js 里那段实测注释同源）：
+   * 真实服务器上量到过"事件循环被阻塞 9.3 秒"（86 次里 50 次超过 6 秒），
+   * 而且其中 70 次发生在**当时空闲**——触发者不是技能任务，而是空闲期反复
+   * 触发的自动捡东西/自动插火把这类反射。A* 是同步的，预算给多大就可能卡多久，
+   * 所以压到 1.8 秒；远距离走不通本来就由分段寻路（_goToSegmented）兜底。
+   *
+   * **这里是唯一权威值**：movement.js 直接读它，不要再写
+   * `Number(config.get('pathThinkTimeoutMs')) || 1800` 那种兜底——
+   * DEFAULTS 永远提供值，`||` 右边的数字**永远不可达**，
+   * 于是"改了 DEFAULTS 却以为兜底会生效"，就会出现
+   * "注释说 1800、实际跑 4000"的漂移（这次就是这么漏的）。
+   * 插件侧可用 path_think_timeout_ms 覆盖它。
    */
-  pathThinkTimeoutMs: 4000,
+  pathThinkTimeoutMs: 1800,
   /** 单个技能最长执行时间（毫秒） */
   skillTimeoutMs: 300000,
-  /** 允许挖掘的方块白名单；空数组 = 不限制。命中受保护方块时直接拒绝，不重试 */
-  digWhitelist: [],
+  /**
+   * 允许挖掘的方块白名单；空数组 = 不限制。命中受保护方块时直接拒绝，不重试。
+   *
+   * **这份默认值必须覆盖内置技能真正会挖的方块**，否则默认配置下技能必然失败：
+   *   - mining.js 的 ORES 表（coal/iron/copper/gold/redstone/lapis/diamond/emerald/
+   *     quartz/ancient_debris 及其 deepslate 变体）
+   *   - mining.js 的 STONE_BLOCKS / STONE_VARIANTS（含 tuff）
+   *   - wood.js 的 LOG_NAMES（含 mangrove/cherry/pale_oak 与下界菌柄）
+   * 早期这里漏掉了**全部矿石**，于是"挖铁矿"在默认配置下 100% 被
+   * actions.js 的 _assertNotProtected 拒绝，而报错又被技能层吞成
+   * "附近没有找到iron"——模型完全看不出真正的原因。
+   *
+   * **这一份必须与 _conf_schema.json 的 dig_whitelist 默认值逐项一致**
+   * （由 dev-tools/test_config_parity.py 守住）。
+   */
+  digWhitelist: [
+    // 石头类（含石制工具的三种材料）
+    'stone', 'cobblestone', 'deepslate', 'cobbled_deepslate',
+    // 其它石质建材（mine_stone 第二阶段的 STONE_VARIANTS）
+    'andesite', 'diorite', 'granite', 'tuff',
+    // 软方块
+    'dirt', 'grass_block', 'sand', 'gravel', 'clay',
+    // 原木（wood.js 的 LOG_NAMES：主世界 6 种 + 新树种 3 种 + 下界菌柄 2 种）
+    'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
+    'mangrove_log', 'cherry_log', 'pale_oak_log', 'crimson_stem', 'warped_stem',
+    // 树叶（gathering 的 collect apple 会挖橡木/深色橡木树叶）
+    'oak_leaves', 'spruce_leaves', 'birch_leaves', 'dark_oak_leaves',
+    'netherrack',
+    // 矿石（mining.js 的 ORES 表；漏掉它们 = 默认配置下挖矿必然失败）
+    'coal_ore', 'deepslate_coal_ore',
+    'iron_ore', 'deepslate_iron_ore',
+    'copper_ore', 'deepslate_copper_ore',
+    'gold_ore', 'deepslate_gold_ore', 'nether_gold_ore',
+    'redstone_ore', 'deepslate_redstone_ore',
+    'lapis_ore', 'deepslate_lapis_ore',
+    'diamond_ore', 'deepslate_diamond_ore',
+    'emerald_ore', 'deepslate_emerald_ore',
+    'nether_quartz_ore',
+    'ancient_debris',
+  ],
   /** 禁止挖掘的方块（领地/主城保护场景） */
   digBlacklist: ['bedrock', 'barrier', 'command_block', 'chain_command_block', 'repeating_command_block'],
-  /** 出生点保护半径内不进行破坏性动作 */
-  spawnProtectionRadius: 0,
+  /**
+   * 出生点保护半径内不进行破坏性动作。
+   *
+   * **必须与 _conf_schema.json 的 spawn_protection_radius 一致（16）**：
+   * 早期引擎侧是 0、插件侧是 16，于是"单独跑引擎调试"和"通过插件跑"
+   * 的保护行为完全不同——同一份配置在两条路径下语义不一致。
+   */
+  spawnProtectionRadius: 16,
   /** 允许自动穿戴护甲 */
   autoEquipArmor: true,
   /** 附近有多少敌对实体时触发撤退 */

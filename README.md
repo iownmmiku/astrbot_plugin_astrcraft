@@ -156,7 +156,7 @@ Minecraft 服务器
   action_agent.py    ReAct：让模型用工具直接驱动它
   knowledge.py       知识库：攻略 + 它自己的教训 + 世界笔记
   advisor.py         生存顾问：按阶段给建议（缺什么、下一步做什么）
-  llm_tools_*.py     50+ 个 LLM 工具
+  llm_tools_*.py     62 个 LLM 工具（core 感知/移动 · skills 技能/目标 · life 人格/记忆）
   skills_docs/       攻略（Markdown，模型按需读）
 
 engine/              Node 引擎（mineflayer）

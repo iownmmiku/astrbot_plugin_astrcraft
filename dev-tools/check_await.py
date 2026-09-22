@@ -6,7 +6,7 @@
 工具注册、签名检查、加载测试全都发现不了——实测它让全部 10 个技能工具瘫痪，
 而且被更早的另一个错误掩盖了很久。
 
-用法：python bot/tools/check_await.py
+用法：python dev-tools/check_await.py
 """
 
 from __future__ import annotations
@@ -19,7 +19,11 @@ from pathlib import Path
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-PLUGIN = Path(r"D:\工作台\mc-astrbot\plugin")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _paths import REPO  # noqa: E402
+
+# 仓库根**就是**插件本体（main.py / life.py / llm_tools_*.py 都在这里）。
+PLUGIN = REPO
 
 problems: list[str] = []
 

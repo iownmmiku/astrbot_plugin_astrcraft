@@ -30,7 +30,7 @@ const bad = (m, d = '') => {
   console.log(`  ❌ ${m}${d ? ` — ${d}` : ''}`);
 };
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'warn' },
 });
@@ -134,7 +134,7 @@ async function turnAndSample(targetYawDeg) {
 
   // ---- 3. 单元测试：步态与角度环绕（直接 require，不走 RPC）
   console.log('\n[3] 步态随机性（同一距离不该总是同一个决策）');
-  const { Gait, WalkGaze, shortestAngle } = require('../humanize');
+  const { Gait, WalkGaze, shortestAngle } = require('../engine/humanize');
   const gait = new Gait();
   const far = new Set();
   for (let i = 0; i < 300; i += 1) far.add(gait.shouldSprint(20));

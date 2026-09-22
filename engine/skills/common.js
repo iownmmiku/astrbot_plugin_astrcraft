@@ -121,6 +121,16 @@ async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label =
       fails += 1;
       lastError = describeFailure(err);
       log.debug(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
+      // **受保护方块：记下原因立刻停，不要重试。**
+      //
+      // 白名单/黑名单/出生点保护是**配置层面的拒绝**——同一个方块再挖 40 次
+      // 结果完全一样，重试只是白烧时间，而且会把这条关键信息淹没在
+      // "连续多次没有进展"里。直接 break，让 lastError（也就是技能的 reason）
+      // 就是那句「挖掘白名单拦截」，模型才知道该改配置而不是换个地方找。
+      if (err && err.name === 'ProtectedBlockError') {
+        log.warn(`${label} 被保护规则拦下，不再重试：${err.message}`);
+        break;
+      }
       // **带调用栈，而且要用 warn 级别**。
       //
       // 这类"某个变量是 null"的报错只看消息定位不了是哪一行

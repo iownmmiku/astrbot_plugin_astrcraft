@@ -807,6 +807,10 @@ async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want,
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
+        // **受保护方块必须往上抛**（与 mining.js 同一个理由）：
+        // 白/黑名单与出生点保护是配置层面的拒绝，换个地方再挖 40 次也一样，
+        // 吞掉它只会让技能报"附近没有找到足够的X"，把真正原因藏起来。
+        if (err && err.name === 'ProtectedBlockError') throw err;
         log.debug(`挖 ${found.name} 失败：${err.message}`);
         // 够不到（典型情况：目标被埋在泥土/岩石下面，寻路走不过去）
         // → 朝目标挖一格，下一轮往往就能挖到了。这也是真玩家的做法。

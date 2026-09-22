@@ -15,9 +15,15 @@ user 消息开始），所以等价物是**写进"最近做过的事"**，让下
 import sys
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.life import LifeLoop  # noqa: E402
+import _paths  # noqa: E402
+
+# life.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_agent_trace")
+
+_paths.load_plugin()
+from astrcraft_plugin.life import LifeLoop  # noqa: E402
 
 passed = 0
 failed = 0
@@ -102,7 +108,7 @@ lp = make_loop()
 ok("默认最多重试 2 次", lp._decide_retry_limit == 2, f"limit={lp._decide_retry_limit}")
 
 print("\n=== 源码里确实接上了（防止只改了注释）===")
-src = (pathlib.Path(__file__).resolve().parents[2] / "plugin" / "life.py").read_text(encoding="utf-8")
+src = (_paths.REPO / "life.py").read_text(encoding="utf-8")
 ok("两条决策路径都调了 note_decision_cut", src.count("self.note_decision_cut(") >= 3,
    f"出现 {src.count('self.note_decision_cut(')} 次（含定义处 0 次）")
 ok("超时到上限会进停牌", "self.note_blocked(" in src and "_decide_retry_limit" in src)

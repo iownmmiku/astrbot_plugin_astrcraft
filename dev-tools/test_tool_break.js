@@ -18,7 +18,7 @@
  */
 
 const path = require('path');
-const { McEngine } = require(path.join(__dirname, '..', 'bot.js'));
+const { McEngine } = require(path.join(__dirname, '..', 'engine', 'bot.js'));
 
 let pass = 0;
 let fail = 0;
@@ -134,7 +134,7 @@ console.log('\n=== 没有 bot 时不炸 ===');
 console.log('\n=== 反射层确实调了它（源码断言）===');
 {
   const fs = require('fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'engine', 'bot.js'), 'utf8');
   ok('反射层里调了 _toolBreakTick', /this\._toolBreakTick\(\)/.test(src));
   ok(
     '注释里写明了 mineflayer 没有 itemBreak（免得以后有人又去猜）',

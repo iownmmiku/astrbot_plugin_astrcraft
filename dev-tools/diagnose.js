@@ -7,7 +7,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'debug' },
 });
@@ -76,7 +76,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   console.log('=== 诊断：地形与寻路 ===\n');
-  await call('connect', { host: '127.0.0.1', port: 25565, version: '1.20.1', username: 'AstrBotDiag' }, 45000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await call('connect', { host: '127.0.0.1', port: 25565, version: '1.20.1', username: 'AstrBotDiag', spawnProtectionRadius: 0 }, 45000);
   console.log('已进服，等 6 秒让区块加载...');
   await sleep(6000);
 

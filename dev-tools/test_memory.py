@@ -15,9 +15,15 @@ import time
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from plugin.memory import MemoryEntry, MemoryStore, normalize_text  # noqa: E402
+import _paths  # noqa: E402
+
+# memory.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_memory")
+
+_paths.load_plugin()
+from astrcraft_plugin.memory import MemoryEntry, MemoryStore, normalize_text  # noqa: E402
 
 passed = 0
 failed = 0

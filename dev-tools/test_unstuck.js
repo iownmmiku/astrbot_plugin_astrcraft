@@ -28,7 +28,7 @@ const bad = (m, d = '') => {
   console.log(`  ❌ ${m}${d ? ` — ${d}` : ''}`);
 };
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
 });
@@ -81,7 +81,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 (async () => {
   const rcon = Rcon.fromDir('.testserver', 25576);
   console.log('=== 被方块卡住的自救验证 ===\n');
-  await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  // 本用例是故意挖机器人脚下的方块，几乎必然落在出生点保护范围内。
+  await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(5000);
   await call('config.update', { autoUnstuck: true, autoCollectDrops: false, autoTorch: false });
 

@@ -1,4 +1,4 @@
-const { StationMemory } = require('../stations');
+const { StationMemory } = require('../engine/stations');
 const fs = require('fs'); const path = require('path'); const os = require('os');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-'));
 const f = path.join(dir, 'stations.json');

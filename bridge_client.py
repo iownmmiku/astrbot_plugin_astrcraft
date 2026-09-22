@@ -162,6 +162,18 @@ class EngineClient:
             if self.running:
                 return self._engine_info
 
+            # **派生新进程前先清掉上一份就绪信息**（P3）。
+            #
+            # `_wait_ready()` 只要 `_engine_info` 非空就**立刻返回**。如果不清，
+            # 上一轮崩溃的引擎留下的那份会被当成本次的就绪结果——于是 start()
+            # 会报"引擎就绪：vX，N 个技能"，而 pid / 技能数全是**旧进程**的，
+            # 新进程的 `engine.ready` 还没到。与"假死重启"（P2）叠加时尤其误导：
+            # 看起来重启成功了，实际新进程可能根本没起来。
+            #
+            # 放在这里而不是只放在 stop() 里，是因为**异常退出不会走 stop()**
+            # （进程被外部杀掉、OOM 等），那条路径上 `_engine_info` 会一直留着。
+            self._engine_info = {}
+
             entry = self._cfg.engine_dir / "index.js"
             if not entry.exists():
                 raise EngineUnavailable(f"引擎入口不存在：{entry}（检查插件配置里的 engine_dir）")
@@ -222,6 +234,10 @@ class EngineClient:
     async def stop(self, *, kill_after: float = 3.0) -> None:
         """优雅关闭：关 stdin 让引擎自己退出，超时再 kill。"""
         self._closing = True
+        # **清掉就绪信息**（P3）：`_wait_ready()` 以"`_engine_info` 非空"作为
+        # "引擎已就绪"的唯一判据。进程都停了还留着它，下一次 start() 就会
+        # 立刻拿旧数据报"就绪"——pid / 技能数全是上一个进程的。
+        self._engine_info = {}
         proc = self._proc
         self._proc = None
         for task in (self._reader_task, self._stderr_task):

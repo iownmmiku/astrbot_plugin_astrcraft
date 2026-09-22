@@ -22,9 +22,15 @@ import sys
 import time
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.life import Hold, LifeLoop  # noqa: E402
+import _paths  # noqa: E402
+
+# life.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_never_idle")
+
+_paths.load_plugin()
+from astrcraft_plugin.life import Hold, LifeLoop  # noqa: E402
 
 passed = 0
 failed = 0
@@ -75,7 +81,7 @@ def make_loop():
 
 
 print("=== 一刀切间隔已经拆掉 ===")
-src = (pathlib.Path(__file__).resolve().parents[2] / "plugin" / "life.py").read_text(encoding="utf-8")
+src = (_paths.REPO / "life.py").read_text(encoding="utf-8")
 ok(
     "主循环里不再有 min_decide_gap 的等待",
     "gap = self._min_decide_gap" not in src,

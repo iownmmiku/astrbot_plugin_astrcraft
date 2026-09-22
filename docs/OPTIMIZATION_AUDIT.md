@@ -15,9 +15,9 @@
 | ACTION_PROMPT | 2,223 字符 | ✅ 是（理论上缓存命中）|
 | 用户提示 | 8 段（运行期拼） | ✅ 是 |
 | MAX_STEPS | **6** | → 一次决策最多 6 次往返 |
-| 技能数 | 20 | — |
+| 技能数 | 20（注册 `craft` 后为 21） | — |
 
-**量法**：`bot/tools/audit_latency.py`（离线，不需要引擎）
+**量法**：`dev-tools/audit_latency.py`（离线，不需要引擎）
 
 ---
 

@@ -4,10 +4,15 @@
 
 ```
 AstrBot（Python 插件）  ──NDJSON/JSON-RPC──▶  Node 引擎子进程  ──▶  Minecraft 服务器
-   plugin/                                      bot/                  Paper / Vanilla
+   仓库根目录（*.py）                            engine/              Paper / Vanilla
 ```
 
 两半都必须装好：Python 侧是 AstrBot 插件，Node 侧是游戏引擎。
+
+> **目录说明**：仓库根目录**就是**插件本体（`main.py` / `life.py` / `advisor.py` /
+> `llm_tools_*.py` / `_conf_schema.json` / `metadata.yaml` / `skills_docs/`），
+> 引擎在 `engine/`，开发工具与测试在 `dev-tools/`。
+> 早期文档写的 `plugin/` 与 `bot/` 两个子目录**从来就不存在**，照着做会直接装不上。
 
 ---
 
@@ -25,14 +30,14 @@ AstrBot（Python 插件）  ──NDJSON/JSON-RPC──▶  Node 引擎子进程
 ## 2. 安装 Node 引擎
 
 ```powershell
-cd <项目目录>\bot
+cd <项目目录>\engine
 
 # 关键：npm 的默认缓存目录可能被系统策略拒绝写入，
 # 这时必须把缓存指到一个你有权限的目录（下面用项目内的 _npm_cache）
 npm install --cache "..\_npm_cache" --no-audit --no-fund
 ```
 
-装完确认这三个包在 `bot\node_modules` 下：
+装完确认这三个包在 `engine\node_modules` 下：
 
 ```
 mineflayer@4.39.0
@@ -43,7 +48,7 @@ mineflayer-pathfinder@2.4.5
 **验证引擎能独立启动**（不依赖 AstrBot）：
 
 ```powershell
-node tools/smoke.js
+node dev-tools\smoke.js
 ```
 
 应该看到 `通过 N 项，失败 0 项`。如果这里就失败，先解决引擎问题，不要往下走。
@@ -52,32 +57,34 @@ node tools/smoke.js
 
 ## 3. 安装 AstrBot 插件
 
-把 `plugin` 目录里的文件复制到 AstrBot 插件目录下的一个新文件夹里：
+把仓库根目录里的文件复制到 AstrBot 插件目录下的一个新文件夹里：
 
 ```powershell
 $dst = "$env:USERPROFILE\.astrbot\data\plugins\astrbot_plugin_astrcraft"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-Copy-Item plugin\*.py, plugin\_conf_schema.json, plugin\metadata.yaml $dst -Force
+Copy-Item *.py, _conf_schema.json, metadata.yaml $dst -Force
+Copy-Item skills_docs $dst -Recurse -Force
 ```
 
 然后在 AstrBot WebUI → 插件管理 → 找到「Minecraft 机器人（真实客户端）」→ 启用。
 
-> **为什么叫 `astrbot_plugin_astrcraft` 而不是 `astrbot_plugin_astrcraft`**：
+> **为什么叫 `astrbot_plugin_astrcraft` 而不是别的名字**：
 > AstrBot 用**目录名**生成插件配置文件名（`<目录名>_config.json`）与数据目录。
-> 如果你机器上还留着早期那版纯 Python 协议插件（目录名 `astrbot_plugin_astrcraft`
-> 或 `astrbot-plugin-minecraft`，特征是含有 `bot_client.py`），两者同名会**互相覆盖配置**。
-> 用一个新名字可以让新旧两版干净共存——旧的那版留着不用即可。
+> 如果你机器上还留着早期那版纯 Python 协议插件（特征是含有 `bot_client.py`），
+> 两者同名会**互相覆盖配置**。用一个新名字可以让新旧两版干净共存——旧的那版留着不用即可。
 
 ### 如果插件不在项目目录内
 
-`plugin/main.py` 按下面的顺序找引擎目录：
+`main.py` 按下面的顺序找引擎目录：
 
 1. 配置里的 `engine_dir`（绝对路径）
-2. 插件目录下的 `engine/`（把引擎打包进插件时用）
-3. 插件目录的同级 / 上一级 / 上两级下的 `bot/`（开发时的仓库布局）
+2. 插件目录下的 `engine/` —— **开发时的仓库布局走的就是这一条**
+   （仓库根目录就是插件目录，所以 `<repo>/engine` 直接命中）
+3. 旧布局兜底：插件目录的**同级 / 上一级 / 上两级 / 自身**下的 `bot/`
+   （历史遗留，只有在你还保留着早期 `bot/` 目录时才会命中）
 
 所以最简单可靠的做法是：**在插件配置里把 `engine_dir` 填成引擎目录的绝对路径**，
-例如 `D:\工作台\mc-astrbot\bot`。这样无论插件被复制到哪里都能找到引擎。
+例如 `D:\工作台\Astrcraft\engine`。这样无论插件被复制到哪里都能找到引擎。
 
 ---
 
@@ -113,8 +120,8 @@ AstrBot WebUI → 插件管理 → Minecraft 机器人 → 配置。
 
 按顺序做，每步都要真的通过再往下：
 
-1. `node tools/smoke.js` → 通道与错误处理全绿
-2. `node tools/smoke.js --connect`（需要服务器在跑）→ 进服、寻路、挖掘全绿
+1. `node dev-tools\smoke.js` → 通道与错误处理全绿
+2. `node dev-tools\smoke.js --connect`（需要服务器在跑）→ 进服、寻路、挖掘全绿
 3. AstrBot 里 `/mc状态` → 显示"引擎：运行中"与"游戏：已连接"
 4. AstrBot 里 `/mc订阅`，然后游戏里说句话 → QQ/TG 收到转发
 5. AstrBot 里让 LLM 调用 `mc_status` → 返回真实位置与背包
@@ -146,11 +153,11 @@ AstrBot WebUI → 插件管理 → Minecraft 机器人 → 配置。
 
 离线账号只能进 `online-mode=false` 的服务器。要进正版服需要：
 
-1. `bot` 目录里额外安装认证库：
+1. `engine` 目录里额外安装认证库：
    ```powershell
    npm install prismarine-auth --cache "..\_npm_cache"
    ```
-2. 在 `bot/config/bot.config.json` 里加：
+2. 在 `engine/config/bot.config.json` 里加：
    ```json
    {
      "auth": "microsoft",
@@ -160,6 +167,6 @@ AstrBot WebUI → 插件管理 → Minecraft 机器人 → 配置。
    ```
 3. 插件配置里 `auth_method` 改成 `microsoft`。
 4. 首次启动时终端会要求访问一个设备码登录链接，登录一次即可，凭据会缓存在
-   `bot/config/auth-cache`。**该目录含登录凭据，不要提交到版本库。**
+   `engine/config/auth-cache`。**该目录含登录凭据，不要提交到版本库。**
 
 > 注意：这条路径没有在本次交付里做过端到端验证，属于"按官方文档配置可用"的状态。

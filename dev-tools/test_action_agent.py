@@ -18,9 +18,14 @@ import asyncio
 import re
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.action_agent import ActionAgent, MAX_STEPS  # noqa: E402
+import _paths  # noqa: E402
+
+# action_agent 依赖 astrbot（astrbot.core.agent.*）。
+_paths.require_astrbot("test_action_agent")
+_paths.load_plugin()
+from astrcraft_plugin.action_agent import ActionAgent, MAX_STEPS  # noqa: E402
 
 passed = 0
 failed = 0
@@ -132,7 +137,7 @@ print("\n=== 提示词里的步数必须和 MAX_STEPS 一致 ===")
 # 踩过：上一轮把 MAX_STEPS 从 4 调到 6，但提示词里还写着"你只有 4 步""最多 4 步"
 # ——模型按 4 步给自己压预算，**正好抵消那次修复**，而且没人发现。
 # 现在提示词从 MAX_STEPS 插值，这个断言负责在它再次漂移时立刻炸。
-from plugin.action_agent import ACTION_PROMPT, _STEPS_TOKEN  # noqa: E402
+from astrcraft_plugin.action_agent import ACTION_PROMPT, _STEPS_TOKEN  # noqa: E402
 
 ok("提示词里没有残留占位符", _STEPS_TOKEN not in ACTION_PROMPT, _STEPS_TOKEN)
 _step_nums = re.findall(r"(\d+)\s*步", ACTION_PROMPT)
@@ -146,7 +151,7 @@ ok(
 )
 
 print("\n=== 判据必须匹配中文「任务号」 ===")
-src = pathlib.Path(__file__).resolve().parents[2] / "plugin" / "action_agent.py"
+src = _paths.REPO / "action_agent.py"
 t = src.read_text(encoding="utf-8")
 ok(
     "提前结束的判据里含中文「任务号」",
@@ -160,7 +165,7 @@ ok(
 
 print("\n=== 提示词里引用的工具必须真实存在 ===")
 names = set()
-for p in (pathlib.Path(__file__).resolve().parents[2] / "plugin").glob("llm_tools_*.py"):
+for p in _paths.REPO.glob("llm_tools_*.py"):
     names |= set(re.findall(r'@filter\.llm_tool\(name="(mc_[a-z_]+)"', p.read_text(encoding="utf-8")))
 # EXCLUDED_TOOLS 是**故意**不暴露给 agent 的管理类工具（改配置/重启/暂停人生…），
 # 它们出现在文件里是正确的，不算"幻影工具"。

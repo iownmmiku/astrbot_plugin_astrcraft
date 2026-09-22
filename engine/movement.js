@@ -146,7 +146,8 @@ function setupPathfinder(bot, config) {
     // 现在：搜索预算压到几秒（事件循环最多被占这么久），
     // 而"允许走多久"仍由 pathTimeoutMs 控制（见 goTo 里的整体超时），
     // 远距离靠已有的分段寻路兜底（_goToSegmented）。
-    // 搜索预算 4000 → **1800 毫秒**。
+    // 搜索预算 4000 → **1800 毫秒**（权威值在 config.js 的
+    // DEFAULTS.pathThinkTimeoutMs；插件侧可用 path_think_timeout_ms 覆盖）。
     //
     // 实测真实服务器上出现过"事件循环被阻塞 9.3 秒"（86 次里 50 次超过 6 秒），
     // 而且 **70 次发生在"当时空闲"**——说明触发者不是技能任务，而是空闲期的
@@ -154,7 +155,12 @@ function setupPathfinder(bot, config) {
     // A* 是同步的，预算给多大就可能卡多久，所以这里压到 1.8 秒：
     // 远距离走不通会由分段寻路兜底（本来就是为这个场景写的），
     // 但引擎始终能响应 RPC——这比"一次算完一条长路"重要得多。
-    bot.pathfinder.thinkTimeout = Number(config.get('pathThinkTimeoutMs')) || 1800;
+    //
+    // **不要再写 `|| 1800` 这类兜底**：DEFAULTS 永远提供值，`||` 右边永远不可达，
+    // 结果就是"注释说 1800、实际跑 4000"——这次修复的第一版就是这么失效的。
+    // 只在配置项确实缺失/非法时才兜底，所以这里显式判有限正数。
+    const thinkTimeout = Number(config.get('pathThinkTimeoutMs'));
+    bot.pathfinder.thinkTimeout = Number.isFinite(thinkTimeout) && thinkTimeout > 0 ? thinkTimeout : 1800;
     if ('tickTimeout' in bot.pathfinder) bot.pathfinder.tickTimeout = 20;
     // 搜索半径 48 → 32：A* 的开销随半径超线性增长，32 格已经够覆盖
     // "看得见的附近目标"，更远的交给分段推进。
@@ -543,7 +549,7 @@ class Navigator {
   }
 
   /** 统一的寻路执行 + 监听清理 + 卡住检测 */
-  async _runPath(goal, { x, y, z, timeout, signal, t0, onTick }) {
+  async _runPath(goal, { x, y, z, range = ARRIVE_RADIUS, timeout, signal, t0, onTick }) {
     const bot = this._bot;
     const pathfinder = bot.pathfinder;
 
@@ -710,8 +716,20 @@ class Navigator {
 
     const pos = this._bot.entity.position;
     const remain = distanceXZ(pos, { x, z });
+    // **`arrived` 必须按调用方要的 `range` 判，不能硬编码**（B 批次查出来的）。
+    //
+    // 原来这里写的是 `arrived: remain <= 2.5` —— 而两个调用方都在 options 里
+    // **传了 `range`**（`_runPath(goal, { ..., range, ... })`），签名却没接收它 ✗
+    // 后果：调用方要 `range: 1`、寻路在 2.4 格处放弃，这里却报 `arrived: true` ✗
+    // 上层据此认为"到了"，于是出现**假成功**——
+    // 实测 `test_pathfinding` 的"绕过贴身的墙"就是这样：任务报 `done`，
+    // 而人还在离目标 3.5~4.7 格的地方。
+    // 假成功比假失败更糟：模型会以为做到了，不会重试，也不会换办法。
+    //
+    // 留 0.5 格容差（寻路停下来的位置本来就有零点几格的抖动）。
+    const tolerance = Number(range) + 0.5;
     return {
-      arrived: remain <= 2.5,
+      arrived: remain <= tolerance,
       final_position: { x: Number(pos.x.toFixed(1)), y: Number(pos.y.toFixed(1)), z: Number(pos.z.toFixed(1)) },
       distance_to_target: Number(remain.toFixed(2)),
       elapsed_ms: Date.now() - t0,

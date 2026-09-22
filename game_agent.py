@@ -277,9 +277,9 @@ class GameChatAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("记录用量失败（不影响主流程）：%s", exc)
 
-            tool_names = getattr(resp, "tools_call_name", None) or []
-            tool_args = getattr(resp, "tools_call_args", None) or []
-            tool_ids = getattr(resp, "tools_call_ids", None) or []
+            tool_names = list(getattr(resp, "tools_call_name", None) or [])
+            tool_args = list(getattr(resp, "tools_call_args", None) or [])
+            tool_ids = list(getattr(resp, "tools_call_ids", None) or [])
 
             if not tool_names:
                 # 没有工具调用 → 这就是最终回复
@@ -311,12 +311,24 @@ class GameChatAgent:
                 )
             )
 
-            for name, args, call_id in zip(tool_names, tool_args, tool_ids):
+            # **按下标取参数，不要用 zip**。
+            #
+            # 早期这里是 `for name, args, call_id in zip(tool_names, tool_args, tool_ids)`。
+            # zip 的语义是"取最短"：只要三个列表长度不一致（provider 不返回
+            # tool_call id、或 args 缺失时只回了 name），它就会**静默产出 0 次迭代**——
+            # 玩家在游戏里让她做的事**全部被丢弃**，她只回话不动手。
+            # 这恰恰是这个模块当初要修的病（"她只会说'好的'然后站着不动"）。
+            #
+            # action_agent.py 与 perception_agent.py 都用下标访问 + call_id 兜底，
+            # 只有这里漏了。三处现在写法一致。
+            for idx, name in enumerate(tool_names):
+                args = tool_args[idx] if idx < len(tool_args) else {}
                 if not isinstance(args, dict):
                     try:
                         args = json.loads(args or "{}")
                     except Exception:  # noqa: BLE001
                         args = {}
+                call_id = tool_ids[idx] if idx < len(tool_ids) else f"call_{idx}"
                 logger.info("游戏内 %s 的请求 → 调用工具 %s(%s)", sender, name, json.dumps(args, ensure_ascii=False))
                 result_text = await self._execute_tool(name, args, event)
                 executed.append(name)

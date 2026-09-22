@@ -5,64 +5,82 @@
 ## 目录结构
 
 ```
-mc-astrbot/
-├─ bot/                        Node 引擎（真实游戏客户端）
-│  ├─ index.js                 RPC 服务端：所有能力的入口，方法表在这里
-│  ├─ bot.js                   mineflayer 实例装配、事件桥、反射层、重连
-│  ├─ rpc.js                   NDJSON/JSON-RPC 实现 + 错误类型定义
-│  ├─ config.js                配置与默认值、敌对生物判定
-│  ├─ util.js                  日志、坐标、错误翻译、超时工具
-│  ├─ log.js                   日志（强制走 stderr，日志脱敏）
-│  ├─ state.js                 状态快照、差分事件、简 reporting、方块扫描
-│  ├─ movement.js              pathfinder 封装：goTo / follow / 卡住检测
-│  ├─ actions.js               原子动作：dig / place / craft / smelt / eat / attack / 容器
-│  ├─ goals.js                 引擎侧任务队列（优先级 + 抢占 + 取消）
-│  ├─ skills/                  技能层（"做成一件事"）
-│  │  ├─ index.js              技能注册表 + 参数校验
-│  │  ├─ common.js             技能上下文、进度上报、落地/下树冠、直接行走
-│  │  ├─ wood.js               木材与工具链
-│  │  ├─ mining.js             挖矿、向下挖阶梯、熔炼
-│  │  ├─ building.js           庇护所建造
-│  │  └─ gathering.js          通用收集、存货、食物、打猎
-│  ├─ tools/                   测试与运维脚本
-│  └─ node_modules/            引擎依赖
-├─ plugin/                     AstrBot 插件（Python）
-│  ├─ main.py                  生命周期、引擎监管、指令、事件转发
-│  ├─ llm_tools_core.py        LLM 工具：感知 / 移动 / 基础动作
-│  ├─ llm_tools_skills.py      LLM 工具：技能 / 目标 / 社交
-│  ├─ llm_tools_life.py        LLM 工具：人格 / 记忆 / 过日子（"朋友接口"）
-│  ├─ bridge_client.py         子进程管理 + NDJSON 客户端
-│  ├─ perception.py            状态快照 → 给 LLM 的紧凑简报
-│  ├─ goals.py                 长期目标 → 技能链 → 执行与重规划
-│  ├─ persona.py               人格桥接：接 AstrBot 的 PersonaManager
-│  ├─ memory.py                记忆层：经历存储 + 相关度检索
-│  ├─ drives.py                驱动力：五个内在动机的水位竞争
-│  ├─ life.py                  过日子循环：自己决定做什么 + 主动分享
-│  ├─ game_agent.py            游戏内对话代理：玩家在游戏里说的话能真正驱动动作
-│  ├─ datadir.py               数据目录多候选解析（优先复用已有数据）
-│  ├─ metadata.yaml            插件清单
-│  └─ _conf_schema.json        配置项定义
-├─ config/bot.config.json      引擎独立运行时的配置（可选）
-├─ docs/                       文档
-├─ scripts/                    安装与开发脚本
-└─ PLAN.md                     原始实施计划
+Astrcraft/                      ← 仓库根目录**就是** AstrBot 插件本体
+├─ main.py                      生命周期、引擎监管、指令、事件转发
+├─ llm_tools_core.py            LLM 工具：感知 / 移动 / 基础动作
+├─ llm_tools_skills.py          LLM 工具：技能 / 目标 / 社交
+├─ llm_tools_life.py            LLM 工具：人格 / 记忆 / 过日子（"朋友接口"）
+├─ bridge_client.py             子进程管理 + NDJSON 客户端
+├─ perception.py                状态快照 → 给 LLM 的紧凑简报
+├─ perception_agent.py          决策前的"先查看再决定"只读代理（工具集见 PERCEPTION_TOOLS）
+├─ action_agent.py              自主行动的"手"：带完整工具集的 ReAct 循环
+├─ game_agent.py                游戏内对话代理：玩家在游戏里说的话能真正驱动动作
+├─ goals.py                     长期目标 → 技能链 → 执行与重规划
+├─ advisor.py                   生存顾问：按真实状态给"下一步该干什么"
+├─ persona.py                   人格桥接：接 AstrBot 的 PersonaManager
+├─ memory.py                    记忆层：经历存储 + 相关度检索
+├─ drives.py                    驱动力：五个内在动机的水位竞争
+├─ life.py                      过日子循环：自己决定做什么 + 主动分享
+├─ knowledge.py                 攻略 + 她自己总结的教训
+├─ inbox.py                     输入队列（主人的话与世界事件共用）
+├─ tokens.py                    token 用量账本
+├─ datadir.py                   数据目录多候选解析（优先复用已有数据）
+├─ metadata.yaml                插件清单
+├─ _conf_schema.json            配置项定义（**公开配置的真源**）
+├─ skills_docs/                 给 LLM 读的攻略（building/tools/food/mining/combat/
+│                               storage/blueprint/strategy）
+├─ engine/                      Node 引擎（真实游戏客户端）
+│  ├─ index.js                  RPC 服务端：所有能力的入口，方法表在这里
+│  ├─ bot.js                    mineflayer 实例装配、事件桥、反射层、重连
+│  ├─ rpc.js                    NDJSON/JSON-RPC 实现 + 错误类型定义
+│  ├─ config.js                 配置与默认值（**引擎侧默认值的真源**）、敌对生物判定
+│  ├─ util.js                   日志、坐标、错误翻译、超时工具
+│  ├─ log.js                    日志（强制走 stderr，日志脱敏）
+│  ├─ state.js                  状态快照、差分事件、简报 reporting、方块扫描
+│  ├─ movement.js               pathfinder 封装：goTo / follow / 卡住检测
+│  ├─ actions.js                原子动作：dig / place / craft / smelt / eat / attack / 容器
+│  ├─ goals.js                  引擎侧任务队列（优先级 + 抢占 + 取消）
+│  ├─ humanize.js               拟人化动作（转头、变速、停顿环顾）
+│  ├─ stations.js               记住"工作台/熔炉/箱子在哪"
+│  ├─ viewer.js                 观战窗口（prismarine-viewer）
+│  ├─ package.json              引擎依赖清单
+│  ├─ skills/                   技能层（"做成一件事"）
+│  │  ├─ index.js               技能注册表 + 参数校验（**技能名的真源**）
+│  │  ├─ common.js              技能上下文、进度上报、落地/下树冠、直接行走
+│  │  ├─ wood.js                木材与工具链
+│  │  ├─ mining.js              挖矿、向下挖阶梯、熔炼
+│  │  ├─ building.js            庇护所建造
+│  │  ├─ blueprint.js           照图纸建造
+│  │  ├─ gathering.js           通用收集、存货、食物、打猎
+│  │  └─ traverse.js            铺路 / 挖通一条路
+│  └─ node_modules/             引擎依赖（需在 engine/ 里执行 npm install）
+├─ dev-tools/                   测试与运维脚本（Python + JS），见 dev-tools/README.md
+│  ├─ _paths.py                 路径与导入辅助（**唯一**解析仓库根的地方）
+│  └─ lib/                      进程内 RCON 客户端（rcon.js / rcon.py）
+├─ docs/                        文档
+├─ data/                        运行时数据（记忆、驱动水位等）
+└─ README.md                    项目说明
 ```
+
+> **历史目录名已废弃**：早期文档里的 `plugin/`（Python 插件）与 `bot/`（Node 引擎）
+> 两个子目录**从来不存在**；引擎现在在 `engine/`，脚本在 `dev-tools/`。
+> 引擎独立运行的配置文件放在 `engine/config/bot.config.json`（可选，默认不存在）。
 
 ## 数据流（一次"砍树"的完整路径）
 
 ```
 用户在 QQ 说"去砍点木头"
   → AstrBot 路由到 LLM
-  → LLM 调用工具 mc_chop_tree(count=8)          [plugin/llm_tools_skills.py]
-  → 转发为 skill.run 请求                        [plugin/bridge_client.py]
-  → 引擎 RPC 分发                                [bot/index.js]
-  → 提交为任务，立刻返回 task_id                 [bot/goals.js]
-  → 后台执行技能                                  [bot/skills/wood.js]
-      ├─ settle() 确保不在树冠上                  [bot/skills/common.js]
-      ├─ 找树 → goTo() 走过去                     [bot/movement.js]
-      ├─ dig() 挖方块 + 自动选工具                [bot/actions.js]
+  → LLM 调用工具 mc_chop_tree(count=8)          [llm_tools_skills.py]
+  → 转发为 skill.run 请求                        [bridge_client.py]
+  → 引擎 RPC 分发                                [engine/index.js]
+  → 提交为任务，立刻返回 task_id                 [engine/goals.js]
+  → 后台执行技能                                  [engine/skills/wood.js]
+      ├─ settle() 确保不在树冠上                  [engine/skills/common.js]
+      ├─ 找树 → goTo() 走过去                     [engine/movement.js]
+      ├─ dig() 挖方块 + 自动选工具                [engine/actions.js]
       └─ collectDrops() 捡掉落物
-  → 进度通过 notice 事件回推（"砍树 3/8"）         [bot/state.js → bot/index.js]
+  → 进度通过 notice 事件回推（"砍树 3/8"）         [engine/state.js → engine/index.js]
   → 任务结束后推送 task.finished
   → 插件更新状态缓存，LLM 下次查 mc_task_status 就能看到结果
 ```
@@ -71,7 +89,7 @@ mc-astrbot/
 
 四步：
 
-1. **写实现** —— 在 `bot/skills/` 下新建文件或在已有文件里加函数。
+1. **写实现** —— 在 `engine/skills/` 下新建文件或在已有文件里加函数。
    签名统一为 `async function mySkill({ actions, nav, state, ctx, params })`。
    - `actions`：原子动作（挖/放/合成/吃/攻击/容器）
    - `nav`：寻路（goTo / follow / stop）
@@ -79,19 +97,22 @@ mc-astrbot/
    - `ctx`：取消信号、进度上报 `ctx.progress()`、`ctx.checkAborted()`
    - 返回值统一走 `skillResult(ok, { steps, produced, note, reason })`
 
-2. **注册** —— 在 `bot/skills/index.js` 的 `SKILLS` 里加一项，写好 `label` 与 `description`
+2. **注册** —— 在 `engine/skills/index.js` 的 `SKILLS` 里加一项，写好 `label` 与 `description`
    （这两个字段会进 LLM 的工具描述与 `mc_skills` 输出）。
+   **注册表是技能名的唯一真源**：`advisor.py` / `life.py` 里写死的技能名
+   必须都在这里存在，否则会被当成"不存在的技能"提交出去白烧一轮。
+   改完跑 `python dev-tools/check_skill_names.py` 验证。
 
-3. **暴露给 LLM（可选）** —— 在 `plugin/llm_tools_skills.py` 加一个
+3. **暴露给 LLM（可选）** —— 在 `llm_tools_skills.py` 加一个
    `@filter.llm_tool(name="mc_xxx")` 方法。
    **`Args:` 段的格式必须严格正确**，否则参数会被静默丢弃：
    ```
    Args:
        count(number): 要几个，默认 8
    ```
-   改完跑 `python bot/tools/check_plugin.py` 验证。
+   改完跑 `python dev-tools/check_plugin.py` 验证。
 
-4. **测试** —— 在 `bot/tools/skilltest.js` 里加一项，跑真服务器验证。
+4. **测试** —— 在 `dev-tools/skilltest.js` 里加一项，跑真服务器验证。
 
 ## 约定与陷阱（都是踩过的）
 
@@ -183,12 +204,22 @@ Node 是单线程的。任何同步耗时循环都会让引擎在这段时间里
 |---|---|---|
 | 手写三重循环 + 逐格 `bot.blockAt` | 半径 48、17 层 → 16 万次调用 → **阻塞 20~28 秒** | 用 `bot.findBlocks({ matching: <方块ID数组> })`（能按 section 调色板跳过整段），或**由近到远扫描 + 提前退出** |
 | 传**函数型** matcher 给 `findBlock` | 无法按调色板预筛，每段都要遍历 4096 格 | 传**方块 ID 数组**（`mcData.blocksByName[name].id`） |
-| 把"整体超时"当成"单次搜索预算" | `thinkTimeout` 误设 30 秒 → A\* 搜索期间事件循环被占满 30 秒 | 两个配置分开：`pathThinkTimeoutMs`（搜索预算，默认 4 秒）与 `pathTimeoutMs`（允许走多久） |
+| 把"整体超时"当成"单次搜索预算" | `thinkTimeout` 误设 30 秒 → A\* 搜索期间事件循环被占满 30 秒 | 两个配置分开：`pathThinkTimeoutMs`（搜索预算，**默认 1800 毫秒**，权威值在 `engine/config.js`）与 `pathTimeoutMs`（允许走多久，默认 30 秒） |
 | 算了没人用的数据 | `snapshot().block_scan` 无人消费，却每次快照烧 2.3 秒 | 先确认消费方再算；需要时走按需 RPC |
 
 **排查手段**：`bot.js` 里有个 250ms 的循环延迟监控，阻塞超过 1.5 秒会告警
 并附上"当时在跑的任务名"。定位这类问题**先看这条日志**，不要靠猜。
-工具：`node tools/probe_responsiveness.js` 可复现并量化（长任务运行中逐轮测 RPC 延迟）。
+工具：`node dev-tools\probe_responsiveness.js` 可复现并量化（长任务运行中逐轮测 RPC 延迟）。
+
+> **`pathThinkTimeoutMs` 的默认值为什么是 1800 而不是 4000**：真实服务器上量到过
+> "事件循环被阻塞 9.3 秒"（86 次里 50 次超过 6 秒），其中 70 次发生在**当时空闲**——
+> 触发者是空闲期反复触发的自动捡东西/自动插火把这类反射，不是技能任务。
+> A\* 是同步的，预算给多大就可能卡多久，所以压到 1.8 秒；远距离走不通由分段寻路兜底。
+> 插件侧可用配置项 `path_think_timeout_ms` 覆盖。
+> **注意**：这里曾经出现"注释说 1800、`config.js` 的 DEFAULTS 却是 4000"的漂移——
+> 因为 `movement.js` 写的是 `Number(config.get(...)) || 1800`，而 DEFAULTS 永远提供值，
+> `||` 右边**永远不可达**。现在只有 `engine/config.js` 一个权威值，
+> 由 `dev-tools/test_config_parity.py` 守住。
 
 ### 错误翻译不要"猜"
 
@@ -199,12 +230,12 @@ Node 是单线程的。任何同步耗时循环都会让引擎在这段时间里
 物品名 `crafting_table` 本身就含 `craft`。
 
 ### RCON 客户端（测试用）
-`tools/lib/rcon.js` 是**进程内**实现，三个坑（都是实测出来的）：
+`dev-tools/lib/rcon.js` 是**进程内**实现，三个坑（都是实测出来的）：
 1. 认证成功的响应是 `id=1/type=2`，**不是**标准文档说的 `type=3`；要按 `id === -1` 判失败
 2. 认证后**不能立刻清空 pending**：命令响应可能在同一个 I/O 块里重入到达，会被当成无主响应丢掉
 3. 响应可能分多包，要累积到 `type === 0` 的结束包再结算
 
-不要用 `execFileSync` 拉 `tools/rcon.js` 子进程：受限环境下"捕获子进程输出"会被拒（EPERM），
+不要用 `execFileSync` 拉 `dev-tools/rcon.js` 子进程：受限环境下"捕获子进程输出"会被拒（EPERM），
 报错看起来像 rcon 坏了，极难归因。
 
 ### 世界生成（超平坦）
@@ -224,63 +255,74 @@ Node 是单线程的。任何同步耗时循环都会让引擎在这段时间里
 
 ## 测试脚本一览
 
+全部在 `dev-tools/` 下（**不是** `bot/tools/`，那个目录不存在）。
+完整清单与用法见 `dev-tools/README.md`；这里只列主要的。
+
 | 脚本 | 作用 | 需要什么 |
 |---|---|---|
-| `bot/tools/smoke.js` | 通道、错误处理、真进服、真寻路、真挖掘 | 加 `--connect` 才需要服务器 |
-| `bot/tools/crafttest.js` | 合成链：木板→木棍→工具（含 3×3 工作台路径） | 服务器 + rcon |
-| `bot/tools/minetest.js` | 挖矿闭环：造矿脉→挖矿→熔炼→做铁镐 | 服务器 + rcon |
-| `bot/tools/survivaltest.js` | 真实生存链：砍树 → 工具 → 挖矿 | 服务器 |
-| `bot/tools/skilltest.js` | 各技能专项（收集、建造、存货） | 服务器 |
-| `bot/tools/diagnose.js` | 地形与寻路诊断，不做断言只打印事实 | 服务器 |
-| `bot/tools/rcon.js` | 命令行发服务端指令（造测试场景用） | 服务器（且开了 rcon） |
-| `bot/tools/soaktest.js` | 稳定性实测：长时间保持连接 + 周期性活动，统计断线次数 | 服务器 |
-| `bot/tools/lib/rcon.js` | **进程内** RCON 客户端（测试脚本用） | — |
-| `bot/tools/reset_world.js` | 重置测试世界；`--full` 连服务端目录一起重建 | — |
-| `bot/tools/fix_server_props.js` | 修正 `server.properties` 里被转义的设置 | — |
-| `bot/tools/setup_testserver.js` | 写入测试服配置 | — |
-| `bot/tools/check_plugin.py` | 插件静态契约检查（docstring / 签名 / 元数据） | 无 |
-| `bot/tools/test_plugin_load.py` | 按 AstrBot 的方式加载插件（命名空间包 + 相对导入） | AstrBot 的 python 与 app 目录 |
-| `bot/tools/test_integration.py` | 真的拉起引擎子进程并走 RPC（含进程回收验证） | AstrBot 的 python |
+| `dev-tools/smoke.js` | 通道、错误处理、真进服、真寻路、真挖掘 | 加 `--connect` 才需要服务器 |
+| `dev-tools/crafttest.js` | 合成链：木板→木棍→工具（含 3×3 工作台路径） | 服务器 + rcon |
+| `dev-tools/minetest.js` | 挖矿闭环：造矿脉→挖矿→熔炼→做铁镐 | 服务器 + rcon |
+| `dev-tools/survivaltest.js` | 真实生存链：砍树 → 工具 → 挖矿 | 服务器 |
+| `dev-tools/skilltest.js` | 各技能专项（收集、建造、存货） | 服务器 |
+| `dev-tools/diagnose.js` | 地形与寻路诊断，不做断言只打印事实 | 服务器 |
+| `dev-tools/rcon.js` | 命令行发服务端指令（造测试场景用） | 服务器（且开了 rcon） |
+| `dev-tools/soaktest.js` | 稳定性实测：长时间保持连接 + 周期性活动，统计断线次数 | 服务器 |
+| `dev-tools/lib/rcon.js` | **进程内** RCON 客户端（测试脚本用） | — |
+| `dev-tools/reset_world.js` | 重置测试世界；`--full` 连服务端目录一起重建 | — |
+| `dev-tools/fix_server_props.js` | 修正 `server.properties` 里被转义的设置 | — |
+| `dev-tools/setup_testserver.js` | 写入测试服配置 | — |
+| `dev-tools/check_plugin.py` | 插件静态契约检查（docstring / 签名 / 元数据） | 无 |
+| `dev-tools/check_skill_names.py` | advisor.py / life.py 里的技能名必须在引擎注册表里 | 无 |
+| `dev-tools/test_config_parity.py` | 配置默认值三方一致（schema / engine / 文档） | 无 |
+| `dev-tools/check_tool_prompts.py` | 提示词提到的 mc_* 必须真实注册且在该路径的工具集里 | 无 |
+| `dev-tools/test_plugin_load.py` | 按 AstrBot 的方式加载插件（命名空间包 + 相对导入） | AstrBot 的 python 与 app 目录 |
+| `dev-tools/test_integration.py` | 真的拉起引擎子进程并走 RPC（含进程回收验证） | AstrBot 的 python |
 
 > **跑测试前先重置世界**：这些测试会真的挖穿地形，连跑几轮后世界满是坑洞，
 > 机器人会掉进自己挖的洞里，表现为"寻路失败、挖矿找不到目标"——
 > 看起来像引擎退化，其实只是环境脏了。本次开发中因此误判过一次回归。
 >
 > ```powershell
-> node tools/reset_world.js        # 重置世界（保留服务端目录）
-> node tools/reset_world.js --full # 连服务端目录一起重建（世界生成配置被改坏时用）
+> node dev-tools\reset_world.js        # 重置世界（保留服务端目录）
+> node dev-tools\reset_world.js --full # 连服务端目录一起重建（世界生成配置被改坏时用）
 > ```
 
-跑法（在 `bot` 目录下）：
+跑法（**在仓库根目录下**；`dev-tools` 的脚本自己解析仓库根，
+也可以用环境变量 `ASTRCRAFT_REPO` 覆盖）：
 
 ```powershell
-node tools/smoke.js
-node tools/smoke.js --connect
+node dev-tools\smoke.js
+node dev-tools\smoke.js --connect
 
-# 插件相关需要 AstrBot 自带的解释器
-$env:PYTHONPATH = 'D:\AstrBot\backend\app'
-D:\AstrBot\backend\python\python.exe tools\check_plugin.py
-D:\AstrBot\backend\python\python.exe tools\test_plugin_load.py
-$env:MC_TEST_CONNECT='1'; D:\AstrBot\backend\python\python.exe tools\test_integration.py
+# 纯静态检查，不需要任何依赖
+py -3 dev-tools\check_skill_names.py
+py -3 dev-tools\test_config_parity.py
+py -3 dev-tools\check_tool_prompts.py
+
+# 需要 AstrBot 运行时的（把 ASTRBOT_APP 指到 AstrBot 的 backend/app，
+# 或直接把 app 目录放进 PYTHONPATH）：
+$env:ASTRBOT_APP = '<AstrBot>\backend\app'
+& '<AstrBot>\backend\python\python.exe' dev-tools\check_plugin.py
+& '<AstrBot>\backend\python\python.exe' dev-tools\test_plugin_load.py
+$env:MC_TEST_CONNECT='1'; & '<AstrBot>\backend\python\python.exe' dev-tools\test_integration.py
 ```
 
-或者一把梭：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\verify.ps1 -Connect -ServerPort 25565
-```
+> 引擎侧的脚本要在 **`engine/` 里执行过 `npm install`** 才能跑；
+> `engine/node_modules` 不存在时，凡是 `require('mineflayer')` 的脚本都会
+> 直接报 `Cannot find module`——那是环境没装好，不是脚本坏了。
 
 ## 本地测试环境
 
-`bot/tools/` 下的脚本假定可以起一个自己的 Paper 服务端。
+`dev-tools/` 下的脚本假定可以起一个自己的 Paper 服务端。
 `.testserver/` 是一个超平坦测试世界（bedrock + 2×dirt + grass），
 用于排除地形干扰、专门验证寻路与建造。
 
 造场景用 RCON：
 
 ```powershell
-node tools/rcon.js --port 25576 --dir .testserver "time set day"
-node tools/rcon.js --port 25576 --dir .testserver --cmd "give AstrBotSkill cobblestone 64"
+node dev-tools\rcon.js --port 25576 --dir .testserver "time set day"
+node dev-tools\rcon.js --port 25576 --dir .testserver --cmd "give AstrBotSkill cobblestone 64"
 ```
 
 需要在 `server.properties` 里开：

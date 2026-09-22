@@ -9,7 +9,7 @@
 这个脚本在发布前跑一遍，把这类问题挡在运行时之前。
 
 用法：
-  D:\\AstrBot\\backend\\python\\python.exe tools/check_plugin.py
+  & '<AstrBot>/backend/python/python.exe' dev-tools/check_plugin.py
 """
 
 from __future__ import annotations
@@ -27,14 +27,13 @@ if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-# 找插件目录：脚本在 <repo>/bot/tools/ 下，插件在 <repo>/plugin/
 _HERE = Path(__file__).resolve().parent
-_CANDIDATES = [
-    _HERE.parent.parent / "plugin",  # <repo>/bot/tools -> <repo>/plugin
-    _HERE.parent / "plugin",
-    _HERE / "plugin",
-]
-PLUGIN_DIR = next((p for p in _CANDIDATES if p.is_dir()), _CANDIDATES[0])
+sys.path.insert(0, str(_HERE))
+from _paths import REPO  # noqa: E402
+
+# 找插件目录：**仓库根就是插件本体**（main.py、llm_tools_*.py、_conf_schema.json
+# 都在这里）。历史脚本找的是不存在的 <repo>/plugin/，于是每次都报"没找到插件文件"。
+PLUGIN_DIR = REPO
 
 # 与 AstrBot 框架保持一致：格式为「参数名(类型): 描述」
 ARG_LINE_RE = re.compile(r"^\s*(\w+)\s*\(\s*([\w\[\]]+)\s*\)\s*:\s*(.+)$")
@@ -150,6 +149,14 @@ def check_file(path: Path) -> None:
 
 
 def main() -> int:
+    # **宁可响亮地失败，也不要静默通过**：目录里没有 main.py 就说明这个脚本
+    # 找错了地方，此时"0 个问题"毫无意义。
+    if not (PLUGIN_DIR / "main.py").is_file():
+        print(f"❌ 没找到插件文件：{PLUGIN_DIR}")
+        print("   （插件本体就是仓库根，这里应该有 main.py；"
+              "用环境变量 ASTRCRAFT_REPO 指定正确的仓库根）")
+        return 2
+
     files = sorted(PLUGIN_DIR.glob("*.py"))
     if not files:
         print(f"❌ 没找到插件文件：{PLUGIN_DIR}")

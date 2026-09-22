@@ -43,20 +43,17 @@ from astrbot.core.agent.tool import ToolSet
 # 不做白名单（除了下面这几个"不该由她自己决定"的）：
 # 原则很清楚——模型手上的工具就是它的双手，
 # 按我的判断去裁剪它反而会让它做不成事。
-# 只排除两类：
-#   1. 管理类（配置、启停、绑定）——那是主人的事，不是她的
-#   2. 会破坏"她在过日子"这个前提的（比如让她自己暂停自己）
+#
+# **这里只允许出现真实注册过的工具名。**
+# 早期这一列里躺着 9 个**根本不存在**的幽灵名字（配置 / 重载 / 重启 / 停止 /
+# 启动 / 暂停人生 / 恢复人生 / 设置人格 / 绑定，都带 mc_ 前缀）——
+# 那些管理面能力从来没有做成 LLM 工具（它们是 `/mc` 指令）。
+# 幽灵条目没有任何作用，却让人以为"管理工具已经被挡住了"，
+# 而检查器也无从判断这一列里的名字到底合不合法。
+# 现在由 dev-tools/check_tool_prompts.py 断言这一列里的名字全部真实存在。
+# （注意：别在这里把那些旧名字按原样写回来——test_action_agent.py 会扫描本文件
+#   里的所有 mc_ 名字并断言它们真实存在，写回来就会把它判成幻影工具。）
 EXCLUDED_TOOLS = (
-    "mc_set_config",
-    "mc_reload",
-    "mc_restart",
-    "mc_stop",
-    "mc_start",
-    "mc_pause_life",
-    "mc_resume_life",
-    "mc_set_persona",
-    "mc_bind",
-    "mc_todo_write",  # 清单由主人的工具写；她自己用 life 的清单接口
     # **任务管理类不算"她的手"**：实测她拿到这些工具后，
     # 会把整整 8 步预算花在 `mc_task_status` 轮询上——
     # 每 3 秒问一次"砍树做完了吗"，每次问都是一次 LLM 往返（几秒），
@@ -108,6 +105,7 @@ ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在�
 | 要盖房子 | `mc_build_shelter()` 或 `mc_blueprint` | 一块块 mc_place |
 | 要存东西 | `mc_store_items()` | 一格一格搬 |
 | 要熔炼 | `mc_smelt(item="iron_ingot", count=3)` | 一个个烧 |
+| **你知道接下来该干什么** | `mc_plan_do(steps="chop_tree, make_tools")` | 一步步来（每步都要停下来想，慢） |
 | 要吃饭 | `mc_cook_food()` 或 `mc_supply` | 一步步找食材 |
 | **掉进坑里/出不来** | `mc_climb_out()` | 硬走（**2 格以上跳不上去，走不出来的**） |
 | **前面过不去（坑/沟/岩浆）** | `mc_pave(direction="forward", count=4)` | 硬走 |

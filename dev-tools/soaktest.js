@@ -25,7 +25,7 @@ const OUT = path.join(__dirname, '..', '.soak.log');
 
 class C {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
     });
@@ -101,7 +101,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   say(`=== 稳定性实测：${MINUTES} 分钟 ===`);
   const c = new C();
-  await c.call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await c.call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(5000);
 
   let ready = false;

@@ -1,6 +1,6 @@
 """输入队列接进 LifeLoop 的测试（W4 第二步，见 docs/PLAN_v2.md）。
 
-第一步只做了队列内核（`plugin/inbox.py`），这一步是**接线**：
+第一步只做了队列内核（`inbox.py`），这一步是**接线**：
 队列躺着没人取，等于没做。要钉住四个注入点：
 
   1. **STEER 在"组装提示词"时注入**——我们的安全注入点。
@@ -20,10 +20,15 @@ import sys
 import time
 import pathlib
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.inbox import Delivery, Inbox  # noqa: E402
-from plugin.life import Hold, LifeLoop  # noqa: E402
+import _paths  # noqa: E402
+
+# 这个测试要导入 main.py（末尾那段 _looks_like_full），而 main.py 依赖 astrbot。
+_paths.require_astrbot("test_inbox_wiring")
+_paths.load_plugin()
+from astrcraft_plugin.inbox import Delivery, Inbox  # noqa: E402
+from astrcraft_plugin.life import Hold, LifeLoop  # noqa: E402
 
 passed = 0
 failed = 0
@@ -183,7 +188,7 @@ ok("报了有急件", "急件" in s, s)
 ok("报了分类", "owner" in s and "task_done" in s, s)
 
 print("\n=== 判「没事做」必须把队列算进去（源码断言）===")
-src = (pathlib.Path(__file__).resolve().parents[2] / "plugin" / "life.py").read_text(encoding="utf-8")
+src = (_paths.REPO / "life.py").read_text(encoding="utf-8")
 ok(
     "agent 那处的空闲判定含 len(self.inbox) == 0",
     "not await self._engine_busy()\n                            and len(self.inbox) == 0" in src
@@ -196,7 +201,7 @@ ok(
 )
 
 print("\n=== 四个接线点确实存在（防止只写了方法没人调）===")
-mn = (pathlib.Path(__file__).resolve().parents[2] / "plugin" / "main.py").read_text(encoding="utf-8")
+mn = (_paths.REPO / "main.py").read_text(encoding="utf-8")
 ok("main.py 构造 LifeLoop 时传了 inbox", "inbox=Inbox(" in mn)
 ok("主人说话入队", "note_owner_said(" in mn)
 ok("任务结果入队", 'note_world_event("task_done"' in mn and 'note_world_event(\n                        "task_failed"' in mn or "task_failed" in mn)
@@ -215,7 +220,7 @@ ok("饥饿入队", 'note_world_event(\n                "hungry"' in mn or '"hung
 ok("工具损坏入队", '"tool_broken"' in mn)
 
 print("\n=== 引擎侧确实发了这些事件（源码断言）===")
-eng = (pathlib.Path(__file__).resolve().parents[2] / "bot" / "bot.js").read_text(encoding="utf-8")
+eng = (_paths.ENGINE_DIR / "bot.js").read_text(encoding="utf-8")
 ok("引擎发 bot.hurt", "this._emit('bot.hurt'" in eng)
 ok("引擎发 bot.hungry", "this._emit('bot.hungry'" in eng)
 ok("引擎发 tool.broken", "this._emit('tool.broken'" in eng)
@@ -235,7 +240,7 @@ print("\n=== 箱子满：从真实报错文本里认（W4 最后一种事件）=
 # 真实信号只有一个：服务端在放不进去时回的报错文本。
 # 认不出就不报——宁可漏报，也不要把"没有箱子"说成"箱子满了"
 # （那会让她去清理一个根本不存在的箱子）。
-from plugin.main import MinecraftPlugin as _P  # noqa: E402
+from astrcraft_plugin.main import MinecraftPlugin as _P  # noqa: E402
 
 _full = _P._looks_like_full
 ok("认得 'container is full'", _full("container is full") is True)

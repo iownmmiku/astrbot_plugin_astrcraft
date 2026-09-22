@@ -183,12 +183,16 @@
   },
   "dig_whitelist": {
     "type": "list",
-    "description": "允许挖掘的方块白名单。**留空 = 机器人可以挖掉你世界里任何方块（基岩等已在黑名单里除外）**。想保护建筑/领地就填上允许的方块名",
+    "description": "允许挖掘的方块白名单。**留空 = 机器人可以挖掉你世界里任何方块（基岩等已在黑名单里除外）**。想保护建筑/领地就填上允许的方块名。默认值 = 原版生存常用方块（石头类 + 各种木头 + **全部矿石**），也就是内置技能（砍树/挖矿/挖石头）真正会去挖的那些；**默认值里没有的方块一律挖不动**，被拦下时引擎会明确回一句「挖掘白名单拦截」",
     "default": [
       "stone",
       "cobblestone",
       "deepslate",
       "cobbled_deepslate",
+      "andesite",
+      "diorite",
+      "granite",
+      "tuff",
       "dirt",
       "grass_block",
       "sand",
@@ -200,28 +204,57 @@
       "jungle_log",
       "acacia_log",
       "dark_oak_log",
+      "mangrove_log",
+      "cherry_log",
+      "pale_oak_log",
+      "crimson_stem",
+      "warped_stem",
       "oak_leaves",
       "spruce_leaves",
       "birch_leaves",
-      "andesite",
-      "diorite",
-      "granite",
-      "netherrack"
+      "dark_oak_leaves",
+      "netherrack",
+      "coal_ore",
+      "deepslate_coal_ore",
+      "iron_ore",
+      "deepslate_iron_ore",
+      "copper_ore",
+      "deepslate_copper_ore",
+      "gold_ore",
+      "deepslate_gold_ore",
+      "nether_gold_ore",
+      "redstone_ore",
+      "deepslate_redstone_ore",
+      "lapis_ore",
+      "deepslate_lapis_ore",
+      "diamond_ore",
+      "deepslate_diamond_ore",
+      "emerald_ore",
+      "deepslate_emerald_ore",
+      "nether_quartz_ore",
+      "ancient_debris"
     ]
   },
   "dig_blacklist": {
     "type": "list",
-    "description": "禁止挖掘的方块",
+    "description": "禁止挖掘的方块。**默认这 5 项**（基岩 / 屏障 / 三种命令方块）与 engine/config.js 的 DEFAULTS.digBlacklist 一致；清空 = 不额外禁止",
     "default": [
       "bedrock",
       "barrier",
-      "command_block"
+      "command_block",
+      "chain_command_block",
+      "repeating_command_block"
     ]
   },
   "spawn_protection_radius": {
     "type": "int",
-    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作。**默认 16**：出生点通常是玩家建筑最密的地方",
+    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作。**默认 16**：出生点通常是玩家建筑最密的地方。这一项必须与 engine/config.js 的 DEFAULTS.spawnProtectionRadius 一致（由 dev-tools/test_config_parity.py 守住）",
     "default": 16
+  },
+  "path_think_timeout_ms": {
+    "type": "int",
+    "description": "**单次 A* 寻路搜索的同步时间预算（毫秒）**。搜索期间引擎的事件循环会被完全占住——这个值给多大，就可能卡多久（卡住时你既问不到她的状态、也喊不停她）。**默认 1800**：实测真实服务器上出现过事件循环被阻塞 9.3 秒（86 次里 50 次超过 6 秒），触发者是空闲期的自动捡东西/自动插火把这类反射。远距离走不通由分段寻路兜底，所以不需要把它调大。**不要**与 skill_timeout_seconds（允许走多久）混为一谈",
+    "default": 1800
   },
   "skill_timeout_seconds": {
     "type": "int",

@@ -10,7 +10,7 @@ const { Rcon } = require('./lib/rcon');
 
 const USER = 'Diag' + Math.floor(Math.random() * 9000);
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'debug' },
 });
@@ -77,7 +77,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rcon = Rcon.fromDir('.testserver', 25576);
   console.log('连接 rcon 测试:', (await rcon.command('list')).trim());
 
-  await call('connect', { host: '127.0.0.1', port: 25566, version: '1.20.1', username: USER }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await call('connect', { host: '127.0.0.1', port: 25566, version: '1.20.1', username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(6000);
 
   console.log(`\n[1] give 到 ${USER} 之前，背包:`, JSON.stringify((await call('inventory.get')).items));

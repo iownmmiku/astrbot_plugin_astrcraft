@@ -11,9 +11,10 @@
   人格     → 能不能从 AstrBot 读到
   数据目录 → 记忆/驱动能不能落盘
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\check_config.py
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  $env:ASTRBOT_DATA='<AstrBot>/data'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/check_config.py
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -29,11 +31,23 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
 
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
+import _paths  # noqa: E402
+from _paths import ENGINE_DIR  # noqa: E402
+
+_paths.load_plugin()
+
+# 这个脚本要对着**用户机器上真实安装的** AstrBot 跑：配置文件、已安装的插件副本、
+# 插件数据目录都在 AstrBot 的 data 目录下。位置因机器而异，
+# 所以只从环境变量读——**不写死任何人的家目录**。
+#   $env:ASTRBOT_DATA='<AstrBot>/data'
+_ASTRBOT_DATA = os.environ.get("ASTRBOT_DATA", "").strip()
+ASTRBOT_DATA = Path(_ASTRBOT_DATA).expanduser() if _ASTRBOT_DATA else None
+
+CONFIG_PATH = ASTRBOT_DATA / "config" / "astrbot_plugin_astrcraft_config.json" if ASTRBOT_DATA else None
+PLUGIN_DIR = ASTRBOT_DATA / "plugins" / "astrbot_plugin_astrcraft" if ASTRBOT_DATA else None
+DATA_DIR = ASTRBOT_DATA / "plugin_data" / "astrbot_plugin_astrcraft" if ASTRBOT_DATA else None
 
 problems: list[str] = []
 warnings: list[str] = []
@@ -73,6 +87,19 @@ class FakeContext:
 
 
 async def main() -> int:
+    if ASTRBOT_DATA is None:
+        print(
+            "⏭  SKIP：这个脚本校验的是**用户机器上真实安装的** AstrBot，需要知道它的数据目录。\n"
+            "    环境变量 ASTRBOT_DATA 没设（脚本里不写死任何人的家目录），所以现在无从检查。\n"
+            "    设置后重试：\n"
+            "      $env:ASTRBOT_DATA='<AstrBot>/data'\n"
+            "    它会去读：\n"
+            "      <AstrBot>/data/config/astrbot_plugin_astrcraft_config.json\n"
+            "      <AstrBot>/data/plugins/astrbot_plugin_astrcraft\n"
+            "      <AstrBot>/data/plugin_data/astrbot_plugin_astrcraft"
+        )
+        sys.exit(0)
+
     print("=== 配置入口校验 ===\n")
     print(f"配置文件：{CONFIG_PATH}")
     print(f"插件目录：{PLUGIN_DIR}\n")
@@ -97,7 +124,7 @@ async def main() -> int:
     engine_dir_raw = str(cfg.get("engine_dir") or "").strip()
     if not engine_dir_raw:
         bad("engine_dir 是空的 —— 插件会找不到引擎（这是最常见的启动失败原因）")
-        print("      修法：填引擎目录绝对路径，例如 D:/工作台/mc-astrbot/bot")
+        print(f"      修法：填引擎目录绝对路径（本仓库里就是 {ENGINE_DIR}）")
     else:
         engine_dir = Path(engine_dir_raw)
         if not engine_dir.exists():
@@ -142,14 +169,20 @@ async def main() -> int:
         else:
             bad(f"配置的 node_path 不存在：{node_path}（请修正或留空让插件自动探测）")
     else:
-        from plugin.bridge_client import EngineConfig
+        # bridge_client 依赖 astrbot（`from astrbot.api import logger`）。
+        # AstrBot 源码目录只认环境变量 ASTRBOT_APP —— _paths.astrbot_available()
+        # 会把它加进 sys.path 并试着导入。
+        if not _paths.astrbot_available():
+            warn("import 不到 astrbot（设 ASTRBOT_APP=<AstrBot>/backend/app）→ 跳过 node 自动探测")
+        else:
+            from astrcraft_plugin.bridge_client import EngineConfig
 
-        tmp = EngineConfig(engine_dir=Path(engine_dir_raw or _REPO / "bot"))
-        try:
-            resolved = tmp.resolve_node()
-            ok(f"node_path 留空 → 自动探测到：{resolved}")
-        except Exception as exc:  # noqa: BLE001
-            bad(f"自动探测 node 失败：{exc}")
+            tmp = EngineConfig(engine_dir=Path(engine_dir_raw or ENGINE_DIR))
+            try:
+                resolved = tmp.resolve_node()
+                ok(f"node_path 留空 → 自动探测到：{resolved}")
+            except Exception as exc:  # noqa: BLE001
+                bad(f"自动探测 node 失败：{exc}")
 
     # ---------------------------------------------------------- 3. 服务器
     print("\n[3] 服务器连接配置")
@@ -203,7 +236,7 @@ async def main() -> int:
 
     # ---------------------------------------------------------- 6. 数据目录
     print("\n[6] 数据目录（记忆与驱动的落盘位置）")
-    data_dir = Path(r"C:\Users\miku\.astrbot\data\plugin_data\astrbot_plugin_astrcraft")
+    data_dir = DATA_DIR
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         probe = data_dir / ".write_probe"

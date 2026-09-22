@@ -71,7 +71,7 @@ async function rconAsync(...commands) {
 
 class Client {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
     });
@@ -240,7 +240,9 @@ async function main() {
 
   const c = new Client();
   global.__mcClient = c;
-  await c.call('connect', { host: '127.0.0.1', port: PORT, version: VERSION, username: USER }, 60000);
+  // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+  // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+  await c.call('connect', { host: '127.0.0.1', port: PORT, version: VERSION, username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(4000);
   // 等进服真正就绪：connect 返回后 bot.entity 可能还没建立，
   // 这时任何动作都会报"机器人尚未进入服务器"。轮询到就绪或超时为止。

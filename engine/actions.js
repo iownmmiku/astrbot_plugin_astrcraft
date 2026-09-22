@@ -246,21 +246,45 @@ class Actions {
 
   /** 挖掘前挡住受保护方块（配合领地插件场景；白/黑名单可配） */
   _assertNotProtected(x, y, z, name) {
-    const blacklist = this._config.get('digBlacklist') || [];
+    // `??` 而不是 `||`：白名单**空数组是合法配置**（= 不限制），
+    // 而 `|| []` 会在值为 null/undefined 时把"没有配置"悄悄变成"不限制"——
+    // 安全相关的配置静默失效是最危险的一类 bug。
+    const blacklist = this._config.get('digBlacklist') ?? [];
     const short = String(name).replace(/^minecraft:/, '');
     if (blacklist.includes(short)) {
-      throw new ProtectedBlockError(`${short} 在禁止挖掘名单中，跳过`);
+      throw new ProtectedBlockError(
+        `【挖掘黑名单拦截】${short} 在禁止挖掘名单里，跳过（这不是"附近没有${short}"，是配置不允许挖它）`,
+      );
     }
-    const whitelist = this._config.get('digWhitelist') || [];
+    const whitelist = this._config.get('digWhitelist') ?? [];
     if (whitelist.length && !whitelist.includes(short)) {
-      throw new ProtectedBlockError(`${short} 不在允许挖掘的白名单内（当前配置只允许挖：${whitelist.join(', ')}）`);
+      // **报错必须自报家门**。
+      //
+      // 早期这里只写"不在允许挖掘的白名单内"，而技能层（mining.js 的 fetchOne）
+      // 把 dig 的异常吞掉、只记 debug 日志，最终给模型的是
+      // "附近没有找到iron"——于是模型以为是地形问题，换个地方继续找，
+      // 而真正的原因是**配置层面根本不允许挖它**，找一辈子也没用。
+      // 现在这句话会一路传到技能的 reason 里，模型能直接看到该怎么办。
+      //
+      // 白名单默认有 40+ 项，全量打印会把报错撑爆，所以只列前若干项 + 总数。
+      const shown = whitelist.slice(0, 12).join(', ');
+      const more = whitelist.length > 12 ? ` …（共 ${whitelist.length} 项）` : '';
+      throw new ProtectedBlockError(
+        `【挖掘白名单拦截】${short} 不在允许挖掘的白名单内——` +
+          `这不是"附近没有${short}"，而是当前配置不允许挖这种方块，换地方找也没用。` +
+          `当前白名单：${shown}${more}。` +
+          `要让她能挖 ${short}，请在插件配置的 dig_whitelist 里加上它（清空整个白名单 = 不限制）。`,
+      );
     }
     const radius = Number(this._config.get('spawnProtectionRadius')) || 0;
     if (radius > 0) {
       const bot = this._bot;
       const spawn = bot.spawnPoint || { x: 0, y: 64, z: 0 };
       if (distance({ x, y, z }, spawn) < radius) {
-        throw new ProtectedBlockError(`(${x},${y},${z}) 在出生点保护半径 ${radius} 格内，不进行破坏性动作`);
+        throw new ProtectedBlockError(
+          `【出生点保护拦截】(${x},${y},${z}) 在出生点保护半径 ${radius} 格内，不进行破坏性动作` +
+            `（这不是"附近没有方块"，是配置在保护出生点）`,
+        );
       }
     }
   }

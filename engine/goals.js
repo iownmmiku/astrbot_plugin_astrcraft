@@ -67,6 +67,20 @@ class Task {
     this.finishedAt = null;
     this.controller = new AbortController();
     this.progress = '';
+    /**
+     * **"这一次执行"的身份令牌**（P4，见 requeue()）。
+     *
+     * `_pump()` 每开始一轮就 +1，`requeue()` 也 +1（把正在跑的那一次作废）。
+     * 收尾时只有 `task._runToken === myToken` 才允许结算 promise / 写状态。
+     *
+     * 为什么不能用布尔标记：技能内部**并非每处 await 都响应 signal**
+     * （`settle()`、部分 `delay(ms)`、若干库调用都可能是裸等待），所以
+     * "旧执行收尾"完全可能晚于"重跑开始"。而布尔标记会在重跑开始时被重置，
+     * 旧执行收尾时看到的就成了"我没事"——于是**替重跑那次把 promise 结算掉**，
+     * 重跑的真实结果被丢弃，`status` 也跟着说谎。
+     * 令牌只会递增，旧执行永远认不出自己。
+     */
+    this._runToken = 0;
     this._resolve = null;
     this._reject = null;
     this.promise = new Promise((resolve, reject) => {
@@ -91,6 +105,34 @@ class Task {
       this.finishedAt = Date.now();
       this._reject(new CancelledError(reason));
     }
+    return true;
+  }
+
+  /**
+   * **被抢占后的"重排"**（P4）：放弃当前这次执行，但**不结算 promise**。
+   *
+   * 与 `cancel()` 的区别只有一点，但很关键：`cancel()` 对 `pending` 的任务会
+   * `this._reject(new CancelledError(reason))`——那是"这件事结束了、而且没做成"。
+   * 而抢占的语义是"**让一让，等下接着做**"：任务马上会被放回队头重跑。
+   *
+   * 原来抢占走的是 `cancel()`，于是这个 promise 被 reject 一次 →
+   * `engine/bot.js` 的 `.catch(err => hooks.onFailed(err))` 把**一个还会重跑的
+   * 本能记成"失败了"**。而 onFailed 的实现基本都带副作用（计数、降频、退避、
+   * 甚至 `bot.chat` 喊一句"我卡住了"）——结果是"被抢了几次之后，她自己把自己
+   * 降频了"，从日志上看还以为是能力问题。
+   *
+   * 这里做两件事：
+   *   ① abort 信号，让正在跑的 `run()` 尽快退出；
+   *   ② **递增 `_runToken`**，把"正在跑的那一次"作废——它随后收尾时
+   *      `_pump` 会发现令牌对不上，于是**不结算、不写状态、不进历史**。
+   *      promise 保持 pending，等真正跑完的那一次再 resolve/reject。
+   */
+  requeue(reason = '被抢占') {
+    this._requeueReason = reason;
+    // **先作废身份，再 abort**：abort 之后 run() 可能同步就抛出来，
+    // 顺序反了会有一瞬间"旧执行还以为自己是当前那次"。
+    this._runToken += 1;
+    this.controller.abort();
     return true;
   }
 
@@ -265,15 +307,30 @@ class TaskQueue {
           `「${victim.name}」被「${task.name}」抢走身体（第 ${victim.preemptCount} 次），` +
             `已放回队头——重新跑会从"已经做到哪"接着做，不会白费`,
         );
-        // 回队头重排，不丢弃
+        // 回队头重排，不丢弃。
+        //
+        // **顺序很关键，别改**：
+        //   ① 先 `requeue()` —— 它 abort 的是**当前正在跑的那次执行**持有的
+        //      controller（见下面 ②）。用 requeue 而不是 cancel：cancel 对
+        //      pending 任务会 reject 一次 promise，而 `engine/bot.js` 的
+        //      `.catch` 会把它当成真失败调 onFailed（计数/降频/退避）。
+        //      被抢占的任务**马上会重跑**，把它记成失败是错的（P4）。
+        //   ② 再换一个新的 controller 给"重跑的那一次"用。
+        //
+        // **这里原来是反的**（先换 controller、再 cancel），后果是：
+        // `cancel()` abort 的是**刚装上去的新 controller**，而正在跑的
+        // `run()` 手里握着的是旧的那个 —— **旧 signal 永远没人 abort**，
+        // 于是"抢占"根本没有打断正在执行的动作：她会一边继续挖/走，
+        // 一边又被排进队列再跑一遍。`dev-tools/test_task_preempt.js`
+        // 的「abort 信号真的传下去了」那条断言就是为这个加的。
         victim.status = 'pending';
         victim.startedAt = null;
-        // 重新造一个 AbortController：旧的可能已被 abort
+        victim.requeue(`被更高优先级任务 ${task.name} 抢占`);
+        // 给"重跑的那一次"准备一个干净的 AbortController
         victim.controller = new AbortController();
         this._queue.push(victim);
         this._sortQueue();
-        victim.cancel(`被更高优先级任务 ${task.name} 抢占`);
-        // cancel 会把状态置为 cancelled，这里恢复成 pending 以便重排执行
+        // requeue 只 abort、不改 status；显式写清楚意图
         victim.status = 'pending';
         victim.error = null;
         this._current = null;
@@ -312,6 +369,15 @@ class TaskQueue {
     this._current = task;
     task.status = 'running';
     task.startedAt = Date.now();
+    // **记下"这一次执行"的身份**（P4）。
+    //
+    // 每开始一轮就 +1：被抢占重排之后，旧执行的 `myToken` 就不再等于
+    // `task._runToken`，于是它收尾时**什么都不要碰**（不结算、不改状态、
+    // 不进历史、不触发回调）。用一个只增不减的令牌，而不是一个会被
+    // 重置的布尔标记——后者在重跑开始时就被清掉，旧执行收尾时看到的
+    // 是"我没事"，于是替重跑那次把 promise 结算了。
+    task._runToken = (task._runToken || 0) + 1;
+    const myToken = task._runToken;
     if (this._onTaskStarted) {
       try {
         this._onTaskStarted(task);
@@ -322,7 +388,12 @@ class TaskQueue {
 
     try {
       const result = await task.run({ signal: task.signal, task });
-      if (task.status !== 'cancelled') {
+      if (task._runToken !== myToken) {
+        // **这次执行已经被作废**（被抢占后回队头重排了）→ 这次不算结束。
+        // promise 保持 pending，既不 resolve（会报假成功、onDone 误触发），
+        // 也不 reject（会报假失败）。等它重跑完的那一次再结算。
+        log.debug(`${task.name}(${task.id}) 被抢占后已重排，本次不结算 promise`);
+      } else if (task.status !== 'cancelled') {
         // 关键：技能可能"正常返回"但业务上失败（skillResult(false, {...})）。
         // 如果一律记成 done，上层就会看到"任务成功但什么都没发生"的假成功——
         // 这个坑真实出现过（make_tools 内部失败却报 done）。
@@ -346,29 +417,52 @@ class TaskQueue {
       }
     } catch (err) {
       const cancelled = err instanceof CancelledError || err.name === 'CancelledError' || task.signal.aborted;
-      if (cancelled) {
+      if (task._runToken !== myToken) {
+        // **被抢占后已重排 → 既不算取消也不算失败**（P4）。
+        // 不 reject（否则 bot.js 的 .catch 会调 onFailed 记一笔假失败），
+        // 也不计 cancelled 统计（它没被取消，只是让了让）。
+        log.debug(`${task.name}(${task.id}) 被抢占后已重排，本次不结算 promise`);
+      } else if (cancelled) {
         task.status = 'cancelled';
         task.error = task.error || err;
         this._stats.cancelled += 1;
+        task._reject(err);
       } else {
         task.status = 'failed';
         task.error = err;
         this._stats.failed += 1;
         log.warn(`任务失败 ${task.name}(${task.id})：${err.message}`);
+        task._reject(err);
       }
-      task._reject(err);
     } finally {
-      task.finishedAt = Date.now();
-      this._current = null;
-      this._remember(task);
-      if (this._onTaskFinished) {
-        try {
-          this._onTaskFinished(task);
-        } catch (err) {
-          log.warn('onTaskFinished 回调异常', err.message);
+      // **收尾也必须按令牌判定**（P4）。
+      //
+      // 技能内部并非每处 await 都响应 signal（`settle()`、部分 `delay(ms)`、
+      // 若干库调用都可能是裸等待），所以旧执行完全可能晚于重跑才收尾。
+      // 令牌对不上就**一个字段都不要碰**——否则它会把重跑那次的
+      // `_current` / 历史 / 回调全部搅乱。
+      if (task._runToken !== myToken) {
+        log.debug(`${task.name}(${task.id}) 的旧执行收尾（已被重排取代），不碰任何状态`);
+      } else {
+        task.finishedAt = Date.now();
+        // **只清掉"确实是自己"的那一份**。
+        //
+        // 被抢占的任务已经回队头了，而它的 `run()` 可能还在收尾（abort 到真正
+        // 抛出之间有几十毫秒）。这段时间里 `_current` 很可能已经是**抢占者**了；
+        // 无条件 `this._current = null` 会把后来者的登记抹掉，
+        // 于是 `_pump` 认为"没人在跑"，又去队列里拿一个 ——
+        // **两个任务同时跑**，而"串行执行"是整个队列存在的前提。
+        if (this._current === task) this._current = null;
+        this._remember(task);
+        if (this._onTaskFinished) {
+          try {
+            this._onTaskFinished(task);
+          } catch (err) {
+            log.warn('onTaskFinished 回调异常', err.message);
+          }
         }
+        this._schedule();
       }
-      this._schedule();
     }
   }
 

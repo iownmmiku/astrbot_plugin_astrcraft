@@ -13,13 +13,18 @@ import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent.parent
-sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(Path(r"D:\AstrBot\backend\app")))
+sys.path.insert(0, str(_HERE))
+
+import _paths  # noqa: E402
+
+# **需要 AstrBot 运行时**（`life.py` / `advisor.py` 顶层就 import `astrbot.api`）。
+# 环境缺失时大声 SKIP，而不是抛一个看着像"测试坏了"的 ModuleNotFoundError。
+_paths.require_astrbot("test_advisor")
 
 # 用包导入方式（life.py 内部是相对导入 `from .advisor import ...`）
-from plugin import advisor as A  # noqa: E402
-from plugin import life as L  # noqa: E402
+_paths.load_plugin()
+from astrcraft_plugin import advisor as A  # noqa: E402
+from astrcraft_plugin import life as L  # noqa: E402
 
 passed = 0
 failed = 0

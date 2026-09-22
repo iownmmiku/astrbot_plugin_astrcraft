@@ -52,6 +52,55 @@ SHARE_TEMPLATES = [
 ]
 
 
+def render_skill_catalog(skills) -> str:
+    """把引擎给的技能清单渲染成提示词里的那几行（P1）。
+
+    ## 为什么必须渲染**全部**技能
+
+    这里原来是 `skills[:12]`——引擎有 21 个技能时，模型**看不到**这 9 个：
+    `cook_food / hunt / food_chain / blueprint / sleep / interact / shoot / shield / craft`。
+
+    后果不是"少了个选项"，而是**它不知道自己会**：不会想到"照图纸盖房子""打猎"
+    "射箭""举盾""单件合成"，只能靠 advisor 恰好建议、或者主动调 `mc_skills` 去查。
+    这与整个设计目标——**"它知道的 = 它能做的"**——直接矛盾。
+
+    ## 代价与"为什么不能挪进动态段"
+
+    实测渲染前 12 项 = 1038 字符，渲染全部 21 项 = **1610 字符**（+572）。
+    这个代价可以接受，因为**这段是静态的**：它拼进 `system` 段（跨轮完全一致、
+    可缓存），而每轮都在变的观察内容在 `user` 段。**不要因为"提示词变长了"
+    就把它挪进动态段**——那会打穿前缀缓存，每一轮都要为这几千字重新付费，
+    代价远大于 572 字符。
+
+    ## 兼容两种清单形状
+
+    `skill.list` 给的是 dict 列表（`{skill, description, params}`），
+    也可能有人直接传字符串列表（`"chop_tree(count=8)：找树砍木材…"`）。
+    两种都要能渲染——这条路径上出过"切片直接抛 KeyError"的坑。
+
+    做成**模块级纯函数**（而不是写在 `_decide` 里）是为了能被测试直接喂假清单：
+    `dev-tools/test_skill_visibility.py` 用它断言"21 个技能名一个都不能少"。
+    """
+    lines: list[str] = []
+    for item in skills or []:
+        if isinstance(item, dict):
+            name = str(item.get("skill") or item.get("name") or "").strip()
+            if not name:
+                continue
+            desc = str(item.get("description") or "").strip()
+            params = item.get("params") or {}
+            ps = ", ".join(f"{k}={v}" for k, v in params.items())
+            if ps:
+                lines.append(f"- {name}({ps})：{desc}" if desc else f"- {name}({ps})")
+            else:
+                lines.append(f"- {name}：{desc}" if desc else f"- {name}")
+        else:
+            text = str(item).strip()
+            if text:
+                lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
 @dataclass
 class LifeDecision:
     """一次"我现在要做什么"的决定。"""
@@ -226,6 +275,10 @@ class LifeLoop:
         self._session_planned = False
         # **LLM 自己写的任务清单**（todo_write 工具维护）
         self._todos: list[dict] = []
+        # **技能名白名单**（引擎注册表里的真实技能名）。
+        # 每次决策取技能清单时顺带刷新；为空表示"还没有可信清单"，
+        # 此时一律放行（见 _skill_is_known 的说明）。
+        self._known_skills: set[str] = set()
 
         self._decide_interval = decide_interval
         # 两次决策之间的最小间隔（"承诺机制"，见 _loop 里的说明）。
@@ -1015,6 +1068,15 @@ class LifeLoop:
                 else:
                     self._pending_follow_up = ""
 
+                # **agent 写的计划要在下一轮生效**（C 批次）。
+                #
+                # 计划机制本来就在，但只有旧路径会写它；走 agent 路径时
+                # agent 每轮都返回"我处理了"，于是计划机制是死的 ——
+                # 她每走一步都要过一次模型（玩家看到的就是"老站着不动"）。
+                if self._pending_plan and not self._plan:
+                    self._set_plan(self._pending_plan, source="agent")
+                    self._pending_plan = []
+
                 # **计划优先：有计划就直接执行下一步，不调模型（W7 的核心）。**
                 #
                 # 为什么必须放在 agent 之前：agent 正常可用时**每轮都会返回 True**
@@ -1209,18 +1271,30 @@ class LifeLoop:
                 logger.debug("取技能清单失败：%s", exc)
                 skills = []
 
-        # 技能清单可能是"字符串列表"也可能是"dict 列表"，两种都要能渲染
-        skill_lines = []
-        for item in (skills or [])[:12]:
+        # 技能清单可能是"字符串列表"也可能是"dict 列表"，两种都要能渲染。
+        # **渲染全部技能**（P1，见 render_skill_catalog 的说明）：原来切前 12 项，
+        # 让模型看不到自己会"照图纸建造/睡觉/打猎/射箭/举盾/单件合成"。
+        skill_text = render_skill_catalog(skills)
+
+        # **顺手把"真实技能名"缓存下来，当白名单用**（B3）。
+        #
+        # 渲染现在是全量，但这两件事**仍然是分开的**：白名单只认"名字"，
+        # 而渲染还要名字+参数+描述。分开写是为了将来任何一侧改格式时，
+        # 另一侧不会跟着坏（早期"用前 12 项当白名单"就是这么埋下误杀隐患的）。
+        #
+        # 只在拿到非空清单时覆盖：engine 没起来 / skill.list 偶发失败时
+        # 不要把已有缓存清空（清空等于"没有可信清单"，见 _skill_is_known）。
+        names_seen = set()
+        for item in skills or []:
             if isinstance(item, dict):
-                name = item.get("skill") or item.get("name") or ""
-                desc = item.get("description") or ""
-                params = item.get("params") or {}
-                ps = ", ".join(f"{k}={v}" for k, v in params.items())
-                skill_lines.append(f"- {name}({ps})：{desc}" if ps else f"- {name}：{desc}")
+                nm = str(item.get("skill") or item.get("name") or "").strip()
             else:
-                skill_lines.append(f"- {item}")
-        skill_text = "\n".join(skill_lines)
+                # 形如 "chop_tree(count=8)：找树砍木材…"
+                nm = str(item).split("(", 1)[0].strip()
+            if nm:
+                names_seen.add(nm)
+        if names_seen:
+            self._known_skills = names_seen
 
         # 生存顾问：把"真玩家脑子里的清单"摆到 LLM 面前。
         # 没有这一段时，LLM 只能从一段状态简报里猜该干什么——
@@ -1651,6 +1725,89 @@ class LifeLoop:
 
     # ------------------------------------------------------------ 技能知识（Markdown）
 
+    def _skill_is_known(self, name: str) -> bool:
+        """这个技能名在引擎注册表里真的存在吗（B3）。
+
+        **为什么必须校验**：`_set_plan()` / `_parse_decision()` 早期只过滤
+        "非空字符串"，于是模型幻觉出来的技能名会被原样当成技能提交。
+        代价是**整整一轮模型往返**（几秒到几十秒）＋一条失败记录，
+        而失败记录还会把 `_should_back_off()` 的 30 秒退避触发出来——
+        她卡在那儿什么都不做，日志里只看到"没有这个技能：xxx"。
+        实测的现成例子就是 advisor 曾经建议的 `craft`（当时注册表里没有）。
+
+        **拿不到清单时一律放行（返回 True）**：`_known_skills` 为空说明
+        "引擎没起来 / skill.list 失败 / 还没决策过"，此时如果一律判成未知技能，
+        她会**彻底不动**——那比偶尔提交一个坏技能严重得多。
+        所以这里只在"手里有可信清单"时才拦。
+        """
+        known = self._known_skills
+        if not known:
+            return True
+        return str(name).strip() in known
+
+    def note_plan_from_agent(self, steps: list, why: str = "") -> dict:
+        """**agent 留下接下来的几步**（C 批次）。
+
+        为什么要有这个：计划机制本来就在（`_set_plan` + `_pop_plan_step`），
+        但**只有旧路径 `decide()` 会写它**。走 agent 路径时，agent 每轮都返回
+        "我处理了"，于是 `_pop_plan_step()` 永远拿到空计划 ——
+        **计划机制在 agent 可用时是死的**。
+
+        后果就是用户反馈的那句"每次停下来思考的时间太长了"：
+        她每走一步都要过一次模型（实测一次决策最多 6 轮往返）。
+
+        现在 agent 可以用 `mc_plan_do` 留下接下来的几步，
+        循环那边会在下一轮把它装进计划表，**然后就不再调模型**。
+        """
+        cleaned = []
+        unknown = []
+        known = set(self._known_skills or [])
+        for item in steps or []:
+            if isinstance(item, str):
+                item = {"skill": item}
+            if not isinstance(item, dict):
+                continue
+            skill = str(item.get("skill") or item.get("name") or "").strip()
+            if not skill:
+                continue
+            # **fail-open**：拿不到技能清单时（引擎没起来）就放行
+            if known and skill not in known:
+                unknown.append(skill)
+                continue
+            cleaned.append(
+                {
+                    "skill": skill,
+                    "params": dict(item.get("params") or {}),
+                    "why": str(item.get("why") or item.get("reason") or "").strip(),
+                }
+            )
+        if not cleaned:
+            return {
+                "ok": False,
+                "reason": (
+                    f"这几步里没有认得出的技能：{'、'.join(unknown[:5])}"
+                    if unknown
+                    else "没给步骤"
+                ),
+                "known_skills": sorted(known)[:12],
+            }
+        self._pending_plan = cleaned
+        logger.info(
+            "agent 留下了 %d 步计划：%s",
+            len(cleaned),
+            " → ".join(s["skill"] for s in cleaned),
+        )
+        return {
+            "ok": True,
+            "accepted": len(cleaned),
+            "steps": [s["skill"] for s in cleaned],
+            "unknown": unknown,
+            "note": (
+                f"记下了 {len(cleaned)} 步，**下一轮开始我直接按这个做，不再问模型**"
+                "（所以这几步要写具体、能独立跑完）"
+            ),
+        }
+
     def _set_plan(self, plan: list, source: str = "llm") -> None:
         """装入一份有序计划。
 
@@ -1663,6 +1820,15 @@ class LifeLoop:
                 continue
             skill = str(item.get("skill") or "").strip()
             if not skill:
+                continue
+            # 未知技能直接丢掉这一步（B3）：留着只会白烧一轮模型往返 + 记一笔失败
+            if not self._skill_is_known(skill):
+                logger.warning(
+                    "计划里的技能「%s」不在引擎注册表里，丢掉这一步（已知技能 %d 个：%s）",
+                    skill,
+                    len(self._known_skills),
+                    "、".join(sorted(self._known_skills)[:8]) or "（清单为空）",
+                )
                 continue
             cleaned.append(
                 {
@@ -1779,6 +1945,26 @@ class LifeLoop:
             return second
         # 她坚持原选择：尊重她的决定（但失败太多时兜底，避免死循环）
         if n >= 5 and self._last_advice and self._last_advice.skill and self._last_advice.skill != skill:
+            # **顾问的建议也要过技能名白名单**（B3 的补口）。
+            #
+            # 这条路径绕过了 _set_plan / _parse_decision，是当初 `craft`
+            # 被原样提交出去的真实入口之一。顾问是人写的常量表，
+            # 将来照样可能写错一个名字——写错了就会白烧一轮模型往返、
+            # 记一笔失败、再触发 30 秒退避。所以这里同样校验一次。
+            if not self._skill_is_known(self._last_advice.skill):
+                logger.warning(
+                    "生存顾问建议的「%s」不在引擎注册表里，放弃这次兜底（改为不动手）",
+                    self._last_advice.skill,
+                )
+                return LifeDecision(
+                    activity=decision.activity,
+                    drive=decision.drive,
+                    skill=None,
+                    params={},
+                    say=decision.say,
+                    intention=decision.intention,
+                    reason=f"（原本坚持 {skill}，兜底建议的技能名不存在，先不动手）",
+                )
             logger.warning(
                 "「%s」已连续失败 %d 次且她仍坚持，退回生存兜底「%s」以避免死循环",
                 skill,
@@ -1833,6 +2019,12 @@ class LifeLoop:
         # 兼容两种格式：
         #   "plan": [{"skill": "chop_tree", "params": {...}, "why": "..."}, ...]
         #   "skill" + "params"（只做一件事）→ 包成一步的计划
+        #
+        # **每一步的技能名都要校验**（B3）：模型幻觉出来的名字（比如早期的
+        # `craft`、或者它自己编的 `mine_diamond`）会被原样提交给 skill.run，
+        # 换来一句"没有这个技能：xxx"——白烧一轮模型往返，还会记进
+        # `_recent_failures` 触发 30 秒失败退避。未知技能在这里就丢掉，
+        # 并留下一条能定位的日志（模型到底编了什么名字）。
         plan = []
         raw_plan = data.get("plan")
         if isinstance(raw_plan, list):
@@ -1840,6 +2032,9 @@ class LifeLoop:
                 if isinstance(item, dict):
                     s = str(item.get("skill") or "").strip()
                     if not s:
+                        continue
+                    if not self._skill_is_known(s):
+                        logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", s)
                         continue
                     plan.append(
                         {
@@ -1849,9 +2044,16 @@ class LifeLoop:
                         }
                     )
                 elif isinstance(item, str) and item.strip():
-                    plan.append({"skill": item.strip(), "params": {}, "why": ""})
+                    s = item.strip()
+                    if not self._skill_is_known(s):
+                        logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", s)
+                        continue
+                    plan.append({"skill": s, "params": {}, "why": ""})
         if not plan and skill:
-            plan = [{"skill": skill, "params": params, "why": str(data.get("reason") or "").strip()}]
+            if self._skill_is_known(skill):
+                plan = [{"skill": skill, "params": params, "why": str(data.get("reason") or "").strip()}]
+            else:
+                logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", skill)
 
         # 本次决定 = 计划的第一步（立刻执行）；剩下的进队列，由循环逐步执行。
         if plan:
@@ -1894,14 +2096,33 @@ class LifeLoop:
         """
         drive = suggestion.get("drive")
         if advice is not None and advice.skill:
-            return LifeDecision(
-                activity=suggestion.get("activity") or advice.why or "做点该做的事",
-                drive=drive,
-                skill=advice.skill,
-                params=dict(advice.params or {}),
-                say=None,
-                reason=f"（按生存阶段决定的：{advice.stage_label or advice.stage}）",
-            )
+            # **顾问的建议同样要过白名单**（B3 的补口）。
+            #
+            # `advice.skill` 是 advisor.py 里的字面量，而这个函数会把它
+            # **直接当技能名返回**——这正是当初 `craft`（当时注册表里没有）
+            # 被提交给 skill.run 的真实路径：白烧一轮模型往返、
+            # 记一笔失败、触发 30 秒失败退避，而日志里只有一句
+            # "没有这个技能：craft"。
+            #
+            # 顾问写错了名字时：**丢掉这条建议**，往下走本函数本来就有的
+            # "按驱动选一个"兜底（那张表里的技能同样被 check_skill_names 守着）。
+            # 这里不选"直接不动手"，是因为这个函数的设计目的就是
+            # "LLM 不可用时也要让她有事做"，而按驱动选出来的技能是可信的。
+            if not self._skill_is_known(advice.skill):
+                logger.warning(
+                    "生存顾问建议的「%s」不在引擎注册表里（advisor.py 写错了？），"
+                    "丢掉这条建议，退回按驱动选择",
+                    advice.skill,
+                )
+            else:
+                return LifeDecision(
+                    activity=suggestion.get("activity") or advice.why or "做点该做的事",
+                    drive=drive,
+                    skill=advice.skill,
+                    params=dict(advice.params or {}),
+                    say=None,
+                    reason=f"（按生存阶段决定的：{advice.stage_label or advice.stage}）",
+                )
         # 顾问也没建议（比如已定居且什么都不缺）→ 按驱动做点轻松的事
         by_drive = {
             "explore": ("chop_tree", {"count": 4}),

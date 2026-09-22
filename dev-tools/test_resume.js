@@ -17,7 +17,7 @@
  */
 
 const path = require('path');
-const { TaskQueue, PRIORITY } = require(path.join(__dirname, '..', 'goals'));
+const { TaskQueue, PRIORITY } = require(path.join(__dirname, '..', 'engine', 'goals'));
 
 let pass = 0;
 let fail = 0;
@@ -113,7 +113,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       ['skills/gathering.js', /const already = actions\.countItem\(want\)/, 'collect 数当前物品'],
     ];
     for (const [file, re, label] of checks) {
-      const src = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+      const src = fs.readFileSync(path.join(__dirname, '..', 'engine', file), 'utf8');
       ok(`${label}（${file}）`, re.test(src));
     }
   }
@@ -121,7 +121,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('\n=== 逐格放置的技能会跳过已经放好的（blueprint）===');
   {
     const fs = require('fs');
-    const src = fs.readFileSync(path.join(__dirname, '..', 'skills', 'blueprint.js'), 'utf8');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'engine', 'skills', 'blueprint.js'), 'utf8');
     ok(
       'blueprint 有"已经是目标方块就跳过"',
       /cur\.name === cell\.name/.test(src) && /skipped\.push/.test(src),
@@ -265,7 +265,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log('\n=== 抢占次数会露到任务结果里（可见性）===');
   {
     const fs = require('fs');
-    const src = fs.readFileSync(path.join(__dirname, '..', 'bot.js'), 'utf8');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'engine', 'bot.js'), 'utf8');
     ok('task.finished 的载荷里有 preempt_count', /preempt_count: task\.preemptCount/.test(src));
     ok('也带上了是谁抢的', /preempted_by: task\.preemptedBy/.test(src));
   }

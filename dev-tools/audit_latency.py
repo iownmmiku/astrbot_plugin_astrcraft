@@ -23,9 +23,16 @@ import re
 import sys
 import pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
-PLUGIN = ROOT / "plugin"
-BOT = ROOT / "bot"
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+from _paths import ENGINE_DIR, REPO  # noqa: E402
+
+# **仓库根就是插件本体**；Node 引擎在 <repo>/engine/。
+# 历史脚本找的是不存在的 <repo>/plugin/ 和 <repo>/bot/——于是每段都量到 0 字符，
+# 而脚本照样退出 0（"全 0 的成功"是最坏的失败模式，见 main() 末尾的兜底）。
+ROOT = REPO
+PLUGIN = REPO
+BOT = ENGINE_DIR
 
 
 def _read(p: pathlib.Path) -> str:
@@ -41,7 +48,6 @@ def section(name: str, chars: int, note: str = "") -> tuple[str, int]:
 
 
 def main() -> int:
-    sys.path.insert(0, str(ROOT))
     print("=== ① 系统提示（每次往返都发，且理论上应该字节级稳定）===")
     total_sys = 0
 
@@ -51,6 +57,13 @@ def main() -> int:
     action_prompt = action_prompt.replace("{{MAX_STEPS}}", "6")
     _, n = section("ACTION_PROMPT（操作规则）", len(action_prompt))
     total_sys += n
+
+    # **兜底闸门**：量到 0 字符只能说明"这个审计脚本自己找错了地方"，
+    # 绝不能当成"提示词很小、延迟很低"然后退出 0 通过。
+    if not action_prompt:
+        print(f"\n❌ 量不到 ACTION_PROMPT（在 {PLUGIN / 'action_agent.py'} 里没匹配到）。")
+        print("   这是审计脚本自己坏了——0 字符的结论没有意义，退出非零而不是静默通过。")
+        return 1
 
     # 人设/system prompt 来自插件配置，这里量不了；技能表能量
     skills_src = _read(BOT / "skills" / "index.js")
@@ -78,14 +91,27 @@ def main() -> int:
 
     print("\n=== ③ 工具表（62 个工具的 schema，每次往返都发）===")
     tool_files = sorted(PLUGIN.glob("llm_tools_*.py"))
+    if not tool_files:
+        print(f"\n❌ 一个 llm_tools_*.py 都没扫到（找的是 {PLUGIN}）——")
+        print("   检查器自己坏了：工具表 0 字符不是「延迟很低」，退出非零而不是静默通过。")
+        return 1
+
     total_tool_chars = 0
+    total_tool_count = 0
     for p in tool_files:
         src = _read(p)
         # 数 docstring 的长度——schema 里 description 主要来自它
         docs = re.findall(r'"""(.*?)"""', src, re.S)
         n = sum(len(d) for d in docs)
         total_tool_chars += n
-        section(f"  {p.name}", n, f"{len(re.findall(r'@filter.llm_tool', src))} 个工具")
+        count = len(re.findall(r"@filter.llm_tool", src))
+        total_tool_count += count
+        section(f"  {p.name}", n, f"{count} 个工具")
+
+    if total_tool_count == 0:
+        print(f"\n❌ 扫到了 {len(tool_files)} 个 llm_tools_*.py，但里面一个 @filter.llm_tool 都没有——")
+        print("   检查器自己坏了（注册写法变了？），退出非零而不是静默通过。")
+        return 1
 
     print("\n=== ④ 一次决策最多要过几轮模型 ===")
     m = re.search(r"^MAX_STEPS = (\d+)", aa, re.M)
@@ -105,7 +131,7 @@ def main() -> int:
         print(f"  {'✅' if found else '—'} {label}")
 
     print("\n=== 小结 ===")
-    print(f"  · 工具表 description 合计 {total_tool_chars} 字符（每次往返都发）")
+    print(f"  · 工具表 description 合计 {total_tool_chars} 字符（{total_tool_count} 个工具，每次往返都发）")
     print(f"  · ACTION_PROMPT {len(action_prompt)} 字符（每次往返都发，应该缓存命中）")
     print(f"  · 一次决策最多 {steps} 轮模型往返")
     print("  · 用户提示有 8 段（运行期拼），其中 brief/learned/advice 是可变的")

@@ -95,6 +95,62 @@ const SKILLS = {
     },
   },
 
+  /**
+   * 合成一件物品（原语级技能）。
+   *
+   * **为什么必须注册它**：advisor.py 在"手上有煤却没有火把"时会建议
+   * `craft(item="torch", count=8)`，而 SKILLS 注册表里**根本没有 craft**——
+   * 这条建议会被 life.py 的 `_fallback_decision()` 原样当成技能名提交给
+   * `skill.run`，引擎回一句「没有这个技能：craft」，白烧一整轮模型往返，
+   * 还会被记进 `_recent_failures`、进而触发 30 秒失败退避
+   * （见 life.py 的 `_should_back_off`）。
+   *
+   * 引擎里 `actions.craft` 早就写好且很完整（工作台自适应、按"她手上的材料
+   * 能不能推出来"挑配方、异步背包同步的善后），只是**没有暴露成技能**，
+   * 所以除了 LLM 工具 `mc_craft` 之外谁也调不到。
+   *
+   * 与 make_tools 的分工：这个只做**单件**合成（火把/箱子/木棍/某一把镐），
+   * 要"一整套工具 + 自动补材料"用 make_tools。所以**紧挨着 make_tools 放**，
+   * 两个合成类技能在清单里连着。
+   *
+   * （它一度被"故意放在注册表末尾"——因为当时 life.py 的决策提示词只渲染
+   *   技能列表的前 12 项，插中间会把 store_items 等挤出去。P1 改成**全量渲染**
+   *   之后这个理由就不存在了，于是挪回它本来该在的位置。）
+   */
+  craft: {
+    label: '合成物品',
+    description:
+      '合成指定物品（自动处理工作台：随身合成不行就去找一个、没有就做一个放下来）。' +
+      '要火把/箱子/木棍/某一把镐这种**单件**合成用它；要一整套工具用 make_tools',
+    params: {
+      item: { type: 'string', required: true },
+      count: { type: 'number', min: 1, max: 256, def: 1 },
+    },
+    async run({ actions, ctx, params }) {
+      const item = requireParam(params, 'item', { type: 'string' });
+      const count = requireParam(params, 'count', { def: 1 });
+      const r = await actions.craft({ item, count, signal: ctx.signal });
+      // **以真实产出为准**：actions.craft 的 ok 依赖"这次调用前后该物品的增量"，
+      // 而产物可能早已在背包里（增量 0），所以这里看 produced。
+      const produced = Number(r && r.produced) || 0;
+      const ok = produced > 0;
+      const why = (r && r.note) || `合成 ${item} 没有产出`;
+      return skillResult(ok, {
+        steps: [
+          {
+            action: 'craft',
+            ok,
+            detail: `${item}×${produced}${r && r.used_table ? '（用了工作台）' : ''}`,
+          },
+        ],
+        produced: ok ? { [item]: produced } : {},
+        note: ok ? `合成了 ${item}×${produced}` : `没能合成 ${item}：${why}`,
+        reason: ok ? null : why,
+        extra: { item, requested: count, produced, used_table: !!(r && r.used_table) },
+      });
+    },
+  },
+
   mine_ores: {
     label: '挖矿',
     description: '挖指定矿石到指定数量（含工具依赖、向下挖阶梯、安全判断）',
@@ -679,6 +735,7 @@ const SKILLS = {
       });
     },
   },
+
 };
 
 function get(name) {

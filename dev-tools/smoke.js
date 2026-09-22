@@ -40,7 +40,7 @@ function check(name, ok, detail = '') {
 
 class EngineClient {
   constructor() {
-    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+    this.child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, MC_ENGINE_LOG_LEVEL: process.env.MC_ENGINE_LOG_LEVEL || 'warn' },
     });
@@ -186,7 +186,10 @@ async function main() {
       }
     }
     try {
-      const conn = await c.call('connect', { host: HOST, port: PORT, version: VERSION, username: 'AstrBotSmoke' }, 45000);
+      // spawnProtectionRadius: 0 —— 这个测试要在出生点附近挖方块；生产默认是 16（保护出生点），
+      // 不显式关掉的话 dig 会被「出生点保护拦截」拒绝，测试会误报失败。
+      // 本用例是故意挖机器人脚下的方块，几乎必然落在出生点保护范围内。
+      const conn = await c.call('connect', { host: HOST, port: PORT, version: VERSION, username: 'AstrBotSmoke', spawnProtectionRadius: 0 }, 45000);
       check('进服成功', conn.ok === true, `username=${conn.username} version=${conn.version}`);
     } catch (err) {
       connectErr = err;

@@ -1651,7 +1651,23 @@ class McEngine {
       try {
         task.promise
           .then(() => hooks.onDone && hooks.onDone())
-          .catch((err) => hooks.onFailed && hooks.onFailed(err));
+          .catch((err) => {
+            // **被取消 ≠ 失败**（P4）。
+            //
+            // 抢占的语义是"让一让、等下接着做"（见 goals.js 的 Task.requeue）。
+            // 这条 promise 在"被抢占后重排"时**不会结算**，所以正常情况下
+            // 这里根本不会被触发；这一层是**兜底**：万一将来有人又用
+            // cancel() 去实现抢占、或者用户 `/mc急停` 取消了它，
+            // 也不该把"没做成"记成"失败了"——onFailed 的实现基本都带副作用
+            // （计数、降频、退避、甚至 chat 喊一句），误报一次就会让她
+            // 自己把自己降频。
+            const name = err && err.name;
+            if (name === 'CancelledError' || name === 'AbortError') {
+              log.debug(`${task.name} 被取消（不算失败，不调 onFailed）`);
+              return;
+            }
+            if (hooks.onFailed) hooks.onFailed(err);
+          });
       } catch {
         /* 拿不到 promise 就算了，不影响主流程 */
       }
@@ -2040,9 +2056,14 @@ class McEngine {
         auto_defend: !!this.config.get('autoDefend'),
         // 安全相关的设置也报出来：否则"我设了挖掘保护到底生效没有"
         // 在插件侧完全无法确认，只能靠翻引擎日志。
-        dig_blacklist: this.config.get('digBlacklist') || [],
-        dig_whitelist: this.config.get('digWhitelist') || [],
-        spawn_protection_radius: this.config.get('spawnProtectionRadius') || 0,
+        //
+        // 用 `??` 而不是 `||`：**config.get 的值一定存在**（DEFAULTS 兜底），
+        // 所以 `||` 右边是不可达的死代码；更糟的是它会在值"合法但为假"
+        // （比如用户真的把 spawnProtectionRadius 设成 0 = 关闭保护）时
+        // 悄悄换成另一个数——这里报出来的必须是**真实生效值**。
+        dig_blacklist: this.config.get('digBlacklist') ?? [],
+        dig_whitelist: this.config.get('digWhitelist') ?? [],
+        spawn_protection_radius: this.config.get('spawnProtectionRadius') ?? 0,
         skill_timeout_ms: this.config.get('skillTimeoutMs'),
       },
       position: this._pos(),

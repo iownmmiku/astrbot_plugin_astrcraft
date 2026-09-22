@@ -39,11 +39,23 @@ from astrbot.core.agent.message import (
 )
 from astrbot.core.agent.tool import ToolSet
 
-# 允许决策阶段调用的只读工具。
+# 允许决策阶段调用的工具。
 #
 # 为什么是这几个：它们回答的正是"我该干什么"需要知道的事——
 #   我在哪、什么状态、身上有什么、周围有什么、别人在不在、我会什么、我经历过什么。
-# 任何会改变世界的工具都不在这里（那是决定之后的事）。
+# **任何会改变世界的工具都不在这里**（那是决定之后的事）。
+#
+# 后半段这几个（todo_* / load_skill / plan_route）**不改变世界**，
+# 但决策提示词（life.py 的 static_rules）明确让她用它们：
+#   · `mc_todo_write` / `mc_todo_done` —— "清单是**你自己的**，随时可以重写"
+#     （见 life.py 的 write_todos 与 ACTION_PROMPT 里的同一句话）。
+#     设计意图是"清单归她管"，那就得让这条路径上真的有这两个工具。
+#   · `mc_load_skill` —— "遇到多步、容易出错的大事，先读攻略再动手"
+#   · `mc_plan_route` —— "走不通时先看要挖哪几格、要不要垫脚"
+#
+# 早期这三类工具**只写在提示词里、却不在工具集里**：模型照着提示词去调，
+# 结果拿到的是"没有工具 mc_todo_write"。提示词承诺了就必须给得出来，
+# 这条一致性由 dev-tools/check_tool_prompts.py 守住。
 PERCEPTION_TOOLS = (
     "mc_status",       # 位置/血量/饱食/手持/附近实体
     "mc_inventory",    # 背包明细
@@ -52,6 +64,11 @@ PERCEPTION_TOOLS = (
     "mc_skills",       # 我会做的事
     "mc_her_memories", # 我的记忆
     "mc_goal_status",  # 当前长期目标
+    "mc_todo_read",    # 我给自己列的清单（只读）
+    "mc_todo_write",   # 重写清单（改的是她自己的笔记，不动世界）
+    "mc_todo_done",    # 划掉一项
+    "mc_load_skill",   # 读攻略（只读）
+    "mc_plan_route",   # 看路线要挖哪几格（只描述，不改世界）
 )
 
 # 决策阶段的行为约束

@@ -26,9 +26,15 @@ import time
 import pathlib
 import tempfile
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from plugin.memory import (  # noqa: E402
+import _paths  # noqa: E402
+
+# memory.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_memory_ledger")
+
+_paths.load_plugin()
+from astrcraft_plugin.memory import (  # noqa: E402
     MAX_EVIDENCE,
     MemoryEntry,
     MemoryStore,
@@ -163,7 +169,7 @@ print("\n=== 评估窗口从'目标设定那一刻'起算（W5 第二部分）==
 # "第一轮挖到 64/128 那条早滚出窗口，后面几轮评估器咬定'没有挖矿证据'，
 #   把她赶去满世界找矿四分钟。"
 # 我们这边 `_render_recent()` 只给最近 5 条，同样会丢累计证据。
-from plugin.life import LifeLoop  # noqa: E402
+from astrcraft_plugin.life import LifeLoop  # noqa: E402
 
 lp = LifeLoop.__new__(LifeLoop)
 lp._recent_outcomes = []

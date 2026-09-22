@@ -9,9 +9,10 @@
 依赖没装、引擎起不来、事件注册不上。这些都是"重启 AstrBot 才发现"的问题，
 这个脚本把它们提前暴露。
 
-用法：
-  $env:PYTHONPATH='D:\\AstrBot\\backend\\app'
-  D:\\AstrBot\\backend\\python\\python.exe bot\\tools\\dryrun.py
+用法（在仓库根执行；AstrBot 的位置用环境变量给，别写死在脚本里）：
+  $env:ASTRBOT_APP='<AstrBot>/backend/app'
+  $env:ASTRBOT_DATA='<AstrBot>/data'
+  & '<AstrBot>/backend/python/python.exe' dev-tools/dryrun.py
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,11 +30,18 @@ if hasattr(sys.stdout, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parent.parent
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_HERE))
 
-CONFIG_PATH = Path(r"C:\Users\miku\.astrbot\data\config\astrbot_plugin_astrcraft_config.json")
-PLUGIN_DIR = Path(r"C:\Users\miku\.astrbot\data\plugins\astrbot_plugin_astrcraft")
+import _paths  # noqa: E402
+
+# 演练要读**用户机器上真实的**配置与**已安装的**插件副本——位置因机器而异，
+# 所以只从环境变量读，**不写死任何人的家目录**。
+#   $env:ASTRBOT_DATA='<AstrBot>/data'
+_ASTRBOT_DATA = os.environ.get("ASTRBOT_DATA", "").strip()
+ASTRBOT_DATA = Path(_ASTRBOT_DATA).expanduser() if _ASTRBOT_DATA else None
+
+CONFIG_PATH = ASTRBOT_DATA / "config" / "astrbot_plugin_astrcraft_config.json" if ASTRBOT_DATA else None
+PLUGIN_DIR = ASTRBOT_DATA / "plugins" / "astrbot_plugin_astrcraft" if ASTRBOT_DATA else None
 
 problems: list[str] = []
 
@@ -101,9 +110,34 @@ class FakeContext:
 
 
 async def main() -> int:
+    if ASTRBOT_DATA is None:
+        print(
+            "⏭  SKIP：演练要用**真实安装的** AstrBot 配置与插件副本，需要知道它的数据目录。\n"
+            "    环境变量 ASTRBOT_DATA 没设（脚本里不写死任何人的家目录），所以现在无从演练。\n"
+            "    设置后重试：\n"
+            "      $env:ASTRBOT_DATA='<AstrBot>/data'\n"
+            "    它会去读：\n"
+            "      <AstrBot>/data/config/astrbot_plugin_astrcraft_config.json\n"
+            "      <AstrBot>/data/plugins/astrbot_plugin_astrcraft"
+        )
+        sys.exit(0)
+
+    # 插件导入要 astrbot；AstrBot 源码目录只认环境变量 ASTRBOT_APP。
+    _paths.require_astrbot("dryrun")
+    _paths.load_plugin()
+
     print("=== 用真实配置做启动演练 ===\n")
     print(f"配置：{CONFIG_PATH}")
     print(f"插件：{PLUGIN_DIR}\n")
+
+    if not CONFIG_PATH.exists():
+        print(f"❌ 配置文件不存在：{CONFIG_PATH}")
+        print("   （AstrBot 加载插件时会自动生成它；确认 ASTRBOT_DATA 指的是 AstrBot 的 data 目录）")
+        return 2
+    if not PLUGIN_DIR.exists():
+        print(f"❌ 已安装的插件目录不存在：{PLUGIN_DIR}")
+        print("   （先把插件装进 AstrBot，或确认 ASTRBOT_DATA 指的是 AstrBot 的 data 目录）")
+        return 2
 
     # 用 utf-8-sig 读：Windows 上各种工具写 JSON 时常带 BOM，
     # 而 Python 的 utf-8 解码会因为 BOM 直接抛 JSONDecodeError（实测踩过）。

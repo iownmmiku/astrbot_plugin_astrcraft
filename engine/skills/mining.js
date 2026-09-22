@@ -133,6 +133,8 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
                 return true;
               } catch (err) {
                 if (err instanceof CancelledError) throw err;
+                // 同上：白/黑名单拦截是配置层面的拒绝，往上抛才有意义
+                if (err && err.name === 'ProtectedBlockError') throw err;
               }
             }
             return false;
@@ -147,6 +149,15 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
+        // **受保护方块必须往上抛，不能吞掉。**
+        //
+        // 白/黑名单与出生点保护是**配置层面的拒绝**：换个地方、再挖 40 次
+        // 结果都一样。早期这里一律 `return false`，于是 driveUntil 的 lastError
+        // 永远是空的，技能最后报的是"附近没有找到iron"——
+        // 模型完全看不出真正原因（它以为是地形），会一直换个地方再试。
+        // 抛出去之后：driveUntil 记下这条消息、立刻停下，reason 里就是
+        // 「挖掘白名单拦截」那句话。
+        if (err && err.name === 'ProtectedBlockError') throw err;
         log.debug(`挖 ${found.name} 失败：${err.message}`);
         return false;
       }

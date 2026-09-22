@@ -119,6 +119,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 上次尝试进服的时间（监管循环用它做冷却，防止连服抖动）
         self._last_connect_attempt = 0.0
         self._supervise_task: asyncio.Task | None = None
+        # **连续多少次 ping 没有回应**（P2）。见 _supervise_tick：
+        # 进程还在、但事件循环被长任务占住时 ping 会超时——这种情况原来
+        # 循环里**没有任何分支处理**，于是永久空转，而 self.connected 仍是 True，
+        # 用户看到的是"她在服里但什么都不做"。攒够 _engine_ping_fail_limit 次
+        # 就判定假死、强制重启。
+        self._engine_ping_failures = 0
+        self._engine_ping_fail_limit = 3
 
         # ---- 人格 / 记忆 / 过日子
         # 这三块让她"是某个人在玩"，而不是"一个执行任务的机器人"
@@ -342,58 +349,138 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     # ================================================================ 引擎监管
 
     async def _supervise_loop(self):
-        """每 20 秒确认引擎还活着；不在就拉起并尝试恢复游戏连接。"""
+        """每 20 秒确认引擎还活着；不在就拉起并尝试恢复游戏连接。
+
+        真正的一轮逻辑抽在 `_supervise_tick()` 里——**抽出来是为了能测**：
+        这个循环里包着 `await asyncio.sleep(20)`，不抽的话"假死重启"这条路径
+        只能靠真实等 60 秒去验证（`dev-tools/test_engine_supervise.py` 直接调 tick）。
+        """
         while True:
             try:
                 await asyncio.sleep(20)
                 if not self.engine:
                     return
-                if self.engine.running and await self.engine.ping():
-                    # 引擎存活：进一步确认游戏连接是否正常（防止引擎活着但游戏掉线后不重试）。
-                    #
-                    # **必须加冷却**：连接是需要几秒的过程，而 self.connected 在连接完成前一直是
-                    # False。早期这里只看这个标记，于是在连接进行中又触发一次 _auto_connect，
-                    # 新连接会把正在建立的连接踢掉 → 实测日志里出现连续 5 次"已进服"和
-                    # 成对的"主动断开"（连服抖动）。现在同时要求"距上次尝试超过 25 秒"。
-                    if self._cfg("auto_connect", False) and not self.connected:
-                        now = time.time()
-                        if now - self._last_connect_attempt >= 25:
-                            try:
-                                st = await self.engine.status()
-                                if not st.get("connected"):
-                                    await self._auto_connect(reason="监管发现游戏掉线，尝试恢复连接")
-                            except Exception:  # noqa: BLE001
-                                pass
-                    # 顺手把心情推给引擎（情绪表达：动机水位 → 走路节奏）。
-                    # 放在这里是因为它每 20 秒跑一次、而且必然在"引擎活着"时执行，
-                    # 不用另开定时器。
-                    try:
-                        await self.push_mood()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("推送心情失败（不影响其它功能）：%s", exc)
-                    continue
-                if not self.engine.running:
-                    logger.warning("检测到引擎未运行，正在重新拉起")
-                    self.connected = False
-                    # **引擎没了 = ENGINE_DOWN 停牌**（W2）：这时她做不了任何事，
-                    # 而这张表让"她为什么不动"有一个明确的答案，不是安静地站着。
-                    if self.life:
-                        try:
-                            self.life.note_engine_up(False)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("标记引擎停牌失败：%s", exc)
-                    try:
-                        await self.engine.start()
-                        if self.life:
-                            self.life.note_engine_up(True)
-                        if self._cfg("auto_connect", False):
-                            await self._auto_connect(reason="引擎重启后恢复")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("重新拉起引擎失败：%s", exc)
+                await self._supervise_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.error("引擎监管循环异常：%s", exc)
+
+    async def _supervise_tick(self):
+        """监管循环的一轮：探活 → （活着）恢复游戏连接 / （假死）重启 / （没了）拉起。
+
+        ## 为什么要有"假死"这条分支（P2）
+
+        原来的结构是：
+
+            if self.engine.running and await self.engine.ping():  → 处理并 continue
+            if not self.engine.running:                            → 重新拉起
+
+        **ping 失败时两个分支都不进**，循环里没有任何处理 → **永久空转**。
+        而 `self.connected` 还是 True，`/mc状态` 显示"运行中/已连接"，
+        用户看到的是"她在服里但什么都不做"，日志里一行都没有。
+
+        这不是理论风险：`docs/MODULE_MAP.md` 的「同步扫描会冻结整个引擎」一节
+        明确记载长任务会把 Node 事件循环整个占住（期间收不到也回不了任何 RPC），
+        A5 把 `pathThinkTimeoutMs` 从 4000 压到 1800 正是为了减少这种阻塞——
+        **说明这条路径是已知会发生的**。
+
+        现在：连续 `_engine_ping_fail_limit` 次（默认 3 次 × 20 秒 ≈ 60 秒）
+        ping 不回应就判定假死 → 停牌 + 停进程 + 重新拉起 + 按配置重连，
+        每一步都有日志说清发生了什么。
+        """
+        if not self.engine:
+            return
+
+        alive = self.engine.running and await self.engine.ping()
+        if alive:
+            # 探活成功 → 计数清零（"偶发一次超时"不该攒着）
+            self._engine_ping_failures = 0
+            # 引擎存活：进一步确认游戏连接是否正常（防止引擎活着但游戏掉线后不重试）。
+            #
+            # **必须加冷却**：连接是需要几秒的过程，而 self.connected 在连接完成前一直是
+            # False。早期这里只看这个标记，于是在连接进行中又触发一次 _auto_connect，
+            # 新连接会把正在建立的连接踢掉 → 实测日志里出现连续 5 次"已进服"和
+            # 成对的"主动断开"（连服抖动）。现在同时要求"距上次尝试超过 25 秒"。
+            if self._cfg("auto_connect", False) and not self.connected:
+                now = time.time()
+                if now - self._last_connect_attempt >= 25:
+                    try:
+                        st = await self.engine.status()
+                        if not st.get("connected"):
+                            await self._auto_connect(reason="监管发现游戏掉线，尝试恢复连接")
+                    except Exception:  # noqa: BLE001
+                        pass
+            # 顺手把心情推给引擎（情绪表达：动机水位 → 走路节奏）。
+            # 放在这里是因为它每 20 秒跑一次、而且必然在"引擎活着"时执行，
+            # 不用另开定时器。
+            try:
+                await self.push_mood()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("推送心情失败（不影响其它功能）：%s", exc)
+            return
+
+        # 走到这里说明"没探活成功"。下面两条路（假死重启 / 进程没了重启）都会
+        # 报一次"引擎下线"，用这个标记避免报两遍。
+        marked_down = False
+
+        if self.engine.running:
+            # ---- 进程还在，但 ping 没回应 = 疑似假死 ----
+            self._engine_ping_failures += 1
+            limit = int(getattr(self, "_engine_ping_fail_limit", 3) or 3)
+            logger.warning(
+                "引擎进程还在，但 ping 没有回应（连续第 %d/%d 次，约 %d 秒）——"
+                "多半是事件循环被长任务/寻路占住了（见 docs/MODULE_MAP.md 的性能一节）",
+                self._engine_ping_failures,
+                limit,
+                self._engine_ping_failures * 20,
+            )
+            if self._engine_ping_failures < limit:
+                return  # 再给一次机会，别因为一次偶发超时就重启
+            logger.error(
+                "引擎连续 %d 次不响应 ping（约 %d 秒），判定为假死，强制重启",
+                self._engine_ping_failures,
+                self._engine_ping_failures * 20,
+            )
+            self._engine_ping_failures = 0
+            # **必须显式断开连接标记**：假死时 self.connected 还是 True，
+            # 不置 False 的话重启后她会被当成"还在服里"，不会重新进服。
+            self.connected = False
+            if self.life:
+                try:
+                    self.life.note_engine_up(False)
+                    # 记一笔：下面"重新拉起"那段就不要再报一次下线了
+                    # （重复调用虽然无害，但会让停牌日志出现两条一样的，
+                    #   排查时看着像"掉了两次"）。
+                    marked_down = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("标记引擎停牌失败：%s", exc)
+            try:
+                # stop() 会关 stdin、3 秒后强杀——假死的进程只能这样收掉。
+                # 它同时会清掉 _engine_info（P3），所以下面 start() 必须重新等 engine.ready。
+                await self.engine.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("停掉假死的引擎失败（继续尝试重启）：%s", exc)
+
+        if not self.engine.running:
+            logger.warning("检测到引擎未运行，正在重新拉起")
+            self.connected = False
+            # **引擎没了 = ENGINE_DOWN 停牌**（W2）：这时她做不了任何事，
+            # 而这张表让"她为什么不动"有一个明确的答案，不是安静地站着。
+            # （假死分支已经报过一次的话就跳过，别报两遍。）
+            if self.life and not marked_down:
+                try:
+                    self.life.note_engine_up(False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("标记引擎停牌失败：%s", exc)
+            try:
+                await self.engine.start()
+                if self.life:
+                    self.life.note_engine_up(True)
+                if self._cfg("auto_connect", False):
+                    await self._auto_connect(reason="引擎重启后恢复")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("重新拉起引擎失败：%s", exc)
 
     async def _engine_call(self, method: str, params: dict | None = None, *, timeout: float = 30.0):
         """给 GoalManager 用的调用入口（引擎不可用时抛 EngineUnavailable）。"""
@@ -506,7 +593,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         out: dict = {}
 
         whitelist = self._cfg("dig_whitelist", None)
-        if isinstance(whitelist, list) and whitelist:
+        if isinstance(whitelist, list):
+            # **空列表也是有效配置**，必须显式下发（与下面的 dig_blacklist 同理）。
+            #
+            # 早期这里是 `and whitelist`——用户把白名单清空后**什么都没下发**，
+            # 引擎里还留着上一轮的旧值（或引擎自己的 DEFAULTS），
+            # 于是"我明明清空了限制、她却还是挖不动"，而界面上看不出任何异常。
+            # 白名单是安全相关的配置，静默失效尤其危险。
             out["digWhitelist"] = [str(x) for x in whitelist]
 
         blacklist = self._cfg("dig_blacklist", None)
@@ -520,6 +613,15 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 out["spawnProtectionRadius"] = int(radius)
             except (TypeError, ValueError):
                 logger.warning("spawn_protection_radius 不是整数，已忽略：%r", radius)
+
+        # 单次 A* 搜索的同步时间预算（毫秒）。这是"引擎会不会被寻路卡住"的开关，
+        # 不下发的话用户在 WebUI 里改了也不生效（引擎只会用 config.js 的 DEFAULTS）。
+        think_ms = self._cfg("path_think_timeout_ms", None)
+        if think_ms is not None:
+            try:
+                out["pathThinkTimeoutMs"] = int(think_ms)
+            except (TypeError, ValueError):
+                logger.warning("path_think_timeout_ms 不是整数，已忽略：%r", think_ms)
 
         # 自动行为开关（这些是引擎反射层用的，插件侧改完必须下发，
         # 否则用户在 WebUI 里关了也会"看起来没生效"）
@@ -1699,6 +1801,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
         lines = ["【Minecraft 机器人状态】"]
         lines.append(f"引擎：运行中（v{self.engine.engine_info.get('version', '?')}）")
+        # **探活计数要看得见**（P2）：假死时"运行中"这三个字是骗人的——
+        # 引擎进程在、但已经不回任何 RPC。有这一行才排得出来"她为什么不动"。
+        ping_fail = int(getattr(self, "_engine_ping_failures", 0) or 0)
+        ping_limit = int(getattr(self, "_engine_ping_fail_limit", 3) or 3)
+        if ping_fail:
+            lines.append(
+                f"引擎探活：⚠️ 连续 {ping_fail} 次无响应（满 {ping_limit} 次判定假死并强制重启）"
+            )
+        else:
+            lines.append(f"引擎探活：正常（连续无响应 0 次，阈值 {ping_limit} 次）")
         cfg = status.get("config") or {}
         target = f"{cfg.get('host')}:{cfg.get('port')}"
         if status.get("connected"):

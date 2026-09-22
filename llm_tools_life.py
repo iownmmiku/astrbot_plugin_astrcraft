@@ -189,6 +189,50 @@ class McLifeTools:
 
     # ============================================================ 她的任务清单（todo）
 
+    @filter.llm_tool(name="mc_plan_do")
+    async def tool_plan_do(
+        self,
+        event: AstrMessageEvent,
+        steps: str = "",
+        why: str = "",
+    ) -> MessageEventResult:
+        """**把接下来的几步一次交代清楚，然后就不用再一步步问了。**
+
+        这是**省时间**的关键：不写计划时，她每做一步都要停下来想一次
+        （一次"想"要过好几轮模型，所以你看到的就是她老站着不动）。
+        用这个工具一次给出几步之后，她会**按顺序自己做完，中途不再问模型**。
+
+        **什么时候用**：你已经知道接下来该干什么了（比如「砍 4 个原木 → 做工作台 → 做木镐」）。
+        **什么时候别用**：你也不确定下一步该干嘛时（那就先看一眼情况再说）。
+
+        Args:
+            steps(string): 步骤列表，每步一个技能名，用逗号或换行分开。
+                比如 `chop_tree, make_tools` 或 `mine_stone, smelt`。
+                能用的技能名用 mc_skills 查。
+            why(string): 一句话说明为什么这么排（可选，给她自己看的）
+        """
+        if not self.life:
+            yield event.plain_result("过日子系统没启用")
+            return
+        raw = [s.strip() for s in str(steps or "").replace("\n", ",").split(",")]
+        names = [s for s in raw if s]
+        if not names:
+            yield event.plain_result("没给步骤。写法：mc_plan_do(steps=\"chop_tree, make_tools\")")
+            return
+        result = self.life.note_plan_from_agent([{"skill": n} for n in names], why=why)
+        if not result.get("ok"):
+            yield event.plain_result(
+                f"没记下：{result.get('reason')}。"
+                f"能用的技能有：{'、'.join(result.get('known_skills') or [])}"
+            )
+            return
+        yield event.plain_result(
+            f"✅ 记下了 {result['accepted']} 步：{' → '.join(result['steps'])}。"
+            "**她接下来会自己按顺序做完，中途不再问模型。**"
+            + (f"（没认出来的：{'、'.join(result['unknown'])}）" if result.get("unknown") else "")
+        )
+
+
     @filter.llm_tool(name="mc_todo_write")
     async def tool_todo_write(
         self,

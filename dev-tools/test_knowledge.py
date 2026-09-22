@@ -16,11 +16,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
+_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, str(Path(r"D:\AstrBot\backend\app")))
 
-from plugin.knowledge import KnowledgeBase, _similar  # noqa: E402
+import _paths  # noqa: E402
+
+# knowledge.py 顶层 import `astrbot.api` → 没有 AstrBot 运行时就大声 SKIP
+_paths.require_astrbot("test_knowledge")
+
+_paths.load_plugin()
+from astrcraft_plugin.knowledge import KnowledgeBase, _similar  # noqa: E402
 
 passed = 0
 failed = 0
