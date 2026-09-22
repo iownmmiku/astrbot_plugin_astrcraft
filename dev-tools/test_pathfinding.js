@@ -27,7 +27,7 @@ const bad = (m, d = '') => {
   console.log(`  ❌ ${m}${d ? ` — ${d}` : ''}`);
 };
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'warn' },
 });
@@ -221,7 +221,32 @@ async function walkTo(x, z, ms = 60000, range = null) {
   await sleep(1800);
   const st5a = await call('state.get', { detail: 'brief' });
   console.log(`    她掉进坑里，y=${st5a.position.y.toFixed(0)}（台地表面 y=-59）`);
-  r = await walkTo(PX + 10, PZ, 90000);
+  // **在目标前面砌一堵石墙**（这一轮加的）。
+  //
+  // 为什么必须加：这一条的断言是"**走不到时，报错要说清要挖哪几格**"，
+  // 而"走不到"必须**确定发生**。原来只靠"她掉在 3 格坑里"来制造走不到——
+  // 但地形不同的时候她可能自己爬出来、一路平走到目标，于是走的是
+  // "自己走到了"那条分支（也判过），**有时却卡在中间**：
+  // 既没走到、失败信息里又**没有任何"挡路的方块"**（平坦泥土地上没东西挡路），
+  // 于是落进 else 分支报红。实测就是 `failed ... 水平还差 10.5 格`（没有价签）。
+  //
+  // 砌一堵**石头**墙（石头是可挖的，所以报错里应该出现"挡路的…是 stone"）：
+  // 这样"走不到 + 有价签"就是**确定**的，不再取决于地形运气。
+  await rcon.command(
+    `fill ${PX + 6} -60 ${PZ - 6} ${PX + 6} -58 ${PZ + 6} minecraft:stone replace air`,
+  );
+  await sleep(1200);
+  // **`range: 4`，和下面断言的 `d <= 4` 对齐**（同一个原则，见场景 6 的说明）。
+  //
+  // 实测：她在这条路上会停在距目标 **2.74 格**的地方（平坦地面、路是通的），
+  // 而默认判据是 `range: 2 + 0.5 = 2.5` —— **差 0.24 格**，于是报 failed，
+  // 报错里自然也没有"挡路的方块"（路是通的，没东西挡），落进 else 分支报红。
+  // 这条场景要测的是**报错内容**，不是"她能站到多近"；而它自己的成功判据
+  // 本来就是 `d <= 4`。两个阈值不一致会一直红。
+  //
+  // （**另记**：她在平坦地面上也常停在离目标 2~3 格处不往前挪，
+  //   这是寻路本身的收敛问题，不是这条测试的问题 —— 见 docs/OPTIMIZATION_AUDIT.md）
+  r = await walkTo(PX + 10, PZ, 90000, 4);
   st = await call('state.get', { detail: 'brief' });
   d = Math.hypot(st.position.x - (PX + 10), st.position.z - PZ);
   // 断言要按**新架构**来：走路默认不改世界，所以"自己挖出去"不再是要的行为。
