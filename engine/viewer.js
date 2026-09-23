@@ -30,7 +30,29 @@
  */
 
 const EventEmitter = require('events');
-const { WorldView } = require('prismarine-viewer/viewer');
+// **观战窗口的依赖是"可选的"**（见 package.json 的 optionalDependencies）。
+//
+// 为什么：`prismarine-viewer` 连它的传递依赖一共约 316 MB，
+// 而观战窗口**默认是关的**（`enable_viewer: false`）——
+// 不用它的人不该为此多下 300 多 MB。
+//
+// 所以这里**不能**在顶层 require：那样引擎一启动就会因为"模块没装"而崩，
+// 哪怕用户根本不开观战窗口。改成真正要用的时候才加载。
+let WorldView = null;
+function loadViewerDeps() {
+  if (WorldView) return;
+  try {
+    ({ WorldView } = require('prismarine-viewer/viewer'));
+  } catch (err) {
+    throw new Error(
+      '观战窗口需要额外依赖，但它们没装（它们是**可选**的，不装不影响正常使用）。\n' +
+        '要开观战窗口的话，在 engine/ 目录里执行：\n' +
+        '    npm install\n' +
+        '（或者只装这几个：npm install prismarine-viewer express socket.io）\n' +
+        `原始错误：${err.message}`,
+    );
+  }
+}
 
 /** 把 bot 的背包读成 HUD 能直接用的 JSON */
 function readInventory(bot) {
@@ -144,6 +166,7 @@ const HUD_JS = `
  *           我早期误以为没有、说成"关不掉"，这里一并纠正）
  */
 function startViewerServer(bot, { port = 3007, firstPerson = true, viewDistance = 6, prefix = '' } = {}) {
+  loadViewerDeps(); // 依赖没装的话，在这里抛出**说人话**的错误（而不是顶层崩溃）
   const express = require('express');
   const app = express();
   const http = require('http').createServer(app);

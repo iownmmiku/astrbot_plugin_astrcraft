@@ -276,10 +276,17 @@ python dev-tools/run_all.py --full
 cd engine && npm install
 ```
 
-> **关于体积**：`npm install` 会下约 770 MB，其中 `minecraft-data` 占 427 MB
-> （mineflayer 需要全版本数据，躲不掉）、`prismarine-viewer` 占 257 MB
-> （**观战窗口，默认是关的**）。
-> *（把 viewer 改成可选依赖、让不用它的人少下 300 MB —— 这件事**还没做**。）*
+> **关于体积**：完整 `npm install` 约 770 MB —— 其中 `minecraft-data` 占 427 MB
+> （mineflayer 需要全版本数据，躲不掉）。
+>
+> **不用观战窗口的话可以省 300 多 MB**：`prismarine-viewer` / `express` / `socket.io`
+> 已经改成**可选依赖**（观战窗口默认就是关的），所以：
+>
+> ```bash
+> cd engine && npm install --no-optional
+> ```
+>
+> 装了也白装不了 —— 开观战窗口时如果缺依赖，引擎会告诉你**该装什么**，不会静默失败。
 
 ---
 
