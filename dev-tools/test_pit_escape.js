@@ -91,19 +91,21 @@ const bad = (m, d) => {
 /** 造一个 depth 格深的坑，把她放进去 */
 async function makePit(rcon, user, X, depth) {
   const Z = 0;
-  // 地板：从 -64 往上铺实心，保证有底
-  await rcon.command(`fill ${X - 6} -64 ${Z - 6} ${X + 6} -61 ${Z + 6} minecraft:stone`);
+  // **地板要跟着深度往下铺**（第一版写死到 -64，depth=10 时挖穿了地板，
+  // 她直接掉到 y=-88 的虚空里、圆石也摔掉了 —— 测出来全是假的）。
+  const floorBottom = -61 - depth - 6;
+  await rcon.command(`fill ${X - 6} ${floorBottom} ${Z - 6} ${X + 6} -61 ${Z + 6} minecraft:stone`);
   await rcon.command(`fill ${X - 6} -60 ${Z - 6} ${X + 6} -40 ${Z + 6} minecraft:air`);
-  await sleep(1500);
+  await sleep(2000);
   // 在她那一格往下挖 depth 格
   const top = -61; // 站在 -60，支撑在 -61
   await rcon.command(
     `fill ${X} ${top - depth + 1} ${Z} ${X} ${top} ${Z} minecraft:air`,
   );
-  await sleep(1200);
+  await sleep(1500);
   const standY = top - depth + 1; // 坑底：脚站在这里
   await rcon.command(`tp ${user} ${X + 0.5} ${standY} ${Z + 0.5}`);
-  await sleep(2000);
+  await sleep(2500);
   return { X, Z, standY, surfaceY: -60 };
 }
 
@@ -120,8 +122,7 @@ async function runSkill(skill, params, sec = 120) {
   const rcon = Rcon.fromDir(RCON_DIR, 25576);
   const USER = 'Pit' + Math.floor(Math.random() * 9000);
   await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
-  await sleep(6000);
-  console.log('=== 从坑里出来（三种真实情况）===\n');
+  await sleep(6000);  console.log('=== 从坑里出来（三种真实情况）===\n');
 
   // ---------- 情况 1：有方块（应该能垫出来）----------
   console.log('[1] 3 格深的坑 + 背包里有 32 个圆石（没有镐）');
@@ -183,6 +184,45 @@ async function runSkill(skill, params, sec = 120) {
     const up2 = after.position.y - before.position.y;
     if (up2 < 1) ok('确实出不去（符合物理：没工具没方块）', `y 没变`);
     else bad('竟然出来了？那说明有别的路径，要重新理解', `升了 ${up2.toFixed(0)} 格`);
+  }
+
+  // ---------- 情况 4：**真实场景**——挖矿挖出来的深竖井 ----------
+  //
+  // 用户的原话："每次挖矿之后都没法自己回到地面，所以应该是有方块也有镐"
+  //
+  // 所以真正要测的是：**十几格深的 1x1 竖井 + 有镐 + 有圆石**（挖矿的产物）。
+  // 前面那三条都太浅（3 格），盖不到这个情况。
+  console.log('\n[4] 真实场景：10 格深的 1x1 竖井 + 有镐 + 有圆石（挖矿回来的样子）');
+  {
+    const p = await makePit(rcon, USER, 380, 10);
+    await rcon.command(`give ${USER} stone_pickaxe 1`);
+    await rcon.command(`give ${USER} cobblestone 32`);
+    await sleep(1500);
+    await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
+    await sleep(2000);
+    const before = await call('state.get', { detail: 'brief' });
+    console.log(`    起点 y=${before.position.y.toFixed(1)}（地面 y=-60，井深 10）`);
+    // 先试 climb_out（她应该会用它）
+    const r = await runSkill('climb_out', { max_steps: 40 }, 240);
+    const after = await call('state.get', { detail: 'brief' });
+    const up = after.position.y - before.position.y;
+    console.log(`    climb_out → ${r.status} ｜ ${String(r.result.note || r.error || '').slice(0, 90)}`);
+    if (after.position.y >= -60.5) {
+      ok('从 10 格深的竖井里爬回地面了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
+    } else {
+      bad('没能从 10 格深的竖井里出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（只升了 ${up.toFixed(0)} 格）`);
+    }
+    // 再试 pave up（另一条路）
+    if (after.position.y < -60.5) {
+      const r2 = await runSkill('pave', { direction: 'up', count: 12 }, 240);
+      const after2 = await call('state.get', { detail: 'brief' });
+      console.log(`    pave up → ${r2.status} ｜ ${String(r2.result.note || r2.error || '').slice(0, 90)}`);
+      if (after2.position.y >= -60.5) {
+        ok('pave up 能从深井里垫上来', `y ${after.position.y.toFixed(0)} → ${after2.position.y.toFixed(0)}`);
+      } else {
+        bad('pave up 也出不来', `y ${after2.position.y.toFixed(0)}`);
+      }
+    }
   }
 
   rcon.close();

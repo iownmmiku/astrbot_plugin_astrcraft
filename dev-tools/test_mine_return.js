@@ -1,0 +1,136 @@
+'use strict';
+/**
+ * **挖矿之后能不能自己回到地面**（用户实测反馈："每次挖矿之后都没法自己回到地面"）。
+ *
+ * 这个测试只问一件事：**让她挖矿，挖完她在哪？**
+ *   · 在地面（y 接近地表）→ ✅
+ *   · 还在自己挖的竖井里 → ❌ 这就是用户报的问题
+ */
+
+const path = require('path');
+const { spawn } = require('child_process');
+const { Rcon } = require('./lib/rcon');
+
+const PORT = Number(process.env.MC_PORT || 25566);
+const RCON_DIR = process.env.MC_RCON_DIR || path.join(__dirname, '..', '.testserver');
+
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+  stdio: ['pipe', 'pipe', 'pipe'],
+  env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
+});
+let buf = '';
+let id = 1;
+const pending = new Map();
+const finished = [];
+const logs = [];
+child.stdout.setEncoding('utf8');
+child.stdout.on('data', (c) => {
+  buf += c;
+  let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (!line) continue;
+    let m;
+    try {
+      m = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (m.method === 'notice') {
+      const p = m.params || {};
+      if (p.event === 'task.finished') finished.push(p.data || {});
+      continue;
+    }
+    const q = pending.get(m.id);
+    if (q) {
+      pending.delete(m.id);
+      if (m.error) q.reject(new Error(m.error.message));
+      else q.resolve(m.result);
+    }
+  }
+});
+child.stderr.setEncoding('utf8');
+child.stderr.on('data', (c) => logs.push(String(c)));
+
+const call = (method, params = {}, t = 300000) =>
+  new Promise((res, rej) => {
+    const i = id++;
+    const tm = setTimeout(() => rej(new Error('timeout ' + method)), t);
+    pending.set(i, {
+      resolve: (v) => {
+        clearTimeout(tm);
+        res(v);
+      },
+      reject: (e) => {
+        clearTimeout(tm);
+        rej(e);
+      },
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: i, method, params }) + '\n');
+  });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+(async () => {
+  const rcon = Rcon.fromDir(RCON_DIR, 25576);
+  const USER = 'Mine' + Math.floor(Math.random() * 9000);
+  const X = 500;
+  await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
+  await sleep(6000);
+
+  // 造一片实心地面（石头在下面，方便往下挖）
+  await rcon.command(`fill ${X - 10} -70 ${-10} ${X + 10} -61 ${10} minecraft:stone`);
+  await rcon.command(`fill ${X - 10} -60 ${-10} ${X + 10} -40 ${10} minecraft:air`);
+  await sleep(2000);
+  await rcon.command(`give ${USER} stone_pickaxe 1`);
+  await sleep(1200);
+  await rcon.command(`tp ${USER} ${X + 0.5} -60 0.5`);
+  await sleep(2500);
+
+  const st0 = await call('state.get', { detail: 'brief' });
+  console.log(`=== 挖矿之后能不能回地面 ===`);
+  console.log(`  起点：y=${st0.position.y.toFixed(1)}（地表 y=-60），脚下 ${st0.standing_on}`);
+
+  // 让她挖 8 个圆石（会往下挖出竖井）
+  const mark = finished.length;
+  await call('skill.run', { skill: 'mine_stone', params: { want: 8 } }, 60000);
+  for (let i = 0; i < 600 && finished.length === mark; i += 1) await sleep(500);
+  const f = finished[mark];
+  const st1 = await call('state.get', { detail: 'brief' });
+  const y = st1.position.y;
+  console.log(`  任务：${f ? f.status : '?'}`);
+  console.log(`  结果：${String((f && f.result && f.result.note) || (f && f.error) || '').slice(0, 140)}`);
+  console.log(`  挖完她在：y=${y.toFixed(1)}（地表 y=-60）`);
+
+  let pass = 0;
+  let fail = 0;
+  if (y >= -60.5) {
+    pass += 1;
+    console.log('  ✅ 挖完回到地面了');
+  } else {
+    fail += 1;
+    console.log(`  ❌ **还在竖井里**（比地表低 ${(-60 - y).toFixed(0)} 格）—— 这就是用户报的问题`);
+  }
+
+  // 再看她有没有"意识到自己在下面"（结果里应该提到）
+  const note = String((f && f.result && f.result.note) || '');
+  if (/爬回地面|还在地下|爬上去/.test(note)) {
+    pass += 1;
+    console.log('  ✅ 结果里说明了"回地面"这件事');
+  } else {
+    fail += 1;
+    console.log('  ⚠️ 结果里没提"回地面"（她自己和玩家都不知道她还在下面）');
+  }
+
+  rcon.close();
+  await call('disconnect').catch(() => {});
+  await sleep(500);
+  child.kill();
+  await sleep(1500);
+  console.log(`\n=== 结果：${pass} 通过，${fail} 失败 ===`);
+  process.exit(fail > 0 ? 1 : 0);
+})().catch((e) => {
+  console.error('ERR', e.message);
+  child.kill();
+  process.exit(1);
+});

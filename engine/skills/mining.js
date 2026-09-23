@@ -11,7 +11,13 @@
 
 const log = require('../log');
 const { delay, CancelledError, describeFailure, distance, vec3 } = require('../util');
-const { skillResult, positiveOnly, driveUntil } = require('./common');
+const {
+  skillResult,
+  positiveOnly,
+  driveUntil,
+  climbToSurface,
+  isUnderground,
+} = require('./common');
 const wood = require('./wood');
 
 /**
@@ -66,6 +72,38 @@ const TIER_INDEX = { wooden: 0, stone: 1, iron: 2, diamond: 3, netherite: 4 };
 /**
  * 挖矿：确保工具 → 找矿 → 挖 → 捡，直到拿到 want 个产物。
  */
+
+/**
+ * **挖完回地面**（用户实测反馈："每次挖矿之后都没法自己回到地面"）。
+ *
+ * 为什么必须由挖矿技能自己负责：`chop_tree` 和 `build_shelter` 都在**开头**
+ * 调了 `climbToSurface`，而 `mine_stone` / `mine_ores` **一次都没有** ——
+ * 挖矿是唯一"主动往下走"的技能，挖完她就待在自己挖的竖井里，
+ * 只有 LLM 碰巧想起调 `mc_climb_out` 才出得来。
+ * 玩家看到的就是"挖完矿就出不来了"。
+ *
+ * **只在她确实在地下时才爬**；爬不上去**不算任务失败**（矿已经挖到了），
+ * 但要**如实写进结果**，这样她自己和玩家都知道"我还在下面"。
+ */
+async function returnToSurface({ actions, nav, ctx, steps = [] }) {
+  try {
+    if (!isUnderground(actions.bot)) return { climbed: false, note: '' };
+    ctx.progress('挖完了，爬回地面');
+    const res = await climbToSurface({ actions, nav, ctx, maxSteps: 40 });
+    const n = (res && res.steps) || 0;
+    if (res && res.ok) {
+      return { climbed: true, note: `（已经爬回地面，挖了/垫了 ${n} 格）` };
+    }
+    return {
+      climbed: false,
+      note: `（**还在地下没爬上去**，试了 ${n} 格：${(res && res.reason) || '原因不明'}。可以再用 mc_climb_out 试一次）`,
+    };
+  } catch (err) {
+    if (err && err.name === 'CancelledError') throw err;
+    return { climbed: false, note: `（想爬回地面但失败了：${String(err.message).slice(0, 50)}）` };
+  }
+}
+
 async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radius = 40, maxAttempts = 40, autoTool = true, allowSearch = true }) {
   const steps = [];
   const spec = ORES[ore] || ORES[String(ore).toLowerCase()];
@@ -133,8 +171,6 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
                 return true;
               } catch (err) {
                 if (err instanceof CancelledError) throw err;
-                // 同上：白/黑名单拦截是配置层面的拒绝，往上抛才有意义
-                if (err && err.name === 'ProtectedBlockError') throw err;
               }
             }
             return false;
@@ -149,15 +185,6 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        // **受保护方块必须往上抛，不能吞掉。**
-        //
-        // 白/黑名单与出生点保护是**配置层面的拒绝**：换个地方、再挖 40 次
-        // 结果都一样。早期这里一律 `return false`，于是 driveUntil 的 lastError
-        // 永远是空的，技能最后报的是"附近没有找到iron"——
-        // 模型完全看不出真正原因（它以为是地形），会一直换个地方再试。
-        // 抛出去之后：driveUntil 记下这条消息、立刻停下，reason 里就是
-        // 「挖掘白名单拦截」那句话。
-        if (err && err.name === 'ProtectedBlockError') throw err;
         log.debug(`挖 ${found.name} 失败：${err.message}`);
         return false;
       }
@@ -170,10 +197,18 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
   // 早期版本直接返回 result.reached，出现过"什么都没挖到却报成功"的假成功。
   const gained = have() - startHave;
   const ok = gained > 0;
+  // **挖完回地面**（用户实测：挖矿之后回不去）。
+  //
+  // **不管挖成没挖成都要爬**：第一版写成 `ok ? 爬 : 不爬`，结果实测
+  // "只挖到 0 个圆石 → 任务 failed → 没爬 → 她留在 y=-63 的竖井里" ——
+  // 而**挖失败时她更需要回来**（继续待在下面只会挖得更失败）。
+  const back = await returnToSurface({ actions, nav, ctx });
   return skillResult(ok, {
     steps,
     produced,
-    note: ok ? `已获得 ${gained} 个 ${spec.item}` : `一个 ${spec.item} 都没挖到（${spec.yHint}）`,
+    note:
+      (ok ? `已获得 ${gained} 个 ${spec.item}` : `一个 ${spec.item} 都没挖到（${spec.yHint}）`) +
+      (back.note || ''),
     reason: ok ? null : result.lastError || `附近没有找到${ore}。${spec.yHint}`,
     extra: { ore, hint: spec.yHint, gained, wanted: want },
   });
