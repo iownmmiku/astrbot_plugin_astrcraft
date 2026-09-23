@@ -552,10 +552,48 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
       continue;
     }
     // 落脚点必须有支撑：她跳上去要站在 (nx, by+1)，下面是 (nx, by)
-    const support = blockAt(bot, nx, by, nz);
+    //
+    // **没有支撑就先放一块**（这一轮的关键修复，用户"挖矿后回不了地面"的答案）。
+    //
+    // 为什么这是正解：实测挖完矿之后她**不在 1x1 竖井里，而在一个挖宽的洞穴里**
+    // ——周围那一层**四个方向全是空气**，所以"在旁边挖出台阶"这个思路
+    // 前提就不成立（四个方向全被这条判据挡掉了，日志里看得很清楚）。
+    //
+    // 而"垫脚上升"（跳起来往**自己脚下**放）卡在几十毫秒的跳跃窗口里，
+    // 服务端一直回 "the block is still there"。
+    //
+    // **往"旁边"放就没有时序问题**：那一格不归她占，站地上放就行，
+    // 不需要跳、不需要赶时间。放好之后它就成了一个新的落脚点，
+    // 再挖它上面两格、跳上去 —— 一级台阶就成了。
+    let support = blockAt(bot, nx, by, nz);
     if (!support || support.boundingBox !== 'block') {
-      log.info(`挖台阶：(${nx}, ${nz}) 落脚点没有支撑（下面是 ${support ? support.name : 'null'}）`);
-      continue;
+      const filler = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand'].find(
+        (n) => actions.countItem(n) > 0,
+      );
+      if (!filler) {
+        log.info(`挖台阶：(${nx}, ${nz}) 落脚点没支撑，而且背包里没有方块可以垫`);
+        continue;
+      }
+      // 那一格必须真的是空的（不然放不下去）
+      if (support && support.boundingBox !== 'empty' && support.name !== 'air') {
+        log.info(`挖台阶：(${nx}, ${nz}) 落脚点被 ${support.name} 占着，跳过`);
+        continue;
+      }
+      ctx.progress(`先往旁边垫一块（(${nx}, ${by}, ${nz})），造一个落脚点`);
+      try {
+        await actions.place({ x: nx, y: by, z: nz, item: filler, signal: ctx.signal, reach: true });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        log.info(`挖台阶：往 (${nx}, ${by}, ${nz}) 垫 ${filler} 失败：${String(err.message).slice(0, 60)}`);
+        continue;
+      }
+      await delay(200, { signal: ctx.signal });
+      support = blockAt(bot, nx, by, nz);
+      if (!support || support.boundingBox !== 'block') {
+        log.info(`挖台阶：垫了但读不到（(${nx}, ${by}, ${nz}) = ${support ? support.name : 'null'}）`);
+        continue;
+      }
+      log.info(`挖台阶：往旁边垫成功了（(${nx}, ${by}, ${nz}) = ${support.name}），现在有落脚点了`);
     }
 
     ctx.progress(`挖一级台阶上去（往 (${nx}, ${by + 1}, ${nz})）`);
