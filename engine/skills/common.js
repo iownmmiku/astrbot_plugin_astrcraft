@@ -553,7 +553,7 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
         await actions.dig({ x: nx, y, z: nz, signal: ctx.signal, collect: true });
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`挖台阶 (${nx}, ${y}, ${nz}) 失败：${err.message}`);
+        log.info(`挖台阶 (${nx}, ${y}, ${nz}) 失败：${err.message}`);
       }
     }
     // 走过去（pathfinder 会自动跳 1 格台阶）
@@ -562,12 +562,12 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
       await nav.goTo({ x: nx, y: by + 1, z: nz, range: 0.6, signal: ctx.signal, timeoutMs: 12000 });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`走上一级台阶失败：${err.message}`);
+      log.info(`走上一级台阶失败：${err.message}`);
       continue;
     }
     // **验证真的升上去了**（"走完了"不等于"上去了" —— 这个坑踩过很多次）
     if (Math.floor(bot.entity.position.y) > beforeY) return true;
-    log.debug(`挖了台阶但没上去（还在 y=${beforeY}）`);
+    log.info(`挖了台阶但没上去（还在 y=${beforeY}）`);
   }
   return false;
 }
@@ -719,7 +719,7 @@ async function pillarUpOne({ actions, ctx, bx, by, bz }) {
     }
     bot.setControlState('jump', false);
     if (!airborne) {
-      log.debug('垫脚上升：没跳起来（可能头顶被挡），改用别的办法');
+      log.info('垫脚上升：没跳起来（可能头顶被挡），改用别的办法');
       return false;
     }
     // 趁在空中往脚下那格放（reach:false —— 空中不能去寻路）
@@ -728,11 +728,11 @@ async function pillarUpOne({ actions, ctx, bx, by, bz }) {
     // 验证真的站上去了：脚下那块应该是她刚放的那块
     const below = blockAt(bot, bx, by, bz);
     if (below && below.name === block) return true;
-    log.debug(`垫脚上升没成（脚下是 ${below ? below.name : '读不到'}）`);
+    log.info(`垫脚上升没成（脚下是 ${below ? below.name : '读不到'}，放的是 ${block}）`);
     return false;
   } catch (err) {
     if (err instanceof CancelledError) throw err;
-    log.debug(`垫脚上升失败：${err.message}`);
+    log.info(`垫脚上升失败：${err.message}`);
     return false;
   }
 }

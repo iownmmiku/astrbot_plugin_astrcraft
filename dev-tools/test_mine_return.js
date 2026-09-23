@@ -117,6 +117,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log(`  任务：${f ? f.status : '?'}`);
   console.log(`  结果：${String((f && f.result && f.result.note) || (f && f.error) || '').slice(0, 140)}`);
   console.log(`  挖完她在：y=${y.toFixed(1)}（平台面 y=-49）`);
+  // **把爬升相关的日志打出来**（这些原来用 log.debug，默认看不到）
+  const tail = logs.join('');
+  const hits = tail.split('\n').filter((l) => /垫脚|挖台阶|爬|阶梯|侧洞|竖井/.test(l));
+  console.log(`  --- 爬升日志（${hits.length} 行）---`);
+  for (const l of hits.slice(-10)) console.log(`    ${l.trim().slice(0, 130)}`);
+  if (!hits.length) console.log('    （**一行都没有** → 爬升代码根本没跑到）');
 
   // **关键检查：挖到的圆石到底在不在背包里**（这一轮加的）。
   //
