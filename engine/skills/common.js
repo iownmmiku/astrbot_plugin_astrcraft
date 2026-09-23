@@ -678,6 +678,17 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   for (let i = 0; i < maxSteps; i += 1) {
     ctx.checkAborted();
 
+    // **每轮都打一条**（这一轮加的，为了不再靠猜）。
+    // 一次就能看出"是循环提前退出了，还是四个方向都挖不动了" ——
+    // 这两件事的修法完全不同，而之前我分不清。
+    {
+      const pp = bot.entity.position;
+      log.info(
+        `爬升第 ${i + 1}/${maxSteps} 轮：我在 y=${Math.floor(pp.y)}，` +
+          `isUnderground=${isUnderground(bot)}`,
+      );
+    }
+
     // **退出判据**：不再单看"头顶有没有盖"。
     //
     // 试过 `isOpenSky`（上方连着 3 格空气就算出来），**在竖井里是错的** ——
@@ -689,7 +700,10 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     // 于是"地表"变成了洞底、她就不算"在地下"了。
     // 已把那里改成**取最高值 + 取样更远**（见 isUnderground），
     // 所以这里可以放心用回它。
-    if (!isUnderground(bot)) return { ok: true, steps: climbed };
+    if (!isUnderground(bot)) {
+      log.info(`爬升：判为"已经出来"了（第 ${i + 1} 轮，y=${Math.floor(bot.entity.position.y)}，共爬 ${climbed} 格）`);
+      return { ok: true, steps: climbed };
+    }
 
     // 兜底：连续 3 轮高度没变化 → 确实上不去了，别空转到 maxSteps
     const nowY = Math.floor(bot.entity.position.y);
@@ -752,6 +766,9 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     }
 
     if (!advanced) {
+      log.info(
+        `爬升：第 ${i + 1} 轮四个方向都走不通（我在 y=${Math.floor(bot.entity.position.y)}，共爬 ${climbed} 格）`,
+      );
       // **四个方向都挖不出阶梯——这是竖井（1 格宽）的典型情形。**
       //
       // 原来的做法是"原地往上挖两格再跳一下"，那**根本出不去**：
