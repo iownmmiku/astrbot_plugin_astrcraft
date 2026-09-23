@@ -620,16 +620,34 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
     }
     // 走过去（pathfinder 会自动跳 1 格台阶）
     const beforeY = Math.floor(bot.entity.position.y);
+    const t1 = Date.now();
+    log.info(`挖台阶：垫好了，试着走上 (${nx}, ${by + 1}, ${nz})（现在 y=${beforeY}）`);
     try {
-      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 0.6, signal: ctx.signal, timeoutMs: 12000 });
+      const r = await nav.goTo({ x: nx, y: by + 1, z: nz, range: 0.6, signal: ctx.signal, timeoutMs: 5000 });
+      log.info(
+        `挖台阶：goTo 返回 arrived=${r && r.arrived} 用时 ${Date.now() - t1}ms` +
+          `（现在 y=${Math.floor(bot.entity.position.y)}，距离 ${r && r.distance_to_target}）`,
+      );
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.info(`走上一级台阶失败：${err.message}`);
+      log.info(`走上一级台阶失败（用时 ${Date.now() - t1}ms）：${String(err.message).slice(0, 90)}`);
       continue;
     }
-    // **验证真的升上去了**（"走完了"不等于"上去了" —— 这个坑踩过很多次）
-    if (Math.floor(bot.entity.position.y) > beforeY) return true;
-    log.info(`挖了台阶但没上去（还在 y=${beforeY}）`);
+    // **验证真的站在目标高度上了**（这一轮找到的最后一层）。
+    //
+    // 原来的判据是 `afterY > beforeY`（比走之前高）—— 而实测发现：
+    // **上一个方向其实已经把她送上去了**，只是她"升上去"发生在
+    // `goTo` 返回之后的一瞬间，于是这次检查看到的是旧高度 → 判"没上去"
+    // → 去试下一个方向；而那时她已经站在目标高度了，`goTo` 立刻返回
+    // `arrived=true`（"我已经在那了"）→ 又判"没上去"……
+    // **四个方向全被判失败**，日志里就是连续四条 arrived=true 却全 return false。
+    //
+    // 正确的判据是**"她在不在目标那一层"**，而不是"她比刚才高了没有"：
+    // 到目标层就算成功（哪怕是被上一个方向送上去的）。
+    await delay(250, { signal: ctx.signal }); // 等她落定（刚跳上去那几帧位置还在抖）
+    const afterY = Math.floor(bot.entity.position.y);
+    if (afterY >= by + 1) return true;
+    log.info(`挖了台阶但没上去（还在 y=${afterY}，目标是 ${by + 1}）`);
   }
   return false;
 }
