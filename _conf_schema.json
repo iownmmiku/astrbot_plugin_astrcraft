@@ -1,19 +1,19 @@
 {
   "engine_dir": {
     "type": "string",
-    "description": "Minecraft 引擎（bot 目录）的路径。留空则使用插件目录同级的 bot/",
+    "description": "【必填】Minecraft 引擎（bot 目录）的路径。留空则使用插件目录同级的 bot/",
     "default": "",
     "hint": "引擎是 Node 子进程，目录里需要有 index.js 和 node_modules（在 bot 目录执行过 npm install）"
   },
   "node_path": {
     "type": "string",
-    "description": "node 可执行文件路径。留空自动探测",
+    "description": "【必填】node 可执行文件路径。留空自动探测",
     "default": "",
     "hint": "Windows 常见位置：C:\\\\Program Files\\\\nodejs\\\\node.exe"
   },
   "engine_log_level": {
     "type": "string",
-    "description": "引擎日志级别",
+    "description": "【超时/性能】引擎日志级别",
     "default": "info",
     "options": [
       "error",
@@ -24,27 +24,27 @@
   },
   "server_host": {
     "type": "string",
-    "description": "Minecraft 服务器地址",
+    "description": "【必填 · 最少只要改这几项】Minecraft 服务器地址",
     "default": "127.0.0.1"
   },
   "server_port": {
     "type": "int",
-    "description": "Minecraft 服务器端口",
+    "description": "【必填 · 最少只要改这几项】Minecraft 服务器端口",
     "default": 25565
   },
   "bot_username": {
     "type": "string",
-    "description": "机器人游戏内名字（离线账号，1-16 字符）",
+    "description": "【必填】机器人游戏内名字（离线账号，1-16 字符）",
     "default": "AstrBot"
   },
   "mc_version": {
     "type": "string",
-    "description": "目标服务器版本（必须与服务器一致，不会自动探测）",
+    "description": "【必填】目标服务器版本（必须与服务器一致，不会自动探测）",
     "default": "1.20.1"
   },
   "auth_method": {
     "type": "string",
-    "description": "登录方式。offline 只能进 online-mode=false 的服务器；microsoft 需要额外配置 prismarine-auth",
+    "description": "【必填】登录方式。offline 只能进 online-mode=false 的服务器；microsoft 需要额外配置 prismarine-auth",
     "default": "offline",
     "options": [
       "offline",
@@ -53,137 +53,137 @@
   },
   "auto_connect": {
     "type": "bool",
-    "description": "插件加载后自动让机器人进服。**默认关闭**：第一次装好时请先填好服务器地址、再打开这个开关（或用 mc进服 指令手动进）",
+    "description": "【常用】插件加载后自动让机器人进服。**默认关闭**：第一次装好时请先填好服务器地址、再打开这个开关（或用 mc进服 指令手动进）",
     "default": false
   },
   "reply_in_game": {
     "type": "bool",
-    "description": "游戏内聊天提到机器人名字时，用 LLM 自动回话",
+    "description": "【常用】游戏内聊天提到机器人名字时，用 LLM 自动回话",
     "default": true
   },
   "wake_words": {
     "type": "list",
-    "description": "游戏内聊天触发回复的唤醒词（机器人名字始终有效）",
+    "description": "【常用】游戏内聊天触发回复的唤醒词（机器人名字始终有效）",
     "default": []
   },
   "persona": {
     "type": "string",
-    "description": "自定义人格描述（仅当读不到 AstrBot 人格库时的兜底；正常情况请直接在 AstrBot 里配人格）",
+    "description": "【常用】自定义人格描述（仅当读不到 AstrBot 人格库时的兜底；正常情况请直接在 AstrBot 里配人格）",
     "default": ""
   },
   "mc_persona_id": {
     "type": "string",
-    "description": "指定她在 MC 里用哪个人格（填 AstrBot 的人格 ID，留空=用 AstrBot 默认人格）。也可用 /mc人格 <名字> 随时切换",
+    "description": "【常用】指定她在 MC 里用哪个人格（填 AstrBot 的人格 ID，留空=用 AstrBot 默认人格）。也可用 /mc人格 <名字> 随时切换",
     "default": ""
   },
   "enable_life_loop": {
     "type": "bool",
-    "description": "让她自己过日子：没人派活时自己决定做什么（挖矿、盖房、散步、找人聊天）",
+    "description": "【常用】让她自己过日子：没人派活时自己决定做什么（挖矿、盖房、散步、找人聊天）",
     "default": true
   },
   "life_decide_interval": {
     "type": "int",
-    "description": "空闲时最多多少秒想一次「接下来干嘛」。任务一结束会立刻唤醒她，所以这只是上限；调小=动作更连贯（默认 20）",
+    "description": "【常用】空闲时最多多少秒想一次「接下来干嘛」。任务一结束会立刻唤醒她，所以这只是上限；调小=动作更连贯（默认 20）",
     "default": 20
   },
   "life_min_decide_gap": {
     "type": "int",
     "default": 6,
-    "description": "**两次决策之间的最小间隔（秒）**。她的自主决策会被\"任务完成\"立刻唤醒，而模型用短动作干活时这会导致**每几秒就改一次主意**——玩家看到的就是\"她一直在乱走\"。这个下限让一个打算至少能连续执行几步。长任务不受影响（在跑的时候不会重新决策）"
+    "description": "【超时/性能】**两次决策之间的最小间隔（秒）**。她的自主决策会被\"任务完成\"立刻唤醒，而模型用短动作干活时这会导致**每几秒就改一次主意**——玩家看到的就是\"她一直在乱走\"。这个下限让一个打算至少能连续执行几步。长任务不受影响（在跑的时候不会重新决策）"
   },
   "life_share_cooldown": {
     "type": "int",
-    "description": "她主动分享见闻的最小间隔（秒）。发现钻石、死亡这类大事不受此限制",
+    "description": "【超时/性能】她主动分享见闻的最小间隔（秒）。发现钻石、死亡这类大事不受此限制",
     "default": 600
   },
   "remember_experiences": {
     "type": "bool",
-    "description": "记录她的经历（去过哪、见过什么、和谁聊过），让她有连续的记忆",
+    "description": "【行为】记录她的经历（去过哪、见过什么、和谁聊过），让她有连续的记忆",
     "default": true
   },
   "enable_llm_planner": {
     "type": "bool",
-    "description": "允许 LLM 把说不上来的目标拆成技能步骤（模板匹配失败时兜底）",
+    "description": "【行为】允许 LLM 把说不上来的目标拆成技能步骤（模板匹配失败时兜底）",
     "default": true
   },
   "forward_engine_events": {
     "type": "bool",
-    "description": "把引擎事件记录到插件事件缓冲（/mc调试 可查）",
+    "description": "【超时/性能】把引擎事件记录到插件事件缓冲（/mc调试 可查）",
     "default": true
   },
   "auto_mode": {
     "type": "bool",
-    "description": "允许自主层行动（关掉后只响应明确指令）",
+    "description": "【行为】允许自主层行动（关掉后只响应明确指令）",
     "default": true
   },
   "in_game_actions": {
     "type": "bool",
-    "description": "游戏内聊天可以驱动动作：玩家在游戏里让她砍树/跟随/挖矿，她真的会去做。关掉则游戏内只聊天不动手",
+    "description": "【常用】游戏内聊天可以驱动动作：玩家在游戏里让她砍树/跟随/挖矿，她真的会去做。关掉则游戏内只聊天不动手",
     "default": true
   },
   "in_game_llm_timeout": {
     "type": "int",
-    "description": "游戏内对话的 LLM 超时（秒）。模型太慢时超时会退回纯文字回复，不会一直卡着",
+    "description": "【超时/性能】游戏内对话的 LLM 超时（秒）。模型太慢时超时会退回纯文字回复，不会一直卡着",
     "default": 120
   },
   "announce_task_done": {
     "type": "bool",
-    "description": "技能任务做完后在游戏里播报结果（「砍完了，拿到 8 个木头」）。关掉则只在 QQ 侧可见",
+    "description": "【行为】技能任务做完后在游戏里播报结果（「砍完了，拿到 8 个木头」）。关掉则只在 QQ 侧可见",
     "default": true
   },
   "auto_eat": {
     "type": "bool",
-    "description": "饿了自动进食",
+    "description": "【行为】饿了自动进食",
     "default": true
   },
   "auto_defend": {
     "type": "bool",
-    "description": "被敌对生物近身时自动反击",
+    "description": "【行为】被敌对生物近身时自动反击",
     "default": true
   },
   "auto_collect_drops": {
     "type": "bool",
-    "description": "自动捡起附近的掉落物（真人不会把挖到的东西留在地上）",
+    "description": "【行为】自动捡起附近的掉落物（真人不会把挖到的东西留在地上）",
     "default": true
   },
   "auto_torch": {
     "type": "bool",
-    "description": "太黑时自动插火把照明（也能防止怪物贴脸刷新）",
+    "description": "【行为】太黑时自动插火把照明（也能防止怪物贴脸刷新）",
     "default": true
   },
   "humanize": {
     "type": "bool",
-    "description": "拟人化动作：渐进转头、走路轻微扫视、变速行走、偶尔停顿环顾、空闲时东张西望。只影响观感，不改变决策与安全性；关掉动作更机械但略快",
+    "description": "【行为】拟人化动作：渐进转头、走路轻微扫视、变速行走、偶尔停顿环顾、空闲时东张西望。只影响观感，不改变决策与安全性；关掉动作更机械但略快",
     "default": true
   },
   "enable_viewer": {
     "type": "bool",
     "default": false,
-    "description": "**观战窗口**：打开后可以用浏览器以**她的第一视角**看她在干什么（只读，你不能操作她）。开启后进服时会自动起一个本地网页服务，浏览器打开 http://127.0.0.1:<观战端口> 即可。需要引擎里装过 prismarine-viewer（npm install 已包含）"
+    "description": "【观战窗口】**观战窗口**：打开后可以用浏览器以**她的第一视角**看她在干什么（只读，你不能操作她）。开启后进服时会自动起一个本地网页服务，浏览器打开 http://127.0.0.1:<观战端口> 即可。需要引擎里装过 prismarine-viewer（npm install 已包含）"
   },
   "viewer_port": {
     "type": "int",
     "default": 3007,
-    "description": "观战页面的端口。浏览器打开 http://127.0.0.1:这个端口 就能看她"
+    "description": "【观战窗口】观战页面的端口。浏览器打开 http://127.0.0.1:这个端口 就能看她"
   },
   "viewer_first_person": {
     "type": "bool",
     "default": true,
-    "description": "观战用第一视角（她的眼睛）。关掉则从斜上方俯视她"
+    "description": "【观战窗口】观战用第一视角（她的眼睛）。关掉则从斜上方俯视她"
   },
   "viewer_view_distance": {
     "type": "int",
     "default": 6,
-    "description": "观战渲染多远（区块）。越大越吃 CPU/内存，6 够看"
+    "description": "【观战窗口】观战渲染多远（区块）。越大越吃 CPU/内存，6 够看"
   },
   "slow_mode": {
     "type": "bool",
-    "description": "反作弊保守模式：移动更慢、关闭跑酷、跳跃更少。**进带反作弊插件的服务器（Grim / Vulcan / 严格 NCP）请打开**，否则可能被踢或误判",
+    "description": "【行为】反作弊保守模式：移动更慢、关闭跑酷、跳跃更少。**进带反作弊插件的服务器（Grim / Vulcan / 严格 NCP）请打开**，否则可能被踢或误判",
     "default": false
   },
   "dig_whitelist": {
     "type": "list",
-    "description": "允许挖掘的方块白名单。**留空 = 机器人可以挖掉你世界里任何方块（基岩等已在黑名单里除外）**。想保护建筑/领地就填上允许的方块名。默认值 = 原版生存常用方块（石头类 + 各种木头 + **全部矿石**），也就是内置技能（砍树/挖矿/挖石头）真正会去挖的那些；**默认值里没有的方块一律挖不动**，被拦下时引擎会明确回一句「挖掘白名单拦截」",
+    "description": "【安全】允许挖掘的方块白名单。**留空 = 机器人可以挖掉你世界里任何方块（基岩等已在黑名单里除外）**。想保护建筑/领地就填上允许的方块名。默认值 = 原版生存常用方块（石头类 + 各种木头 + **全部矿石**），也就是内置技能（砍树/挖矿/挖石头）真正会去挖的那些；**默认值里没有的方块一律挖不动**，被拦下时引擎会明确回一句「挖掘白名单拦截」",
     "default": [
       "stone",
       "cobblestone",
@@ -237,7 +237,7 @@
   },
   "dig_blacklist": {
     "type": "list",
-    "description": "禁止挖掘的方块。**默认这 5 项**（基岩 / 屏障 / 三种命令方块）与 engine/config.js 的 DEFAULTS.digBlacklist 一致；清空 = 不额外禁止",
+    "description": "【安全】禁止挖掘的方块。**默认这 5 项**（基岩 / 屏障 / 三种命令方块）与 engine/config.js 的 DEFAULTS.digBlacklist 一致；清空 = 不额外禁止",
     "default": [
       "bedrock",
       "barrier",
@@ -248,17 +248,17 @@
   },
   "spawn_protection_radius": {
     "type": "int",
-    "description": "出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作。**默认 16**：出生点通常是玩家建筑最密的地方。这一项必须与 engine/config.js 的 DEFAULTS.spawnProtectionRadius 一致（由 dev-tools/test_config_parity.py 守住）",
+    "description": "【安全】出生点保护半径（格）。大于 0 时，半径内不进行破坏性动作。**默认 16**：出生点通常是玩家建筑最密的地方。这一项必须与 engine/config.js 的 DEFAULTS.spawnProtectionRadius 一致（由 dev-tools/test_config_parity.py 守住）",
     "default": 16
   },
   "path_think_timeout_ms": {
     "type": "int",
-    "description": "**单次 A* 寻路搜索的同步时间预算（毫秒）**。搜索期间引擎的事件循环会被完全占住——这个值给多大，就可能卡多久（卡住时你既问不到她的状态、也喊不停她）。**默认 1800**：实测真实服务器上出现过事件循环被阻塞 9.3 秒（86 次里 50 次超过 6 秒），触发者是空闲期的自动捡东西/自动插火把这类反射。远距离走不通由分段寻路兜底，所以不需要把它调大。**不要**与 skill_timeout_seconds（允许走多久）混为一谈",
+    "description": "【超时/性能】**单次 A* 寻路搜索的同步时间预算（毫秒）**。搜索期间引擎的事件循环会被完全占住——这个值给多大，就可能卡多久（卡住时你既问不到她的状态、也喊不停她）。**默认 1800**：实测真实服务器上出现过事件循环被阻塞 9.3 秒（86 次里 50 次超过 6 秒），触发者是空闲期的自动捡东西/自动插火把这类反射。远距离走不通由分段寻路兜底，所以不需要把它调大。**不要**与 skill_timeout_seconds（允许走多久）混为一谈",
     "default": 1800
   },
   "skill_timeout_seconds": {
     "type": "int",
-    "description": "单个技能的最长执行时间（秒）。超过就中止并如实报告（会下发给引擎）",
+    "description": "【超时/性能】单个技能的最长执行时间（秒）。超过就中止并如实报告（会下发给引擎）",
     "default": 300
   }
 }
