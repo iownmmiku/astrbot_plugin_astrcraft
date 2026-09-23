@@ -455,21 +455,32 @@ function isUnderground(bot) {
   // ① 有天花板
   if (solid(blockAt(bot, bx, by + 2, bz)) && solid(blockAt(bot, bx, by + 3, bz))) return true;
   // ② 比周围地面低（竖井/坑/矿洞）
-  let higher = 0;
+  // **采样要更远，而且要取"最高值"**（这一轮修的关键）。
+  //
+  // 原来只采 ±6 格、要求"四个方向里至少三个比她高" —— 而**挖矿挖出来的是宽洞**：
+  // ±6 格以内也都被挖空了，于是"周围地面"变成了洞底、她就不算"在地下"，
+  // 爬升提前结束。实测症状："爬到 -52 就停了，而平台在 -49"。
+  //
+  // 现在采三圈（±6 / ±12 / ±20），这样**宽洞外面那圈没被动过的地面**也能采到；
+  // 判据改成"**附近最高的一处地面**比她高 2 格以上 → 她还在下面"。
+  // 语义上也更对：只要附近还有比她高的地面，她就还没回到地表。
   let sampled = 0;
-  for (const [dx, dz] of [
-    [6, 0],
-    [-6, 0],
-    [0, 6],
-    [0, -6],
-  ]) {
-    const surf = surfaceHeightAt(bot, bx + dx, bz + dz, by);
-    if (surf === null) continue;
-    sampled += 1;
-    if (surf >= by + 2) higher += 1;
+  let maxSurf = null;
+  for (const r of [6, 12, 20]) {
+    for (const [dx, dz] of [
+      [r, 0],
+      [-r, 0],
+      [0, r],
+      [0, -r],
+    ]) {
+      const surf = surfaceHeightAt(bot, bx + dx, bz + dz, by);
+      if (surf === null) continue;
+      sampled += 1;
+      if (maxSurf === null || surf > maxSurf) maxSurf = surf;
+    }
   }
-  // 四个方向里至少三个方向的地面都比她高 2 格以上 → 她在坑里
-  return sampled >= 3 && higher >= 3;
+  if (sampled === 0 || maxSurf === null) return false;
+  return maxSurf >= by + 2;
 }
 
 /**
@@ -623,6 +634,30 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
   return false;
 }
 
+/**
+ * **头顶是不是真的开了**（= 已经回到地面/露天）。
+ *
+ * 为什么不能用 `isUnderground` 判"爬出来了"：那个函数看的是
+ * "周围 ±6 格的中位地表高度"，而**在挖宽的洞穴里那个"地表"是洞底** ——
+ * 于是她刚往上爬一两格就被判"不在地下了"，爬升提前结束。
+ * 实测症状："爬到 -52 就停了，而平台在 -49"。
+ *
+ * 这个判据直接问"我头顶有没有盖"：上方连着 `need` 格都是空气 → 露天了。
+ * 在竖井、宽洞、天然矿洞里都成立。
+ */
+function isOpenSky(bot, need = 3) {
+  const p = bot.entity.position;
+  const bx = Math.floor(p.x);
+  const by = Math.floor(p.y);
+  const bz = Math.floor(p.z);
+  for (let i = 1; i <= need; i += 1) {
+    const b = blockAt(bot, bx, by + i + 1, bz);
+    if (!b) return false; // 读不到就别乱判
+    if (b.boundingBox === 'block') return false;
+  }
+  return true;
+}
+
 async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   const bot = actions.bot;
   if (!isUnderground(bot)) return { ok: true, steps: 0, already: true };
@@ -634,10 +669,40 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     [0, -1],
   ];
   let climbed = 0;
+  // **连续"一级都没升上去"的次数**（这一轮加的）。
+  //
+  // 用来判"确实上不去了"，而不是靠 `isUnderground` 猜 —— 见下面的说明。
+  let stalledRounds = 0;
+  let lastY = Math.floor(bot.entity.position.y);
 
   for (let i = 0; i < maxSteps; i += 1) {
     ctx.checkAborted();
+
+    // **退出判据**：不再单看"头顶有没有盖"。
+    //
+    // 试过 `isOpenSky`（上方连着 3 格空气就算出来），**在竖井里是错的** ——
+    // 竖井本身就是一根通天的空气柱，于是她刚起步就被判"已经出来了"，
+    // 实测直接报"已经爬回地面，挖了/垫了 0 格"，而她还在 -59。
+    //
+    // 真正的问题是 `isUnderground` 里"地表"的定义：
+    // 它取周围 ±6 格的**中位数**，而**挖宽的洞穴里 ±6 格也都被挖空了**，
+    // 于是"地表"变成了洞底、她就不算"在地下"了。
+    // 已把那里改成**取最高值 + 取样更远**（见 isUnderground），
+    // 所以这里可以放心用回它。
     if (!isUnderground(bot)) return { ok: true, steps: climbed };
+
+    // 兜底：连续 3 轮高度没变化 → 确实上不去了，别空转到 maxSteps
+    const nowY = Math.floor(bot.entity.position.y);
+    if (nowY > lastY) {
+      stalledRounds = 0;
+      lastY = nowY;
+    } else {
+      stalledRounds += 1;
+      if (stalledRounds >= 3) {
+        log.info(`爬升停滞（连续 3 轮都在 y=${nowY}），停下`);
+        return { ok: false, steps: climbed, reason: `连着 3 轮都没能再往上（卡在 y=${nowY}）` };
+      }
+    }
 
     const p = bot.entity.position;
     const bx = Math.floor(p.x);
