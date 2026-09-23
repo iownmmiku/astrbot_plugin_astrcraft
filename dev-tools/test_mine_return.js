@@ -92,7 +92,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await sleep(2000);
   const r1 = await rcon.command(`fill ${X - 10} -64 -10 ${X + 10} -50 10 minecraft:stone`);
   const r2 = await rcon.command(`fill ${X - 10} -49 -10 ${X + 10} -30 10 minecraft:air`);
-  console.log(`  铺平台：${String(r1).slice(0, 40)} / ${String(r2).slice(0, 40)}`);
+  // **底层要铺基岩**（这一轮修的）。
+  //
+  // 踩过：第一版直接 `fill -64..-50 stone` —— 它把超平坦世界的**基岩(-64)替换成了石头**，
+  // 而**石头是可挖的**，于是她能一路挖穿、**掉进 -64 以下的虚空**（实测掉到 -76 / -88）。
+  // 那看起来像"爬坑失败"，其实是**测试场景不真实**：
+  // 真实世界里挖矿下面还是石头和矿，不会是虚空。
+  const r3 = await rcon.command(`fill ${X - 10} -64 -10 ${X + 10} -64 10 minecraft:bedrock`);
+  console.log(`  铺平台：${String(r1).slice(0, 34)} / ${String(r2).slice(0, 34)} / ${String(r3).slice(0, 34)}`);
   await sleep(2500);
   await rcon.command(`give ${USER} stone_pickaxe 1`);
   await sleep(1200);
