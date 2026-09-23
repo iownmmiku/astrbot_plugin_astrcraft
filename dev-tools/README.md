@@ -1,5 +1,7 @@
 # dev-tools
 
+> 路径与导入约定见 [../docs/REPO.md](../docs/REPO.md)。
+
 ## **先看这个：一条命令跑全部检查**
 
 ```bash
