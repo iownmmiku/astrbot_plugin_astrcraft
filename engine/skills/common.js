@@ -700,12 +700,62 @@ async function pillarUpOne({ actions, ctx, bx, by, bz }) {
   const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
   const block = CANDIDATES.find((n) => actions.countItem(n) > 0);
   if (!block) return false;
+
+  // **用她"现在"的位置，不要用调用方传进来的快照**（这一轮找到的根因）。
+  //
+  // 踩过：调用方（`climbToSurface`）在每轮迭代开头算一次 `by = Math.floor(p.y)`，
+  // 而**那一轮里她可能又往下掉了**（挖矿挖掉自己脚下那块、或者刚被 tp 到半空）。
+  // 于是 `by` 变成过期值 —— 实测报错里目标格是 `(501, -53, 0)`，
+  // 而她人已经在 **-55**：等于**往她头顶上方放**，那里还是石头，
+  // 服务端回 "the block is still there"。
+  //
+  // 判据：**必须站在实地上才能跳**（在下落时 `jump` 无效、
+  // 而且 `p.y - by` 是负的，那个"离地 0.7 格"永远不成立）。
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000) {
+      if (bot.entity && bot.entity.onGround) break;
+      await delay(100, { signal: ctx.signal });
+    }
+    if (!bot.entity.onGround) {
+      log.info('垫脚上升：等了 4 秒还没落地，这次跳过');
+      return false;
+    }
+  }
+  const now = bot.entity.position;
+  const nbx = Math.floor(now.x);
+  const nby = Math.floor(now.y);
+  const nbz = Math.floor(now.z);
+  if (nbx !== bx || nby !== by || nbz !== bz) {
+    log.info(
+      `垫脚上升：位置变了（调用方给的是 ${bx},${by},${bz}，她现在在 ${nbx},${nby},${nbz}）——按现在的算`,
+    );
+  }
+  bx = nbx;
+  by = nby;
+  bz = nbz;
+
   try {
     // **跳起来，然后等"她真的离地了"再放。**
     //
     // 踩过：只 `jump` 130ms 就放，那时她还在原地 —— 服务端直接拒
     // （"Server refused to place: the block is still…"），因为那一格被她自己占着。
     // 真人的手法是**跳到最高点附近**放，这时身体已经离开那一格了。
+    //
+    // **起跳前先瞄准正下方**（这一轮加的，用户实测"挖矿后回不了地面"的修复）。
+    //
+    // 为什么必须预瞄：`actions.place` 内部会 `lookAt`（force）—— 那是一次**网络往返**。
+    // 而 MC 的跳跃全程只有约 0.5 秒、最高点在 ~0.25 秒；等"离地 0.7 格"的判据满足时
+    // 已经过去 ~150ms，再花一次往返去转头，**包发出去时她已经落回那一格了**。
+    // 实测报错正是这个：
+    //   Server refused to place cobblestone at (498, -53, 0): the block is still…
+    // 预先瞄准之后，`place` 里的 `lookAt` 发现"已经朝着那了"，**瞬间返回**，
+    // 于是包能早 100~200ms 发出去，落在窗口里。
+    try {
+      await bot.lookAt(vec3(bx + 0.5, by + 0.5, bz + 0.5), true);
+    } catch {
+      /* 瞄不准也继续试 */
+    }
     bot.setControlState('jump', true);
     let airborne = false;
     for (let i = 0; i < 12; i += 1) {
@@ -723,7 +773,21 @@ async function pillarUpOne({ actions, ctx, bx, by, bz }) {
       return false;
     }
     // 趁在空中往脚下那格放（reach:false —— 空中不能去寻路）
-    await actions.place({ x: bx, y: by, z: bz, item: block, signal: ctx.signal, reach: false });
+    //
+    // **失败就立刻再试一次**：她可能还在空中，第二次（不用转头了）来得及。
+    let placeErr = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await actions.place({ x: bx, y: by, z: bz, item: block, signal: ctx.signal, reach: false });
+        placeErr = null;
+        break;
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        placeErr = err;
+        log.info(`垫脚上升：第 ${attempt + 1} 次放置被拒（${String(err.message).slice(0, 60)}），再试一次`);
+      }
+    }
+    if (placeErr) throw placeErr;
     await delay(260, { signal: ctx.signal });
     // 验证真的站上去了：脚下那块应该是她刚放的那块
     const below = blockAt(bot, bx, by, bz);

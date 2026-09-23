@@ -88,6 +88,28 @@ const TIER_INDEX = { wooden: 0, stone: 1, iron: 2, diamond: 3, netherite: 4 };
 async function returnToSurface({ actions, nav, ctx, steps = [] }) {
   try {
     if (!isUnderground(actions.bot)) return { climbed: false, note: '' };
+
+    // **先等她落地**（这一轮找到的根因之一）。
+    //
+    // 挖矿是**挖掉自己脚下那块**往下走的 —— 任务结束时她往往**还在半空往下掉**。
+    // 而 `pillarUpOne` 的前提是"站在地上才能跳"，她在下落时：
+    //   · `setControlState('jump', true)` 没有任何效果（不在 ground 上）
+    //   · `p.y - by` 是**负的**，"离地 0.7 格"那个判据永远不成立
+    // 实测报错正是 "垫脚上升：没跳起来（可能头顶被挡）"，而她脚下是 air。
+    //
+    // 这也解释了为什么"坑里能爬出来"（那边是被 tp 过去、**站着**的），
+    // 而"挖完矿回不去"（这边是**掉着**的）—— 同一个函数，两种前提。
+    const t0 = Date.now();
+    while (Date.now() - t0 < 6000) {
+      if (actions.bot.entity && actions.bot.entity.onGround) break;
+      await delay(100, { signal: ctx.signal });
+    }
+    // 落地后再稳一下，等物理状态收敛（刚落地那几帧位置还在抖）
+    await delay(300, { signal: ctx.signal });
+    if (!actions.bot.entity.onGround) {
+      log.info('想爬回地面，但等了 6 秒还没落地（可能一直在往下掉）');
+    }
+
     ctx.progress('挖完了，爬回地面');
     const res = await climbToSurface({ actions, nav, ctx, maxSteps: 40 });
     const n = (res && res.steps) || 0;
