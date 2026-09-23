@@ -78,18 +78,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
   await sleep(6000);
 
-  // 造一片实心地面（石头在下面，方便往下挖）
-  await rcon.command(`fill ${X - 10} -70 ${-10} ${X + 10} -61 ${10} minecraft:stone`);
-  await rcon.command(`fill ${X - 10} -60 ${-10} ${X + 10} -40 ${10} minecraft:air`);
+  // **在世界高度范围内堆一个平台**（这一轮修对的）。
+  //
+  // 踩过的两个坑：
+  //   ① 未加载区块里的 `/fill` **静默无效**
+  //   ② **`y=-70` 超出世界高度** → 服务端直接回 "That position is out of this world!"，
+  //      **整条命令被拒绝**、什么都不铺。实测她脚下读到天然 bedrock 就是这个原因。
+  //      超平坦世界的最低建筑高度是 **-64**。
+  //
+  // 做法：把 -64..-50 铺成石头（她在 -49 站着，下面是 15 格可挖的石头），
+  // 上面清空。
+  await rcon.command(`forceload add ${X - 16} -16 ${X + 16} 16`);
   await sleep(2000);
+  const r1 = await rcon.command(`fill ${X - 10} -64 -10 ${X + 10} -50 10 minecraft:stone`);
+  const r2 = await rcon.command(`fill ${X - 10} -49 -10 ${X + 10} -30 10 minecraft:air`);
+  console.log(`  铺平台：${String(r1).slice(0, 40)} / ${String(r2).slice(0, 40)}`);
+  await sleep(2500);
   await rcon.command(`give ${USER} stone_pickaxe 1`);
   await sleep(1200);
-  await rcon.command(`tp ${USER} ${X + 0.5} -60 0.5`);
+  await rcon.command(`tp ${USER} ${X + 0.5} -49 0.5`);
   await sleep(2500);
 
   const st0 = await call('state.get', { detail: 'brief' });
   console.log(`=== 挖矿之后能不能回地面 ===`);
-  console.log(`  起点：y=${st0.position.y.toFixed(1)}（地表 y=-60），脚下 ${st0.standing_on}`);
+  console.log(`  起点：y=${st0.position.y.toFixed(1)}（平台面 y=-49），脚下 ${st0.standing_on}`);
+  // **自检**：场景必须真的造出来了，否则后面测什么都不可信
+  if (String(st0.standing_on) !== 'stone') {
+    console.log(`  ⚠️ 场景没造对（脚下是 ${st0.standing_on}，应该是 stone）——结果不可信`);
+  }
 
   // 让她挖 8 个圆石（会往下挖出竖井）
   const mark = finished.length;
@@ -100,16 +116,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const y = st1.position.y;
   console.log(`  任务：${f ? f.status : '?'}`);
   console.log(`  结果：${String((f && f.result && f.result.note) || (f && f.error) || '').slice(0, 140)}`);
-  console.log(`  挖完她在：y=${y.toFixed(1)}（地表 y=-60）`);
+  console.log(`  挖完她在：y=${y.toFixed(1)}（平台面 y=-49）`);
 
   let pass = 0;
   let fail = 0;
-  if (y >= -60.5) {
+  if (y >= -49.5) {
     pass += 1;
     console.log('  ✅ 挖完回到地面了');
   } else {
     fail += 1;
-    console.log(`  ❌ **还在竖井里**（比地表低 ${(-60 - y).toFixed(0)} 格）—— 这就是用户报的问题`);
+    console.log(`  ❌ **还在竖井里**（比平台低 ${(-49 - y).toFixed(0)} 格）—— 这就是用户报的问题`);
   }
 
   // 再看她有没有"意识到自己在下面"（结果里应该提到）

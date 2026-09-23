@@ -243,7 +243,15 @@ async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, max
     radius,
     maxAttempts,
   });
-  if (strict.ok) return strict;
+  // **挖完回地面**（用户实测：挖矿之后回不去）。
+  //
+  // 注意 `mineStone` 走的是 `wood.mineSpecific`，**不是 `mineOre`** ——
+  // 我第一版只改了 `mineOre`，实测"挖到 20 个圆石、任务 done、人还在 y=-59
+  // （平台在 -49，低了 10 格）"，就是因为这条路径没被改到。
+  if (strict.ok) {
+    const back = await returnToSurface({ actions, nav, ctx });
+    return back.note ? { ...strict, note: `${strict.note || ''}${back.note}` } : strict;
+  }
 
   // 附近只有其它石质方块时，退而挖它们（按各自的真实掉落物计数）
   const gainedStrict = (strict.extra && strict.extra.gained) || 0;
@@ -262,8 +270,10 @@ async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, max
 
   // 两阶段合并报告：只要任一段有产出就算部分成功
   if (loose.ok || gainedStrict > 0) {
+    const back2 = await returnToSurface({ actions, nav, ctx });
     return {
       ...loose,
+      note: `${loose.note || ''}${back2.note || ''}`,
       ok: loose.ok || gainedStrict >= want,
       steps: [...(strict.steps || []), ...(loose.steps || [])],
       note: `圆石 ${gainedStrict} 个${loose.ok ? `；其它石质方块 ${(loose.extra && loose.extra.gained) || 0} 个` : ''}`,
