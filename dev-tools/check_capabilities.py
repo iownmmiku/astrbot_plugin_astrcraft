@@ -122,6 +122,47 @@ def excluded_tools() -> set[str]:
     return set(re.findall(r'"(mc_[a-z_]+)"', block))
 
 
+# ---------------------------------------------------------------- README 数字
+
+def check_readme_numbers() -> list[tuple[bool, str]]:
+    """核对 README 里写的数字和实际一致。
+
+    **只查"N 个工具" / "N 个技能" 这类明确的表述** ——
+    不猜别的数字（README 里还有"5 分钟""12,742 字符"之类，
+    那些要么是外部事实、要么量起来成本高，不该由这个检查器管）。
+    """
+    out: list[tuple[bool, str]] = []
+    readme = PLUGIN / "README.md"
+    if not readme.exists():
+        return out
+    text = _read(readme)
+
+    real_tools = len(registered_tools())
+    real_skills = len(engine_skills())
+
+    # "63 个工具" / "（63 个）" 这种
+    for m in re.finditer(r"(\d+)\s*个工具", text):
+        n = int(m.group(1))
+        out.append((n == real_tools, f"README 说 {n} 个工具，实际 {real_tools} 个"))
+    # **只认明确带"工具/技能"字样的**。
+    # 试过再加一条"（N 个）"，结果把"31 个离线检查"也当成工具数报了误报 ——
+    # 宁可少抓，也不要报假警（报假警的检查器没人会看）。
+    for m in re.finditer(r"(\d+)\s*个技能", text):
+        n = int(m.group(1))
+        out.append((n == real_skills, f"README 说 {n} 个技能，实际 {real_skills} 个"))
+    return out
+
+
+def engine_skills() -> list[str]:
+    """引擎注册的技能名（从 skills/index.js 里数，不需要跑 node）。"""
+    src = BOT / "skills" / "index.js"
+    if not src.exists():
+        return []
+    text = _read(src)
+    # 技能表的键：两个空格 + 名字 + ": {"
+    return re.findall(r"^  ([a-z_][a-z0-9_]*): \{", text, re.M)
+
+
 def main() -> int:
     fails: list[str] = []
     warns: list[str] = []
@@ -184,6 +225,30 @@ def main() -> int:
     else:
         print("  ❌ 存在的符号没找到——检查器坏了")
         fails.append("检查器失效")
+
+    # ---- **README 里的数字也要核对**（这一轮加的）----
+    #
+    # 为什么：README 是新人**唯一**的入口，而它漂过 ——
+    # 加了 mc_plan_do 之后工具数变成 63，README 两处还写着 62。
+    #
+    # 这个病和"提示词承诺了、代码没有"是**同一类**：
+    # 说的和做的不一致。既然这里已经在扫提示词了，顺手把 README 也扫掉。
+    readme_nums = check_readme_numbers()
+    if readme_nums:
+        print("\n=== README 里的数字 ===")
+        bad_nums = []
+        for ok, msg in readme_nums:
+            print(f"  {'✅' if ok else '❌'} {msg}")
+            if not ok:
+                bad_nums.append(msg)
+        if bad_nums:
+            # **数字漂了要让脚本失败** —— 它和"提示词承诺了、代码没有"是同一类病：
+            # 说的和做的不一致。而且改起来很便宜（改个数字），
+            # 留着不管的话，新人读到的是错的信息。
+            print(f"\n❌ README 里有 {len(bad_nums)} 处数字对不上 —— 改一下就行")
+            # **必须加进 fails**：第一版只打印了没加，
+            # 于是"检测到了"但脚本还是 exit 0 —— 等于没检查。
+            fails.extend(f"README 数字漂了：{m}" for m in bad_nums)
 
     print("\n=== 结果 ===")
     if warns:
