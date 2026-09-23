@@ -28,33 +28,20 @@
 
 ## 用法
 
-    python dev-tools/check_capabilities.py
+    python bot/tools/check_capabilities.py
 
 退出码非 0 表示有承诺没兑现。新增能力时要往 `PROMISES` 里加一条。
 """
 
 from __future__ import annotations
 
-import io
 import re
 import sys
 import pathlib
 
-# Windows 控制台默认 GBK，直接 print ✅/❌ 会抛 UnicodeEncodeError
-# （`'\u274c'` 根本不在 GBK 里）——检查器自己因为编码挂掉，等于没检查。
-if hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
-_HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE))
-from _paths import ENGINE_DIR, REPO, SKILLS_DOCS  # noqa: E402
-
-# **仓库根就是插件本体**；Node 引擎在 <repo>/engine/。
-# 历史脚本找的是不存在的 <repo>/plugin/ 和 <repo>/bot/。
-ROOT = REPO
-PLUGIN = REPO
-BOT = ENGINE_DIR
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+PLUGIN = ROOT / "plugin"
+BOT = ROOT / "bot"
 
 
 # ---------------------------------------------------------------- 能力承诺表
@@ -68,24 +55,27 @@ BOT = ENGINE_DIR
 # 新增能力时：先在这里加一行，再写代码。**这一行就是"我承诺了"的登记。**
 PROMISES: list[tuple[str, str, str, str]] = [
     # ---- 走路 / 地形 ----
-    ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "engine/movement.js", "只描述，不改世界"),
-    ("挖台阶/垫脚从坑里出来", "climbToSurface", "engine/skills/common.js", "代码已有"),
-    ("垫脚上升（跳起来往脚下放方块）", "pillarUpOne", "engine/skills/common.js", "climbToSurface 内部"),
+    ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "bot/movement.js", "只描述，不改世界"),
+    ("挖台阶/垫脚从坑里出来", "climbToSurface", "bot/skills/common.js", "代码已有"),
+    ("垫脚上升（跳起来往脚下放方块）", "pillarUpOne", "bot/skills/common.js", "climbToSurface 内部"),
     # 下面这几条**故意留成失败**，等 B 批次做完再打开——
     # 它们就是当前"她做不到但提示词说能做"的证据。
-    ("她能不能主动调'爬出坑'（工具入口）", "mc_climb_out", "llm_tools_skills.py", "A 批次 ✅"),
-    ("她能不能主动'走回去捡掉落物'", "mc_recover_drops", "llm_tools_skills.py", "C 批次 ✅"),
-    ("死亡时写入恢复清单", "_death_recovery_todos", "life.py", "C 批次 ✅"),
-    ("她能不能主动'铺路/垫高'", "mc_pave", "llm_tools_skills.py", "B 批次 ✅"),
-    ("她能不能主动'挖通一条路'", "mc_dig_path", "llm_tools_skills.py", "B 批次 ✅"),
-    ("铺路的实现（往前垫 + 垂直垫高）", "pave", "engine/skills/traverse.js", "B 批次"),
-    ("挖通的实现（真的挖掉挡路方块）", "digPath", "engine/skills/traverse.js", "B 批次"),
-    ("垫脚上升（pave 的 up 方向复用它）", "pillarUpOne", "engine/skills/common.js", "A 批次导出"),
-    # C 批次：agent 路径产出计划
-    ("agent 能主动留下接下来的几步", "mc_plan_do", "llm_tools_life.py", "C 批次"),
-    ("收下 agent 的计划（含技能名核对）", "note_plan_from_agent", "life.py", "C 批次"),
-    ("计划优先于 agent（有计划就不调模型）", "_pop_plan_step", "life.py", "W7 已有"),
-    ("agent 写的计划在下一轮生效", "_pending_plan", "life.py", "C 批次"),
+    ("她能不能主动调'爬出坑'（工具入口）", "mc_climb_out", "plugin/llm_tools_skills.py", "A 批次 ✅"),
+    ("她能不能主动'走回去捡掉落物'", "mc_recover_drops", "plugin/llm_tools_skills.py", "C 批次 ✅"),
+    ("死亡时写入恢复清单", "_death_recovery_todos", "plugin/life.py", "C 批次 ✅"),
+    ("她能不能主动'铺路/垫高'", "mc_pave", "plugin/llm_tools_skills.py", "B 批次 ✅"),
+    ("她能不能主动'挖通一条路'", "mc_dig_path", "plugin/llm_tools_skills.py", "B 批次 ✅"),
+    ("铺路的实现（往前垫 + 垂直垫高）", "pave", "bot/skills/traverse.js", "B 批次"),
+    ("挖通的实现（真的挖掉挡路方块）", "digPath", "bot/skills/traverse.js", "B 批次"),
+    ("垫脚上升（pave 的 up 方向复用它）", "pillarUpOne", "bot/skills/common.js", "A 批次导出"),
+    # C 批次：agent 路径产出计划（治"每次停下来思考太久"的结构性缺口）
+    ("agent 能主动留下接下来的几步", "mc_plan_do", "plugin/llm_tools_life.py", "C 批次"),
+    ("收下 agent 的计划（含技能名核对）", "note_plan_from_agent", "plugin/life.py", "C 批次"),
+    ("计划优先于 agent（有计划就不调模型）", "_pop_plan_step", "plugin/life.py", "W7 已有"),
+    ("agent 写的计划在下一轮生效", "_pending_plan", "plugin/life.py", "C 批次"),
+
+    # 挖阶梯（用户实测"有镐却爬不出来"的修复）
+    ("挖一级台阶上去（有镐没方块时唯一的路）", "digStepUp", "bot/skills/common.js", "本轮补"),
 
 ]
 
@@ -105,9 +95,9 @@ def collect_prompt_sources() -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for p in sorted(PLUGIN.glob("*.py")):
-        out[p.name] = _read(p)
-    for p in sorted(SKILLS_DOCS.glob("*.md")):
-        out[f"skills_docs/{p.name}"] = _read(p)
+        out[f"plugin/{p.name}"] = _read(p)
+    for p in sorted(PLUGIN.glob("skills_docs/*.md")):
+        out[f"plugin/skills_docs/{p.name}"] = _read(p)
     return out
 
 

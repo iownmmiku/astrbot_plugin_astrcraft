@@ -73,17 +73,30 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
       const bx = Math.floor(p.x);
       const by = Math.floor(p.y);
       const bz = Math.floor(p.z);
-      // 先把头顶腾出来（不然跳不起来）
+      // 先把头顶腾出来（不然跳不起来）。
+      //
+      // **挖不动也要继续试**（这一轮修的）：实测"有 32 个圆石、没镐"时，
+      // 头顶是石头 → `actions.dig` 抛"挖 cobblestone 需要一把镐" →
+      // **整个 pave up 直接失败**，而她其实只要垫脚就能出去。
+      // 清头顶只是"让她跳得起来"，不是必须成功的一步。
       const head = bot.blockAt(vec3(bx, by + 2, bz));
       if (head && head.boundingBox === 'block') {
-        if (!head.diggable || isDangerousBlock(head.name)) {
+        if (isDangerousBlock(head.name)) {
           return skillResult(done > 0, {
-            note: `垫了 ${done} 格，头顶被 ${head.name} 挡住且挖不动`,
-            reason: '头顶有挖不动的方块',
+            note: `垫了 ${done} 格，头顶是 ${head.name}（危险方块，不能挖）`,
+            reason: '头顶是危险方块',
             extra: { paved: done, direction: 'up' },
           });
         }
-        await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: true });
+        if (head.diggable) {
+          try {
+            await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: true });
+          } catch (err) {
+            if (err && err.name === 'CancelledError') throw err;
+            // **不因为挖不动就放弃**：接着试垫脚上升（可能照样能上去）
+            log.debug(`清头顶失败（继续试垫脚）：${err.message.slice(0, 60)}`);
+          }
+        }
       }
       const ok = await pillarUpOne({ actions, ctx, bx, by, bz });
       if (!ok) break;

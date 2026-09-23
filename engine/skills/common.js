@@ -121,16 +121,6 @@ async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label =
       fails += 1;
       lastError = describeFailure(err);
       log.debug(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
-      // **受保护方块：记下原因立刻停，不要重试。**
-      //
-      // 白名单/黑名单/出生点保护是**配置层面的拒绝**——同一个方块再挖 40 次
-      // 结果完全一样，重试只是白烧时间，而且会把这条关键信息淹没在
-      // "连续多次没有进展"里。直接 break，让 lastError（也就是技能的 reason）
-      // 就是那句「挖掘白名单拦截」，模型才知道该改配置而不是换个地方找。
-      if (err && err.name === 'ProtectedBlockError') {
-        log.warn(`${label} 被保护规则拦下，不再重试：${err.message}`);
-        break;
-      }
       // **带调用栈，而且要用 warn 级别**。
       //
       // 这类"某个变量是 null"的报错只看消息定位不了是哪一行
@@ -512,6 +502,76 @@ function surfaceHeightAt(bot, x, z, fromY) {
  * 真人下矿挖的是**阶梯**，因为阶梯能原路走回来。这里照做：
  * 往斜上方挖掉两格（脚+头），再走上去（pathfinder 会自动跳 1 格台阶），重复到见天。
  */
+/**
+ * **挖一级台阶上去**：往斜上方挖掉两格（脚+头），再走上去。
+ *
+ * ## 为什么必须补这个（用户实测反馈："还是不能从坑里面垫出来"）
+ *
+ * 这个函数的**设计一直写在 `climbToSurface` 的注释里**
+ * （"真人下矿挖的是阶梯…往斜上方挖掉两格（脚+头），再走上去，
+ * pathfinder 会自动跳 1 格台阶，重复到见天"），
+ * **但实现里从来没有这一步** —— 只有"垫脚上升"和"往侧面开洞"两条。
+ *
+ * 后果（实测，见 `tools/test_pit_escape.js`）：
+ *   · 背包里**有方块** → `pillarUpOne` 能把她垫出来 ✅
+ *   · 背包里**有镐、没方块** → 只剩"往侧面开洞"，而 1 格宽的竖井里
+ *     **开侧洞出不去**（洞是横的，人还在原来的高度）→ **爬 0 格就放弃** ❌
+ *
+ * 这就是"有镐却爬不出来"的根因。真人遇到这种情况是**挖阶梯**：
+ * 斜上方挖两格，跳上去，重复。
+ *
+ * @returns true = 真的升上去了（会**验证高度**，不靠"走完了"就当成功）
+ */
+async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
+  const bot = actions.bot;
+  const dirs = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+  for (const [dx, dz] of dirs) {
+    const nx = bx + dx;
+    const nz = bz + dz;
+    // 要挖的是**斜上方那两格**（脚+头），这样她跳上去有地方站
+    const s1 = blockAt(bot, nx, by + 1, nz);
+    const s2 = blockAt(bot, nx, by + 2, nz);
+    if (!s1 || !s2) continue;
+    // 两格都得是实心且挖得动（已经是空气就不用挖，也算可用）
+    const need = [s1, s2].filter((b) => b.boundingBox === 'block');
+    if (need.some((b) => !b.diggable)) continue;
+    if (need.some((b) => isDangerousBlock(b.name))) continue;
+    // 落脚点必须有支撑：她跳上去要站在 (nx, by+1)，下面是 (nx, by)
+    const support = blockAt(bot, nx, by, nz);
+    if (!support || support.boundingBox !== 'block') continue;
+
+    ctx.progress(`挖一级台阶上去（往 (${nx}, ${by + 1}, ${nz})）`);
+    for (const y of [by + 1, by + 2]) {
+      const b = blockAt(bot, nx, y, nz);
+      if (!b || b.boundingBox !== 'block') continue;
+      try {
+        await actions.dig({ x: nx, y, z: nz, signal: ctx.signal, collect: true });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        log.debug(`挖台阶 (${nx}, ${y}, ${nz}) 失败：${err.message}`);
+      }
+    }
+    // 走过去（pathfinder 会自动跳 1 格台阶）
+    const beforeY = Math.floor(bot.entity.position.y);
+    try {
+      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 0.6, signal: ctx.signal, timeoutMs: 12000 });
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      log.debug(`走上一级台阶失败：${err.message}`);
+      continue;
+    }
+    // **验证真的升上去了**（"走完了"不等于"上去了" —— 这个坑踩过很多次）
+    if (Math.floor(bot.entity.position.y) > beforeY) return true;
+    log.debug(`挖了台阶但没上去（还在 y=${beforeY}）`);
+  }
+  return false;
+}
+
 async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   const bot = actions.bot;
   if (!isUnderground(bot)) return { ok: true, steps: 0, already: true };
@@ -592,6 +652,17 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         }
       }
       if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
+        climbed += 1;
+        continue;
+      }
+      // **挖阶梯**（这一轮补的，见 digStepUp 的说明）。
+      //
+      // 放在"垫脚"之后、"开侧洞"之前：
+      //   · 垫脚最快，但它**要求背包里有方块** —— 下矿回来常常没有
+      //   · 挖阶梯只要有镐就行，**这才是真人下矿回来的常规做法**
+      //   · 开侧洞只挖横的，人在原来的高度，**1 格宽的竖井里出不去**
+      // 实测：有镐没方块时，只有前两条 → 爬 0 格就放弃（用户报的就是这个）。
+      if (await digStepUp({ actions, nav, ctx, bx, by, bz })) {
         climbed += 1;
         continue;
       }
@@ -728,4 +799,8 @@ module.exports = {
   // 不导出的话只能复制一份——而它的时序很讲究（跳起来、等真离地 0.7 格以上、
   // 趁空中往脚下放，站地上放会被服务端拒绝），复制一份必然会走样。
   pillarUpOne,
+  // **挖阶梯**（这一轮补的）：有镐没方块时唯一能出来的路。
+  // 见 digStepUp 的注释——它的设计一直写在 climbToSurface 的文档里，
+  // 但实现里从来没有，用户实测"有镐却爬不出来"就是这个原因。
+  digStepUp,
 };
