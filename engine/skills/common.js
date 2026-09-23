@@ -524,6 +524,7 @@ function surfaceHeightAt(bot, x, z, fromY) {
  */
 async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
   const bot = actions.bot;
+  log.info(`挖台阶：开始试（我在 ${bx}, ${by}, ${bz}）`);
   const dirs = [
     [1, 0],
     [-1, 0],
@@ -536,14 +537,26 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
     // 要挖的是**斜上方那两格**（脚+头），这样她跳上去有地方站
     const s1 = blockAt(bot, nx, by + 1, nz);
     const s2 = blockAt(bot, nx, by + 2, nz);
-    if (!s1 || !s2) continue;
+    if (!s1 || !s2) {
+      log.info(`挖台阶：(${nx}, ${nz}) 斜上方读不到方块（s1=${s1 ? s1.name : 'null'} s2=${s2 ? s2.name : 'null'}）`);
+      continue;
+    }
     // 两格都得是实心且挖得动（已经是空气就不用挖，也算可用）
     const need = [s1, s2].filter((b) => b.boundingBox === 'block');
-    if (need.some((b) => !b.diggable)) continue;
-    if (need.some((b) => isDangerousBlock(b.name))) continue;
+    if (need.some((b) => !b.diggable)) {
+      log.info(`挖台阶：(${nx}, ${nz}) 那两格挖不动（${need.map((b) => b.name).join('/')}）`);
+      continue;
+    }
+    if (need.some((b) => isDangerousBlock(b.name))) {
+      log.info(`挖台阶：(${nx}, ${nz}) 是危险方块，跳过`);
+      continue;
+    }
     // 落脚点必须有支撑：她跳上去要站在 (nx, by+1)，下面是 (nx, by)
     const support = blockAt(bot, nx, by, nz);
-    if (!support || support.boundingBox !== 'block') continue;
+    if (!support || support.boundingBox !== 'block') {
+      log.info(`挖台阶：(${nx}, ${nz}) 落脚点没有支撑（下面是 ${support ? support.name : 'null'}）`);
+      continue;
+    }
 
     ctx.progress(`挖一级台阶上去（往 (${nx}, ${by + 1}, ${nz})）`);
     for (const y of [by + 1, by + 2]) {
@@ -651,18 +664,19 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
           if (err instanceof CancelledError) throw err;
         }
       }
-      if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
+      // **先挖阶梯**（这一轮调换了顺序）。
+      //
+      // 为什么挖阶梯要在垫脚上升**前面**：
+      //   · 挖阶梯**不依赖时序** —— 挖掉两格、走过去，随时都能做
+      //   · 垫脚上升卡在**几十毫秒的跳跃窗口**里（要赶在落地前把包发出去），
+      //     我在这上面来回好几轮了，服务端一直回 "the block is still there"
+      //   · **真人下矿回来挖的就是阶梯** —— 能原路走回来，不需要方块
+      // 所以：先试不依赖时序的，再试快的但脆的。
+      if (await digStepUp({ actions, nav, ctx, bx, by, bz })) {
         climbed += 1;
         continue;
       }
-      // **挖阶梯**（这一轮补的，见 digStepUp 的说明）。
-      //
-      // 放在"垫脚"之后、"开侧洞"之前：
-      //   · 垫脚最快，但它**要求背包里有方块** —— 下矿回来常常没有
-      //   · 挖阶梯只要有镐就行，**这才是真人下矿回来的常规做法**
-      //   · 开侧洞只挖横的，人在原来的高度，**1 格宽的竖井里出不去**
-      // 实测：有镐没方块时，只有前两条 → 爬 0 格就放弃（用户报的就是这个）。
-      if (await digStepUp({ actions, nav, ctx, bx, by, bz })) {
+      if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
         climbed += 1;
         continue;
       }
