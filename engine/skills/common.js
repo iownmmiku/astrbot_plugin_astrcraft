@@ -623,7 +623,17 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
     const t1 = Date.now();
     log.info(`挖台阶：垫好了，试着走上 (${nx}, ${by + 1}, ${nz})（现在 y=${beforeY}）`);
     try {
-      const r = await nav.goTo({ x: nx, y: by + 1, z: nz, range: 0.6, signal: ctx.signal, timeoutMs: 5000 });
+      // **`range` 从 0.6 放宽到 1.5**（这一轮修的"不稳定"）。
+      //
+      // 实测对比：成功那次 `距离 0.71`（arrived=true），失败那次 `距离 1.58`
+      // （arrived=false）—— 而判据是 `range(0.6) + 0.5 = 1.1`，
+      // 于是 1.58 就被判"没走到"，`digStepUp` 直接放弃这个方向。
+      //
+      // 但**这一步该不该算成功，真正的判据是"她有没有站到目标那一层"**
+      // （下面那个 `afterY >= by + 1`）。站上一格 1x1 的台阶，
+      // 人本来就很难正好停在格子中心（0.7 格是常态），拿 0.6 去卡没有意义。
+      // 放宽之后由高度判据说了算 —— 站上去了就是成功，没上去就换方向。
+      const r = await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.5, signal: ctx.signal, timeoutMs: 5000 });
       log.info(
         `挖台阶：goTo 返回 arrived=${r && r.arrived} 用时 ${Date.now() - t1}ms` +
           `（现在 y=${Math.floor(bot.entity.position.y)}，距离 ${r && r.distance_to_target}）`,
