@@ -118,6 +118,39 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log(`  结果：${String((f && f.result && f.result.note) || (f && f.error) || '').slice(0, 140)}`);
   console.log(`  挖完她在：y=${y.toFixed(1)}（平台面 y=-49）`);
 
+  // **关键检查：挖到的圆石到底在不在背包里**（这一轮加的）。
+  //
+  // 为什么查这个：爬升失败时说"**没有方块可以垫脚**"，可她**刚挖了 20 个圆石**。
+  // 要么是"挖到了但没进背包"（掉落物没捡起来），要么是读取的方式不对。
+  // 这决定了该修哪一边 —— 是修"捡掉落物"还是修"找方块的判据"。
+  const inv = await call('inventory.get').catch(() => null);
+  // **`items` 可能是对象（按名字计数）也可能是数组** —— 两种都处理，
+  // 第一版只按数组写，直接 `items.find is not a function` 崩了。
+  const rawItems = (inv && inv.items) || {};
+  const items = Array.isArray(rawItems)
+    ? rawItems.map((it) => ({ name: String(it.name), count: Number(it.count) || 0 }))
+    : Object.entries(rawItems).map(([name, count]) => ({ name, count: Number(count) || 0 }));
+  const cobble = items.find((it) => String(it.name).includes('cobblestone'));
+  console.log(`  背包里 ${items.length} 种东西：${items.slice(0, 8).map((i) => `${i.name}×${i.count}`).join('、') || '（空的）'}`);
+  console.log(
+    cobble
+      ? `  ✅ 圆石在背包里：${cobble.name}×${cobble.count}`
+      : `  ❌ **圆石不在背包里** —— "挖到 20 个"只是计数，东西没捡起来`,
+  );
+  // 再看她脚下和四周是什么（判断"侧面挖不动"合不合理）
+  const bp = st1.block_position;
+  console.log(`  她那一格 (${bp.x}, ${bp.y}, ${bp.z})，脚下 ${st1.standing_on}`);
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ]) {
+    const b = await call('block.at', { x: bp.x + dx, y: bp.y, z: bp.z + dz }).catch(() => null);
+    const b2 = await call('block.at', { x: bp.x + dx, y: bp.y + 1, z: bp.z + dz }).catch(() => null);
+    console.log(`    旁边 (${dx},${dz})：脚=${b && b.name} 头=${b2 && b2.name}`);
+  }
+
   let pass = 0;
   let fail = 0;
   if (y >= -49.5) {
