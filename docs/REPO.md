@@ -68,22 +68,34 @@
 
 ---
 
-## 测试环境怎么接（不用拷代码）
+## 测试环境（已经搬进来了，不需要联接）
 
-公开仓库里跑测试需要两样东西，都可以用**目录联接**指过去，**不用拷代码**：
+`.testserver/`（424 MB）和 `engine/node_modules/`（771 MB）**已经是这个仓库里的真实目录** ——
+它们是 2026-09 从开发仓库**搬**过来的（同一个盘上 move，不是拷贝）。
 
-```cmd
-:: 测试服（server.jar 和世界数据）
-mklink /J "Astrcraft\.testserver" "D:\工作台\mc-astrbot\bot\.testserver"
+所以现在：
 
-:: 引擎依赖（770 MB，不用重下）
-mklink /J "Astrcraft\engine\node_modules" "D:\工作台\mc-astrbot\bot\node_modules"
-
-:: 根目录的（少数测试从根 require mineflayer）
-mklink /J "Astrcraft\node_modules" "D:\工作台\mc-astrbot\bot\node_modules"
+```bash
+cd engine && npm install          # 只在你需要重装依赖时
+python dev-tools/run_all.py       # 离线检查
+python dev-tools/run_all.py --full  # 连服务器测试（要先把 .testserver 起起来）
 ```
 
-> **注意**：`dev-tools` 里的测试用的是**相对路径** `.testserver`，
+**根目录还有一个 `node_modules` 联接**指向 `engine/node_modules` ——
+少数测试从仓库根 `require('mineflayer')`，所以需要它。
+
+### 一个实测教训：**别用目录联接代替 `node_modules`**
+
+搬过来之前，`Astrcraft/engine/node_modules` 是个**目录联接**指向开发仓库。
+那时 `Astrcraft` 里**所有需要引擎的测试都报 `ERR timeout connect`** ——
+而同一份测试代码在开发仓库里连得上、引擎也能正常启动。
+
+换成**真实目录**之后立刻就好了。
+
+**所以：`node_modules` 不要用联接。** 它牵涉 Node 的模块解析和进程启动路径，
+联接会让某些解析失败 —— 而且失败方式是 `timeout connect` 这种**看不出根因**的样子。
+
+> **另外**：`dev-tools` 里的测试用的是**相对路径** `.testserver`，
 > 所以必须**从仓库根跑**（`node dev-tools/xxx.js`），从 `dev-tools/` 里跑会找不到。
 
 ---
