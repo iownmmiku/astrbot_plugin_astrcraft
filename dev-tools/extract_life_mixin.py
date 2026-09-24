@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """把 `life.py` 里**只读的**方法搬进一个 mixin，缩小那个 2129 行的上帝文件。
 
-> ## ⚠️ 当前状态：**还没成功，不要直接用**
+> ## 状态：**已成功**（2026-09）
 >
-> 方案是**对的**（mixin 不需要改调用点），dry-run 也漂亮
-> （30 个方法 / 530 行 / 2129 → 约 1761 行），但**跑测试会红**。
+> `life.py` 2129 → **1556 行**，`life_render.py` 570 行、`life_types.py` 83 行。
+> `run_all.py` 32 项全过（exit 0）。
 >
-> 已经修掉/发现的问题（都写在下面代码的注释里）：
+> **踩过的四个坑**（都写在下面代码的注释里，重跑这个脚本不用再踩）：
 >   1. **import 会漏** —— 手写补了 `time` 又漏 `Enum`。
->      改成 `std_imports()` **照抄 `life.py` 的 import 段**。✅ 已修
+>      改成 `std_imports()` **照抄 `life.py` 的 import 段**。
 >   2. **`AnnAssign` 不是 `Assign`** —— `HOLD_RELEASE: dict["Hold", str] = {`
->      是带注解的赋值，只判断 `Assign` 会漏掉它，然后 ImportError。✅ 已修
->   3. **类 docstring 没闭合** —— 生成的 `PromptRenderMixin` 里那个
->      一行 docstring 把后面的 `def` 吞进字符串了，于是类体是空的、
->      `class LifeLoop(PromptRenderMixin)` 报
->      `AttributeError: 'function' object has no attribute '__mro__'`。
->      ❌ **还没修**
+>      是带注解的赋值，只判断 `Assign` 会漏掉它 → ImportError。
+>   3. **`Assign` 的判断被嵌在错误的条件里** ——
+>      `getattr(n, "name", None) in TYPES_MOVE` 对 Assign 永远是 False。
+>   4. **装饰器必须一起搬** —— `@dataclass` 留在原处、
+>      它装饰的 class 被搬走，装饰器就落到**下一个定义**上，
+>      报 `AttributeError: 'function' object has no attribute '__mro__'`。
+>      这个错看起来和"搬类型"毫无关系，最难想到。
 >
-> **每次尝试都要跑一遍测试**（`test_life_rhythm` 是最敏感的那个），
-> 不对就用 `git checkout -- life.py` 回滚（并删掉生成的两个文件）。
-
-
-    python dev-tools/extract_life_mixin.py            # 真做
-    python dev-tools/extract_life_mixin.py --dry-run  # 只看会搬什么
+> **每次改完必须跑测试**（`test_life_rhythm` 最敏感），
+> 不对就 `git checkout -- life.py` 回滚 + 删掉生成的两个文件。
+>
+> **一个方法论教训**：我自己的检查脚本**两次给出假绿** ——
+> 先是靠"输出里有没有 ❌"判、后是靠"有没有'通过'那行"判，
+> 而 traceback / import 失败时两种都没有。
+> **退出码才是唯一可靠的判据。**
 
 ## 为什么用 mixin 而不是普通函数
 
@@ -249,6 +251,13 @@ def main() -> int:
         if not any(nm in TYPES_MOVE for nm in names):
             continue
         s = n.lineno - 1
+        # **装饰器必须一起搬**（踩过，而且是最后一个 bug）：
+        # `@dataclass` 如果留在 life.py，而它装饰的 `class LifeDecision` 被搬走了，
+        # 那个装饰器就会**落到下一个定义上** ——
+        # 报错是 `AttributeError: 'function' object has no attribute '__mro__'`，
+        # 看起来和"搬类型"毫无关系，很难往这边想。
+        for dec in getattr(n, "decorator_list", []):
+            s = min(s, dec.lineno - 1)
         j = s - 1
         while j >= 0 and lines[j].strip().startswith("#"):
             s = j
