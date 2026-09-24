@@ -277,10 +277,36 @@ async function makePlanks({ actions, ctx, want = 8 }) {
     }
     ctx.progress(`木板 +${planksHave() - startHave}/${want}`);
   }
+  // **必须验证真的做出来了**（这一轮修的"假成功"）。
+  //
+  // 原来这里**无条件** `return skillResult(true, ...)` —— 于是：
+  //   · `actions.craft` 失败（比如工作台没放好、配方没匹配上）
+  //   · 循环继续转，直到 `guard > 64` 才 break
+  //   · **然后照样返回 ok: true**
+  // 上游（`ensureCraftingTable`）以为木板够了，就去合成工作台 ——
+  // 而实际木板还是 3 个，于是报 "合成工作台没有产出（检查木板是否够 4 个）"。
+  //
+  // 实测：`test_survival_chain` 的 [2] 就是这样红的，而且**背包里明明有 5 个原木**。
+  //
+  // 判据用**实际增量**，不信循环"跑完了"：
+  // 跑完不等于做成 —— 这个坑我在 `_runPath` 的 `arrived` 上踩过一次，
+  // 在 `make_tools` 上也踩过一次，这是第三次。
+  const gained = planksHave() - startHave;
+  if (gained < want) {
+    return skillResult(gained > 0, {
+      steps,
+      produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+      note: gained > 0 ? `只做出 ${gained} 个木板（想要 ${want} 个）` : null,
+      reason:
+        gained > 0
+          ? `只做出 ${gained}/${want} 个木板`
+          : '一个木板都没做出来（可能工作台没放好、或者配方没匹配上）',
+    });
+  }
   return skillResult(true, {
     steps,
     produced: positiveOnly(diffOf(before, actions.inventoryMap())),
-    note: `新增木板 ${planksHave() - startHave} 个`,
+    note: `新增木板 ${gained} 个`,
   });
 }
 
