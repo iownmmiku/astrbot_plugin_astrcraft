@@ -300,6 +300,7 @@ class GoalManager:
             self._task.cancel()
             try:
                 await self._task
+            # 清理路径：取消时抛什么都不重要，这里就是要吞掉
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self.status = GOAL_ABANDONED
@@ -315,6 +316,7 @@ class GoalManager:
             self._task.cancel()
             try:
                 await self._task
+            # 清理路径：取消时抛什么都不重要，这里就是要吞掉
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 
@@ -431,6 +433,7 @@ class GoalManager:
             return
         try:
             await self._call("task.cancel", {"task_id": task_id})
+        # 清理路径：取消时抛什么都不重要，这里就是要吞掉
         except Exception:  # noqa: BLE001
             pass
 

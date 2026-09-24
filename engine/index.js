@@ -341,7 +341,7 @@ rpc.handle(
         await bot.toss(item.type, null, item.count);
         dropped[item.name] = (dropped[item.name] || 0) + item.count;
       } catch (err) {
-        log.debug(`丢出 ${item.name} 失败：${err.message}`);
+        log.info(`丢出 ${item.name} 失败：${err.message}`);
       }
       await delay(80);
     }
@@ -461,7 +461,7 @@ rpc.handle(
             placed.push({ x, y, z });
             n += 1;
           } catch (err) {
-            log.debug(`放置 ${ore} 到 (${x},${y},${z}) 失败：${err.message}`);
+            log.info(`放置 ${ore} 到 (${x},${y},${z}) 失败：${err.message}`);
           }
         }
       }

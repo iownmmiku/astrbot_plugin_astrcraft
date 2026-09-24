@@ -207,7 +207,7 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`挖 ${found.name} 失败：${err.message}`);
+        log.info(`挖 ${found.name} 失败：${err.message}`);
         return false;
       }
     },
@@ -364,11 +364,11 @@ async function digDownStaircase({ actions, nav, ctx, steps = [], layers = 4 }) {
         break;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`阶梯挖掘方向 (${dx},${dz}) 失败：${err.message}`);
+        log.info(`阶梯挖掘方向 (${dx},${dz}) 失败：${err.message}`);
       }
     }
     if (!advanced) {
-      log.debug('四个方向都无法安全向下挖，停止');
+      log.info('四个方向都无法安全向下挖，停止');
       break;
     }
     // 别一口气挖到基岩：最多 32 格

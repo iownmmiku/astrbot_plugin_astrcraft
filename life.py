@@ -240,7 +240,7 @@ class LifeLoop(PromptRenderMixin):
         try:
             self.inbox.on_urgent(lambda: self._wake.set())
         except Exception as exc:  # noqa: BLE001
-            logger.debug("登记急件叫醒失败：%s", exc)
+            logger.info("登记急件叫醒失败：%s", exc)
         self._share_cooldown = share_cooldown
         self._last_share_at = 0.0
         self._last_decide_at = 0.0
@@ -330,7 +330,7 @@ class LifeLoop(PromptRenderMixin):
         try:
             taken = self.inbox.take_control()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取控制条目失败：%s", exc)
+            logger.info("取控制条目失败：%s", exc)
             return ""
         if not taken:
             return ""
@@ -351,7 +351,7 @@ class LifeLoop(PromptRenderMixin):
                         self.memory.prune()
                         done.append("整理记忆")
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("整理记忆失败：%s", exc)
+                    logger.info("整理记忆失败：%s", exc)
             else:
                 done.append(f"（不认识的控制器 {e.type}，跳过）")
         text = "、".join(done) if done else ""
@@ -454,7 +454,7 @@ class LifeLoop(PromptRenderMixin):
         # 丢掉之后下一轮会重新问 LLM 排一份新的（它会看到失败记录）。
         if self._plan:
             self.clear_plan(f"{name} 失败：{(error or '')[:40]}")
-        logger.debug("记录失败：%s（近半小时第 %d 次）%s", name, len(self._recent_failures[name]), error[:60])
+        logger.info("记录失败：%s（近半小时第 %d 次）%s", name, len(self._recent_failures[name]), error[:60])
         # **学习回路**：同一个坑摔第三次就停下来总结一条教训。
         #
         # 为什么是"第三次"而不是每次：第一次可能是偶发（网络、地形），
@@ -571,6 +571,7 @@ class LifeLoop(PromptRenderMixin):
             self._task.cancel()
             try:
                 await self._task
+            # 清理路径：取消时抛什么都不重要，这里就是要吞掉
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._save_state()
@@ -670,6 +671,7 @@ class LifeLoop(PromptRenderMixin):
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=self._decide_interval)
                     self._wake.clear()
+                # 等超时是**正常路径**（唤醒/轮询的等待），不是错误
                 except asyncio.TimeoutError:
                     pass
                 if self._stopped:
@@ -709,6 +711,7 @@ class LifeLoop(PromptRenderMixin):
                     try:
                         await asyncio.wait_for(self._wake.wait(), timeout=5.0)
                         self._wake.clear()
+                    # 等超时是**正常路径**（唤醒/轮询的等待），不是错误
                     except asyncio.TimeoutError:
                         pass
                     continue
@@ -934,7 +937,7 @@ class LifeLoop(PromptRenderMixin):
                 else:
                     skills = []
             except Exception as exc:  # noqa: BLE001
-                logger.debug("取技能清单失败：%s", exc)
+                logger.info("取技能清单失败：%s", exc)
                 skills = []
 
         # 技能清单可能是"字符串列表"也可能是"dict 列表"，两种都要能渲染。
@@ -1261,7 +1264,7 @@ class LifeLoop(PromptRenderMixin):
             advice = await self._build_advice()
             advice_text = self._render_advice(advice) if advice else ""
         except Exception as exc:  # noqa: BLE001
-            logger.debug("拼生存建议失败：%s", exc)
+            logger.info("拼生存建议失败：%s", exc)
         _mark("生存建议")
 
         recent_text = self._render_recent()
@@ -1273,7 +1276,7 @@ class LifeLoop(PromptRenderMixin):
                 query = f"{self._intention or ''} {' '.join(self._recent_failures.keys())} {advice_text[:200]}"
                 learned = self.knowledge.render_for_prompt(query)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("检索知识库失败：%s", exc)
+                logger.info("检索知识库失败：%s", exc)
         _mark("知识库检索")
 
         # **插话注入点**（W4）：主人的话和世界事件在"组装提示词"这一刻注入——
@@ -1333,6 +1336,7 @@ class LifeLoop(PromptRenderMixin):
             for t in getattr(mgr, "func_list", []) or []:
                 if str(getattr(t, "name", "")).startswith("mc_"):
                     _tool_count += 1
+        # **尽力而为**的统计：拿不到就当 0，不影响主流程
         except Exception:  # noqa: BLE001
             pass
         logger.info(
@@ -1524,7 +1528,7 @@ class LifeLoop(PromptRenderMixin):
         try:
             data = json.loads(text[start : end + 1])
         except json.JSONDecodeError:
-            logger.debug("过日子的决定解析失败：%s", text[:150])
+            logger.info("过日子的决定解析失败：%s", text[:150])
             return None
         if not isinstance(data, dict):
             return None
@@ -1640,7 +1644,7 @@ class LifeLoop(PromptRenderMixin):
             try:
                 await self._on_activity(decision)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("on_activity 回调异常：%s", exc)
+                logger.info("on_activity 回调异常：%s", exc)
 
         # 说点什么（受冷却限制，避免刷屏）
         if decision.say:
@@ -1680,7 +1684,7 @@ class LifeLoop(PromptRenderMixin):
         try:
             await self._on_share(text)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("分享失败：%s", exc)
+            logger.info("分享失败：%s", exc)
 
     # ------------------------------------------------------------ 分享
 
@@ -1737,7 +1741,7 @@ class LifeLoop(PromptRenderMixin):
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("读取生活状态失败：%s", exc)
+            logger.info("读取生活状态失败：%s", exc)
             return
         if not isinstance(data, dict):
             return

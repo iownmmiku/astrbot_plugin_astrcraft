@@ -108,7 +108,7 @@ class KnowledgeBase:
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("读取教训库失败：%s", exc)
+            logger.info("读取教训库失败：%s", exc)
             return
         if isinstance(data, list):
             self._lessons = [d for d in data if isinstance(d, dict) and d.get("text")]
@@ -125,7 +125,7 @@ class KnowledgeBase:
                 encoding="utf-8",
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("保存教训库失败：%s", exc)
+            logger.info("保存教训库失败：%s", exc)
 
     # ------------------------------------------------------------ 攻略（人写的）
 
@@ -142,7 +142,7 @@ class KnowledgeBase:
         try:
             return path.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("读攻略 %s 失败：%s", want, exc)
+            logger.info("读攻略 %s 失败：%s", want, exc)
             return None
 
     # ------------------------------------------------------------ 教训（她自己写的）
@@ -206,7 +206,7 @@ class KnowledgeBase:
                 fh.write(f"- [{stamp}] {body}\n")
             return f"记下了：{body}"
         except Exception as exc:  # noqa: BLE001
-            logger.debug("写笔记失败：%s", exc)
+            logger.info("写笔记失败：%s", exc)
             return f"写不进去：{exc}"
 
     def notes(self, limit: int = 30) -> str:

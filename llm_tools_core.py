@@ -49,6 +49,7 @@ class McPerceptionTools:
                 cur = st.get("current")
                 if cur:
                     task = f"{cur.get('name')}（{cur.get('detail') or ''}）"
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except EngineError:
                 pass
             parts = [brief]

@@ -58,7 +58,7 @@ async function smoothLook(bot, yaw, pitch, { durationMs = null, signal = null, e
     try {
       await bot.look(startYaw + dYaw * e, startPitch + dPitch * e, true);
     } catch (err) {
-      log.debug(`渐进转头失败：${err.message}`);
+      log.info(`渐进转头失败：${err.message}`);
       return false;
     }
     if (i < steps) await delay(stepMs, { signal });

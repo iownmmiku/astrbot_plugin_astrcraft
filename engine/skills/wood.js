@@ -80,7 +80,7 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAt
           }
         } catch (err) {
           if (err instanceof CancelledError) throw err;
-          log.debug(`为捡掉落物下树失败：${err.message}`);
+          log.info(`为捡掉落物下树失败：${err.message}`);
         }
       }
       return true;
@@ -226,7 +226,7 @@ async function wanderLookingFor(names, { actions, nav, ctx, radius = 48, maxHops
       await nav.goTo({ x: tx, y: null, z: tz, range: 3, signal: ctx.signal, timeoutMs: 12000 });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`探索移动失败（换方向继续）：${err.message}`);
+      log.info(`探索移动失败（换方向继续）：${err.message}`);
     }
   }
   return null;
@@ -617,7 +617,7 @@ async function ensureCraftingTable({ actions, ctx, steps = [] }) {
         steps.push('放置工作台');
         return { ok: true, position: pos };
       } catch (err) {
-        log.debug(`放置工作台失败：${err.message}`);
+        log.info(`放置工作台失败：${err.message}`);
         // 必须在这里返回：以前漏了 return，代码会继续往下走到"再合成一个工作台"，
         // 结果背包里明明有工作台，却报"材料不足"（真实踩过的坑）。
         return {
@@ -702,7 +702,7 @@ async function digToward({ actions, ctx, target }) {
       return true;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`朝目标挖 (${x},${y},${z}) 失败：${err.message}`);
+      log.info(`朝目标挖 (${x},${y},${z}) 失败：${err.message}`);
     }
   }
   return false;
@@ -755,10 +755,10 @@ async function ensurePickaxeDurability({ actions, nav, state, ctx, need = 10 }) 
       log.info(`已补做石镐（原 ${pick.name} 剩 ${pick.remain}）`);
       return true;
     }
-    log.debug(`补做石镐没成功：${r && r.reason}`);
+    log.info(`补做石镐没成功：${r && r.reason}`);
   } catch (err) {
     if (err instanceof CancelledError) throw err;
-    log.debug(`补做石镐失败：${err.message}`);
+    log.info(`补做石镐失败：${err.message}`);
   }
   return false;
 }
@@ -811,7 +811,7 @@ async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want,
         // 白/黑名单与出生点保护是配置层面的拒绝，换个地方再挖 40 次也一样，
         // 吞掉它只会让技能报"附近没有找到足够的X"，把真正原因藏起来。
         if (err && err.name === 'ProtectedBlockError') throw err;
-        log.debug(`挖 ${found.name} 失败：${err.message}`);
+        log.info(`挖 ${found.name} 失败：${err.message}`);
         // 够不到（典型情况：目标被埋在泥土/岩石下面，寻路走不过去）
         // → 朝目标挖一格，下一轮往往就能挖到了。这也是真玩家的做法。
         const toward = await digToward({ actions, ctx, target: found });

@@ -305,7 +305,7 @@ async function buildFromSpec({ actions, nav, ctx, spec, origin }) {
           });
         } catch (err) {
           if (err instanceof CancelledError) throw err;
-          log.debug(`走到 (${cell.x}, ${cell.z}) 失败，就地试着放：${err.message}`);
+          log.info(`走到 (${cell.x}, ${cell.z}) 失败，就地试着放：${err.message}`);
         }
       }
       await placeWithRetry(actions, cell, ctx);
@@ -314,7 +314,7 @@ async function buildFromSpec({ actions, nav, ctx, spec, origin }) {
       if (err instanceof CancelledError) throw err;
       // 单个格子失败不该让整栋房子算失败：记下来继续（最后如实报告哪几格没成）
       failed.push({ ...cell, reason: String(err.message || err).slice(0, 60) });
-      log.debug(`放 ${cell.name} @ (${cell.x},${cell.y},${cell.z}) 失败：${err.message}`);
+      log.info(`放 ${cell.name} @ (${cell.x},${cell.y},${cell.z}) 失败：${err.message}`);
     }
     await delay(60, { signal: ctx.signal });
   }

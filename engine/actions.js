@@ -303,7 +303,7 @@ class Actions {
         await this.holdItem({ item: better.name, signal });
         return better.name;
       } catch (err) {
-        log.debug(`装备 ${better.name} 失败：${err.message}`);
+        log.info(`装备 ${better.name} 失败：${err.message}`);
       }
     }
     // 检查手上/背包里有没有能挖这个方块的工具。
@@ -502,7 +502,7 @@ class Actions {
         await delay(120, { signal });
         done.push(item.name);
       } catch (err) {
-        log.debug(`穿戴 ${item.name} 失败：${err.message}`);
+        log.info(`穿戴 ${item.name} 失败：${err.message}`);
       }
     }
     return done;
@@ -551,7 +551,7 @@ class Actions {
       try {
         await bot.equip(fresh, 'hand');
       } catch (err) {
-        log.debug(`装备 ${want} 第 ${i + 1} 次失败：${err.message}`);
+        log.info(`装备 ${want} 第 ${i + 1} 次失败：${err.message}`);
         await delay(200, { signal });
         continue;
       }
@@ -611,7 +611,7 @@ class Actions {
         await bot.lookAt(vec3(x, y, z), true);
         return { ok: true };
       } catch (err) {
-        log.debug(`看向 (${x}, ${y}, ${z}) 失败：${err.message}`);
+        log.info(`看向 (${x}, ${y}, ${z}) 失败：${err.message}`);
         return { ok: false };
       }
     }
@@ -619,7 +619,7 @@ class Actions {
       const ok = await smoothLookAt(bot, { x, y, z }, { signal });
       return { ok };
     } catch (err) {
-      log.debug(`看向 (${x}, ${y}, ${z}) 失败：${err.message}`);
+      log.info(`看向 (${x}, ${y}, ${z}) 失败：${err.message}`);
       return { ok: false };
     }
   }
@@ -943,7 +943,7 @@ class Actions {
         await craftOnceAndSettle(table);
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`第 ${attempts} 次重试合成 ${want} 也失败：${describeFailure(err)}`);
+        log.info(`第 ${attempts} 次重试合成 ${want} 也失败：${describeFailure(err)}`);
       }
       await this._closeWindowsAndSettle(bot, signal);
     }
@@ -959,7 +959,7 @@ class Actions {
         await craftOnceAndSettle(table);
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`继续合成 ${want} 第 ${guard} 份失败（已做出 ${produced} 份）：${describeFailure(err)}`);
+        log.info(`继续合成 ${want} 第 ${guard} 份失败（已做出 ${produced} 份）：${describeFailure(err)}`);
         break;
       }
       const now = (this.inventoryMap()[want] || 0) - (before[want] || 0);
@@ -1031,7 +1031,7 @@ class Actions {
             // 刚放下的这个记下来：下次直接走回来
             if (table && this.stations) this.stations.remember('crafting_table', table.position);
           } catch (err) {
-            log.debug(`放置工作台失败：${err.message}`);
+            log.info(`放置工作台失败：${err.message}`);
           }
         }
       }
@@ -1347,7 +1347,7 @@ class Actions {
     try {
       return await this.eat({ signal });
     } catch (err) {
-      log.debug(`自动进食失败：${err.message}`);
+      log.info(`自动进食失败：${err.message}`);
       return null;
     }
   }
@@ -1410,7 +1410,7 @@ class Actions {
       try {
         await bot.lookAt(vec3(aimX, aimY, aimZ), true);
       } catch (err) {
-        log.debug(`瞄准失败：${err.message}`);
+        log.info(`瞄准失败：${err.message}`);
       }
 
       // 拉弓 → 等蓄力 → 放
@@ -1561,7 +1561,7 @@ class Actions {
         bot.attack(live);
         attacks += 1;
       } catch (err) {
-        log.debug(`攻击失败：${err.message}`);
+        log.info(`攻击失败：${err.message}`);
       }
       // **走位：像真人那样侧移绕圈**，而不是站着对砍。
       // 站着不动对砍在 MC 里很吃亏（怪会连续命中），而且看着也不像人在打架。
@@ -1755,7 +1755,7 @@ class Actions {
         });
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`走到床边失败，就地试着睡：${err.message}`);
+        log.info(`走到床边失败，就地试着睡：${err.message}`);
       }
     }
 
@@ -1842,7 +1842,7 @@ class Actions {
         });
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`走到 ${target} 身边失败：${err.message}`);
+        log.info(`走到 ${target} 身边失败：${err.message}`);
       }
     }
     if (item) {
@@ -1956,7 +1956,7 @@ class Actions {
           await win.deposit(item.type, null, n);
           moved[item.name] = (moved[item.name] || 0) + n;
         } catch (err) {
-          log.debug(`存入 ${item.name} 失败：${err.message}`);
+          log.info(`存入 ${item.name} 失败：${err.message}`);
         }
       }
     } finally {
@@ -2457,7 +2457,7 @@ function blockAt(bot, x, y, z) {
   try {
     return bot.blockAt(vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
   } catch (err) {
-    log.debug(`blockAt(${x},${y},${z}) 失败：${err.message}`);
+    log.info(`blockAt(${x},${y},${z}) 失败：${err.message}`);
     return null;
   }
 }

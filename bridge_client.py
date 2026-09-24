@@ -349,6 +349,7 @@ class EngineClient:
                         logger.debug("[MC引擎] %s", text)
         except asyncio.CancelledError:
             raise
+        # **有意吞掉**：这里的失败不影响调用方要的结果
         except Exception:  # noqa: BLE001
             pass
 

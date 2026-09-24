@@ -329,7 +329,7 @@ async function huntAnimal({ actions, nav, state, ctx, mob = 'cow', want = 1 }) {
       }
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`打猎失败：${err.message}`);
+      log.info(`打猎失败：${err.message}`);
       break;
     }
   }
@@ -457,7 +457,7 @@ async function cookFood({ actions, nav, state, ctx, count = 4 }) {
       await actions.craft({ item: 'bread', count: Math.floor(actions.countItem('wheat') / 3), signal: ctx.signal });
       steps.push('烤面包');
     } catch (err) {
-      log.debug(`做面包失败：${err.message}`);
+      log.info(`做面包失败：${err.message}`);
     }
   }
 

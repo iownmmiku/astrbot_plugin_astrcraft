@@ -158,6 +158,7 @@ class Inbox:
             for cb in list(self._urgent_listeners):
                 try:
                     cb()
+                # **回调**：监听者抛异常不该影响调用方
                 except Exception:  # noqa: BLE001
                     pass
         return entry

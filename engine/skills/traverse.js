@@ -94,7 +94,7 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
           } catch (err) {
             if (err && err.name === 'CancelledError') throw err;
             // **不因为挖不动就放弃**：接着试垫脚上升（可能照样能上去）
-            log.debug(`清头顶失败（继续试垫脚）：${err.message.slice(0, 60)}`);
+            log.info(`清头顶失败（继续试垫脚）：${err.message.slice(0, 60)}`);
           }
         }
       }
@@ -401,7 +401,7 @@ async function digPath({ actions, nav, ctx, x, y = null, z, maxBlocks = 8 }) {
     arrived = !!(r && r.arrived);
   } catch (err) {
     if (err && err.name === 'CancelledError') throw err;
-    log.debug(`挖通后走过去失败：${err.message}`);
+    log.info(`挖通后走过去失败：${err.message}`);
   }
 
   if (!dug.length) {

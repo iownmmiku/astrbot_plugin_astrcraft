@@ -115,6 +115,7 @@ def _has_existing_data(path: Path) -> bool:
             p = path / name
             if p.is_file() and p.stat().st_size > 0:
                 return True
+    # **探测**：失败就是「不可写/不存在」，用返回值表达，不是异常
     except Exception:  # noqa: BLE001
         pass
     return False

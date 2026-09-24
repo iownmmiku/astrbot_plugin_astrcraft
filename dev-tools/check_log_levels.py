@@ -241,18 +241,25 @@ def main() -> int:
         print()
 
     print("=" * 60)
-    # **两条规则都不让脚本失败** —— 这是个"提示性检查"，不是门禁。
+    # **两条规则都归零了，所以现在让它真的失败**（2026-09）。
     #
-    # 为什么不让它红：规则 B 有 100 多处，一次报 100 条红的，
-    # 结果就是**没人会看这个检查器** —— 那还不如不写。
-    # 它的价值在于"跑 run_all 时提醒你还有多少处没提级别"，
-    # 以及"新写的代码别再这样"。
+    # 历史：一开始规则 B 有 114 处、规则 A 有 20 处 —— 那时**故意让它只提示不失败**，
+    # 因为一次报 100 多条红的，结果是**没人会看这个检查器**，那还不如不写。
+    #
+    # 现在两批都清完了（`dev-tools/raise_failure_logs.py` 批量提的级别，
+    # 规则 A 的 20 处是加了说明注释）。**归零之后就该变成门禁** ——
+    # 否则新写的代码会慢慢退回去。
     if rule_a:
-        print(f"⚠️  {len(rule_a)} 处静默吞掉（规则 A）—— 建议加上日志或写明为什么可以吞")
+        print(f"❌ {len(rule_a)} 处静默吞掉（规则 A）—— 加日志，或写明为什么可以吞")
+        for rel, ln, text, _ in rule_a[:5]:
+            print(f"     {rel}:{ln}  {text[:60]}")
     if rule_b:
-        print(f"ℹ️  {len(rule_b)} 处失败原因用了 debug（规则 B）—— 建议逐步提到 info")
-    if not rule_a and not rule_b:
-        print("✅ 没有发现")
+        print(f"❌ {len(rule_b)} 处失败原因用了 debug（规则 B）—— 提到 info")
+        for rel, ln, text, _ in rule_b[:5]:
+            print(f"     {rel}:{ln}  {text[:60]}")
+    if rule_a or rule_b:
+        return 1
+    print("✅ 没有发现")
     return 0
 
 

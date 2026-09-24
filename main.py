@@ -341,6 +341,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 if self.engine.running and self.connected:
                     await self.engine.call("disconnect", {}, timeout=5.0)
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except Exception:  # noqa: BLE001
                 pass
             await self.engine.stop()
@@ -409,6 +410,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                         st = await self.engine.status()
                         if not st.get("connected"):
                             await self._auto_connect(reason="监管发现游戏掉线，尝试恢复连接")
+                    # **有意吞掉**：这里的失败不影响调用方要的结果
                     except Exception:  # noqa: BLE001
                         pass
             # 顺手把心情推给引擎（情绪表达：动机水位 → 走路节奏）。
@@ -454,7 +456,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     #   排查时看着像"掉了两次"）。
                     marked_down = True
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("标记引擎停牌失败：%s", exc)
+                    logger.info("标记引擎停牌失败：%s", exc)
             try:
                 # stop() 会关 stdin、3 秒后强杀——假死的进程只能这样收掉。
                 # 它同时会清掉 _engine_info（P3），所以下面 start() 必须重新等 engine.ready。
@@ -472,7 +474,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 try:
                     self.life.note_engine_up(False)
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("标记引擎停牌失败：%s", exc)
+                    logger.info("标记引擎停牌失败：%s", exc)
             try:
                 await self.engine.start()
                 if self.life:
@@ -692,6 +694,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 if getattr(d, "key", None) == key:
                     label = getattr(d, "label", key)
                     break
+        # **尽力而为**的统计：拿不到就当 0，不影响主流程
         except Exception:  # noqa: BLE001
             pass
         mood = {
@@ -798,7 +801,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 self.life.note_dead(False)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("解除死亡停牌失败：%s", exc)
+                logger.info("解除死亡停牌失败：%s", exc)
 
         # **每次进游戏都重新排一份计划**（用户要的"每一次进游戏也会生成一个任务"）。
         # 旧的计划是针对"上次那个处境"排的，进服后处境可能完全不同
@@ -807,7 +810,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 self.life.on_session_start()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("会话开始时清理计划失败：%s", exc)
+                logger.info("会话开始时清理计划失败：%s", exc)
 
         await self._notify_subscribers(
             f"✅ 机器人已进入 Minecraft（{data.get('username')}，{data.get('version')}）\n位置 ({pos.get('x')}, {pos.get('y')}, {pos.get('z')})"
@@ -830,7 +833,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     len(saved.get("items") or []),
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("读取见闻失败：%s", exc)
+                logger.info("读取见闻失败：%s", exc)
 
         # 2) 人格可能被改过，重新按人格调整动机倾向
         if self.drives and self.persona:
@@ -838,7 +841,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 cur = await self.persona.resolve()
                 self.drives.apply_personality(cur.get("prompt") or "")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("按人格调整动机失败：%s", exc)
+                logger.info("按人格调整动机失败：%s", exc)
 
         # 3) 启动"过日子"循环
         if self.life and not self.life.running:
@@ -863,7 +866,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             hp_text = f"（血量 {hp}）" if hp is not None else ""
             self.life.note_world_event("hurt", f"我被打了一下{hp_text}", urgent=True)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("受伤事件入队失败：%s", exc)
+            logger.info("受伤事件入队失败：%s", exc)
 
     async def _on_bot_hungry(self, data: dict) -> None:
         """她饿了 → 入队（W4）。不是急件：反射层会自己找东西吃。"""
@@ -875,7 +878,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 "hungry", f"我饿了（饱食度 {food}），得吃点东西" if food is not None else "我饿了"
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("饥饿事件入队失败：%s", exc)
+            logger.info("饥饿事件入队失败：%s", exc)
 
     async def _on_tool_broken(self, data: dict) -> None:
         """工具坏了 → 入队（W4）。
@@ -890,7 +893,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             item = str(data.get("item") or "工具")
             self.life.note_world_event("tool_broken", f"我的{item}用坏了")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("工具损坏事件入队失败：%s", exc)
+            logger.info("工具损坏事件入队失败：%s", exc)
 
     @staticmethod
     def _looks_like_full(error: str) -> bool:
@@ -961,7 +964,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 # 之前没有这个状态，死了之后决策层照样在跑，只是每件事都失败。
                 self.life.note_dead(True)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("记录死亡地点失败：%s", exc)
+                logger.info("记录死亡地点失败：%s", exc)
             asyncio.create_task(
                 self.life.share_event(kind="death", text=f"我在 {place} 死了", force=True),
                 name="mc-share-death",
@@ -1017,7 +1020,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         try:
             st = await self.engine.call("state.get", {"detail": "normal"}, timeout=8.0)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取状态快照失败：%s", exc)
+            logger.info("取状态快照失败：%s", exc)
             return out
         if not isinstance(st, dict):
             return out
@@ -1038,7 +1041,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 if not out.get("inventory_slots_used"):
                     out["inventory_slots_used"] = len(items)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取背包失败：%s", exc)
+            logger.info("取背包失败：%s", exc)
         return out
 
     async def _on_task_finished(self, data: dict) -> None:
@@ -1062,7 +1065,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 self.life.wake(reason=f"{data.get('name') or '任务'} {data.get('status')}")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("唤醒过日子循环失败：%s", exc)
+                logger.info("唤醒过日子循环失败：%s", exc)
 
         # **任务结果也入队**（W4）：这样"砍树做完了""挖矿失败了"会**排着**，
         # 在她本来要停的时候接上（FOLLOW_UP）——
@@ -1090,7 +1093,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                             "chest_full", f"箱子装不下了（{why[:40]}），得先清一清或者换一个"
                         )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("任务结果入队失败：%s", exc)
+                logger.info("任务结果入队失败：%s", exc)
 
         # 把结果写进"失败记忆"：决策层要知道"这个技能刚失败过"，
         # 否则会出现实测过的死循环（同一个技能连失败几十次、持续一小时）。
@@ -1102,7 +1105,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 skill_name = self._skill_name_from_task(task_name)
                 self.life.note_task_result(skill_name or task_name, ok, str(data.get("error") or ""))
             except Exception as exc:  # noqa: BLE001
-                logger.debug("记录任务结果失败：%s", exc)
+                logger.info("记录任务结果失败：%s", exc)
 
         if data.get("kind") != "skill":
             return
@@ -1162,7 +1165,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     dedupe_window=120,
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("任务播报失败：%s", exc)
+            logger.info("任务播报失败：%s", exc)
 
     async def _on_game_chat(self, data: dict) -> None:
         sender = data.get("sender")
@@ -1190,7 +1193,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 self.life.note_owner_said(f"{sender} 说：{message}")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("主人的话入队失败：%s", exc)
+                logger.info("主人的话入队失败：%s", exc)
 
         # 社交也是经历：记下来（她是"认识这个人"的）
         if self.memory:
@@ -1284,13 +1287,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 if pid:
                     return pid
             except Exception as exc:  # noqa: BLE001
-                logger.debug("取会话模型失败，回退默认模型：%s", exc)
+                logger.info("取会话模型失败，回退默认模型：%s", exc)
         try:
             provider = await self.context.get_using_provider_async(umo=umo)
             if provider is not None:
                 return (provider.provider_config or {}).get("id")
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取默认模型失败：%s", exc)
+            logger.info("取默认模型失败：%s", exc)
         return None
 
     async def _llm(self, prompt: str, system: str | None = None, umo: str | None = None) -> str | None:
@@ -1315,6 +1318,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             if hasattr(resp, "result_chain"):
                 try:
                     return resp.result_chain.get_plain_text().strip()
+                # **尽力而为**的统计：拿不到就当 0，不影响主流程
                 except Exception:  # noqa: BLE001
                     pass
             return None
@@ -1341,7 +1345,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             entries = self.memory.recall(query, limit=limit)
             return self.memory.render_for_prompt(entries)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("检索记忆失败：%s", exc)
+            logger.info("检索记忆失败：%s", exc)
             return ""
 
     async def _skill_catalog(self) -> list[dict]:
@@ -1382,7 +1386,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 await self.engine.say(text)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("游戏内发言失败：%s", exc)
+                logger.info("游戏内发言失败：%s", exc)
         await self._notify_subscribers(f"💭 {text}")
 
     async def _on_life_activity(self, decision) -> None:
@@ -1481,7 +1485,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 chain = MessageChain().message(text)
                 await self.context.send_message(umo, chain)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("推送到 %s 失败：%s", umo, exc)
+                logger.info("推送到 %s 失败：%s", umo, exc)
 
     # ================================================================ 状态读取（带缓存）
 
@@ -1571,6 +1575,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             try:
                 lines.append("")
                 lines.append(self.life.describe())
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1699,7 +1704,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 lines.append(f"【能动吗】{self.life.hold_explain()}")
                 lines.append("")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("渲染停牌说明失败：%s", exc)
+                logger.info("渲染停牌说明失败：%s", exc)
             lines.append(self.life.describe())
         if self.drives:
             lines.append("")
@@ -1710,6 +1715,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 lines.append("")
                 lines.append("【当前状态】")
                 lines.append(await self._get_brief(max_age=3.0))
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except Exception:  # noqa: BLE001
                 pass
         if not lines:
@@ -1842,7 +1848,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 lines.append("")
                 lines.append(f"【待办队列】{self.life.inbox_summary()}")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("渲染队列摘要失败：%s", exc)
+                logger.info("渲染队列摘要失败：%s", exc)
         # **用量台账**（W6）：一次决策到底花多少 token、缓存有没有生效。
         # 没有这行数据就没法谈"不烧 token"——提示词分层省了多少也看不出来。
         try:
@@ -1852,7 +1858,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             lines.append("【用量】")
             lines.append(ledger().describe())
         except Exception as exc:  # noqa: BLE001
-            logger.debug("渲染用量台账失败：%s", exc)
+            logger.info("渲染用量台账失败：%s", exc)
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mc进服", alias={"mcconnect"})
@@ -1907,6 +1913,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             self.life.pause()
             try:
                 await self._engine_call("task.cancel", {})
+            # 清理路径：取消时抛什么都不重要，这里就是要吞掉
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -1928,6 +1935,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 cur = status.get("current")
                 if cur:
                     text += f"\n\n当前动作：{cur.get('name')}（{cur.get('detail') or ''}）"
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except Exception:  # noqa: BLE001
                 pass
         yield event.plain_result(text)

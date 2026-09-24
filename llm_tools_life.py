@@ -53,6 +53,7 @@ class McLifeTools:
                 lines.append("")
                 lines.append("【当前状态】")
                 lines.append(brief)
+            # **有意吞掉**：这里的失败不影响调用方要的结果
             except Exception:  # noqa: BLE001
                 pass
         else:

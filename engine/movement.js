@@ -211,7 +211,7 @@ class Navigator {
       // 只有"找不到路/超时"这类寻路失败才值得分段重试；
       // 其它错误（例如未连接）直接上抛，否则会掩盖真问题。
       if (!(err instanceof PathError) && err.name !== 'PathError') throw err;
-      log.debug(`整段寻路失败（${err.message}），改为分段推进`);
+      log.info(`整段寻路失败（${err.message}），改为分段推进`);
     }
 
     return this._goToSegmented({ x, y: targetY, z, range, signal, timeoutMs, onTick, xzOnly });
@@ -261,7 +261,7 @@ class Navigator {
           stalled = after > before - 0.5 ? stalled + 1 : 0;
         } catch (err) {
           if (err instanceof CancelledError) throw err;
-          log.debug(`分段推进（步长 ${step}）到 (${wx.toFixed(0)}, ${wz.toFixed(0)}) 失败：${err.message}`);
+          log.info(`分段推进（步长 ${step}）到 (${wx.toFixed(0)}, ${wz.toFixed(0)}) 失败：${err.message}`);
           stalled += 1;
         }
         if (stalled >= 3) break; // 这个步长推不动了，换更小的
@@ -495,7 +495,7 @@ class Navigator {
       ? (range > 1 ? new goals.GoalNear(standable.x, standable.y, standable.z, range) : new goals.GoalBlock(standable.x, standable.y, standable.z))
       : new goals.GoalNear(x, targetY === null ? Math.floor(cur.y) : targetY, z, range);
     if (standable && targetY !== null && Math.abs(standable.y - targetY) > 2) {
-      log.debug(`目标高度 ${targetY} 无法站立，改用附近可站立点 y=${standable.y}`);
+      log.info(`目标高度 ${targetY} 无法站立，改用附近可站立点 y=${standable.y}`);
     }
 
     return this._runPath(finalGoal, { x, y: targetY, z, range, timeout, signal, t0, onTick });
@@ -857,7 +857,7 @@ class Navigator {
               });
             } catch (err) {
               if (err instanceof CancelledError) throw err;
-              log.debug(`绕行失败（继续直接跟）：${err.message}`);
+              log.info(`绕行失败（继续直接跟）：${err.message}`);
             }
           }
           void before;
@@ -1196,7 +1196,7 @@ class Navigator {
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`挖开卡住自己的方块失败：${err.message}`);
+        log.info(`挖开卡住自己的方块失败：${err.message}`);
       }
     }
 
@@ -1222,7 +1222,7 @@ class Navigator {
           return true;
         } catch (err) {
           if (err instanceof CancelledError) throw err;
-          log.debug(`脱困挖掘 (${tx},${ty},${tz}) 失败：${err.message}`);
+          log.info(`脱困挖掘 (${tx},${ty},${tz}) 失败：${err.message}`);
         }
       }
     }

@@ -193,7 +193,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
         chestCount = actions.countItem('chest');
         steps.push({ action: 'craft_chest', ok: chestCount > 0 });
       } catch (err) {
-        log.debug(`做箱子失败：${err.message}`);
+        log.info(`做箱子失败：${err.message}`);
         out.skipped.push('箱子（木板不够或合成失败）');
       }
     } else {
@@ -208,7 +208,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
       out.chest = true;
       steps.push({ action: 'place_chest', ok: true });
     } catch (err) {
-      log.debug(`放箱子失败：${err.message}`);
+      log.info(`放箱子失败：${err.message}`);
       out.skipped.push('放箱子');
     }
   }
@@ -231,7 +231,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
         bed = BEDS.find((n) => actions.countItem(n) > 0) || null;
         steps.push({ action: 'craft_bed', ok: !!bed });
       } catch (err) {
-        log.debug(`做床失败：${err.message}`);
+        log.info(`做床失败：${err.message}`);
       }
     } else {
       out.skipped.push('床（要 3 羊毛 + 3 木板，羊毛得去打羊或剪羊毛）');
@@ -244,7 +244,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
       out.bed = true;
       steps.push({ action: 'place_bed', ok: true });
     } catch (err) {
-      log.debug(`放床失败：${err.message}`);
+      log.info(`放床失败：${err.message}`);
       out.skipped.push('放床');
     }
   }
@@ -443,7 +443,7 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
           break;
         }
       } catch (err) {
-        log.debug(`做门失败：${err.message}`);
+        log.info(`做门失败：${err.message}`);
         break;
       }
     }
@@ -459,7 +459,7 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
             await actions.smelt({ item: wood.LOG_NAMES.find((n) => actions.countItem(n) > 0), count: 1, signal: ctx.signal });
             steps.push('烧木炭');
           } catch (err) {
-            log.debug(`烧木炭失败：${err.message}`);
+            log.info(`烧木炭失败：${err.message}`);
           }
         }
       }
@@ -517,7 +517,7 @@ async function clearFootprint({ actions, ctx, origin, outer, wallHeight, steps }
       cleared += 1;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`清理 (${t.x},${t.y},${t.z}) 失败：${err.message}`);
+      log.info(`清理 (${t.x},${t.y},${t.z}) 失败：${err.message}`);
     }
   }
   if (cleared) steps.push(`清理场地 ${cleared} 格`);
@@ -545,7 +545,7 @@ async function fillFloor({ actions, ctx, origin, outer, material, steps }) {
       await actions.place({ x: h.x, y: h.y, z: h.z, item: material.name, signal: ctx.signal, reach: true });
       filled += 1;
     } catch (err) {
-      log.debug(`补地板 (${h.x},${h.y},${h.z}) 失败：${err.message}`);
+      log.info(`补地板 (${h.x},${h.y},${h.z}) 失败：${err.message}`);
     }
   }
   if (filled) steps.push(`补地板 ${filled} 格`);
@@ -737,7 +737,7 @@ async function placeTorches({ actions, ctx, origin, inner, steps }) {
       const r = await actions.place({ x: s.x, y: s.y, z: s.z, item: 'torch', signal: ctx.signal, reach: true });
       if (r.ok) placed += 1;
     } catch (err) {
-      log.debug(`插火把 (${s.x},${s.y},${s.z}) 失败：${err.message}`);
+      log.info(`插火把 (${s.x},${s.y},${s.z}) 失败：${err.message}`);
     }
   }
   if (placed) steps.push(`插火把 ${placed} 个`);

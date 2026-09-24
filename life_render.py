@@ -83,7 +83,7 @@ class PromptRenderMixin:
         try:
             taken = self.inbox.take_steer()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取插话失败：%s", exc)
+            logger.info("取插话失败：%s", exc)
             return ""
         if not taken:
             return ""
@@ -104,7 +104,7 @@ class PromptRenderMixin:
         try:
             taken = self.inbox.take_follow_up()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取接续失败：%s", exc)
+            logger.info("取接续失败：%s", exc)
             return ""
         if not taken:
             return ""
@@ -143,7 +143,7 @@ class PromptRenderMixin:
         try:
             self._on_activity(text)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("写状态简报失败：%s", exc)
+            logger.info("写状态简报失败：%s", exc)
 
     def idle_explain(self) -> str:
         """她是不是"能跑但没事做"——给 /mc状态 用。"""
@@ -168,7 +168,7 @@ class PromptRenderMixin:
             try:
                 raw = await self._llm(prompt, "你在总结一条以后能用的经验。只回答那条经验本身。")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("提炼教训失败：%s", exc)
+                logger.info("提炼教训失败：%s", exc)
                 return
             result = self.knowledge.parse_lesson(raw, skill=skill, source="失败总结")
             if result:
@@ -289,7 +289,7 @@ class PromptRenderMixin:
             if isinstance(data, dict):
                 out.update(data)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取状态失败（顾问将用默认值）：%s", exc)
+            logger.info("取状态失败（顾问将用默认值）：%s", exc)
         return out
 
     def _auto_resume_if_expired(self) -> None:
@@ -579,7 +579,7 @@ class PromptRenderMixin:
                 json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("保存生活状态失败：%s", exc)
+            logger.info("保存生活状态失败：%s", exc)
 
     def failure_summary(self) -> str:
         """最近反复失败的技能（诊断视图用）。

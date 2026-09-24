@@ -611,7 +611,7 @@ function blockAt(bot, x, y, z) {
     if (!bot || typeof bot.blockAt !== 'function') return null;
     return bot.blockAt(vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
   } catch (err) {
-    log.debug(`blockAt(${x},${y},${z}) 失败：${err.message}`);
+    log.info(`blockAt(${x},${y},${z}) 失败：${err.message}`);
     return null;
   }
 }

@@ -307,7 +307,7 @@ const SKILLS = {
         }
       } catch (err) {
         if (err && err.name === 'CancelledError') throw err;
-        log.debug(`爬出来后走出去失败：${err.message}`);
+        log.info(`爬出来后走出去失败：${err.message}`);
       }
 
       // **`skillResult` 的第一个参数是布尔，第二个是对象** ——
@@ -400,7 +400,7 @@ const SKILLS = {
         arrived = !!(r && r.arrived);
       } catch (err) {
         if (err && err.name === 'CancelledError') throw err;
-        log.debug(`走去死亡地点失败：${err.message}`);
+        log.info(`走去死亡地点失败：${err.message}`);
       }
       if (!arrived) {
         return skillResult(false, {
@@ -419,7 +419,7 @@ const SKILLS = {
         got = (res && res.gained) || {};
       } catch (err) {
         if (err && err.name === 'CancelledError') throw err;
-        log.debug(`捡掉落物失败：${err.message}`);
+        log.info(`捡掉落物失败：${err.message}`);
       }
       const names = Object.entries(got);
       if (!names.length) {

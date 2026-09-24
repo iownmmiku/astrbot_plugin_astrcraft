@@ -223,7 +223,7 @@ class McEngine {
     try {
       if (this.config.get('autoEquipArmor')) await this.actions.autoEquipArmor();
     } catch (err) {
-      log.debug(`自动穿戴护甲失败：${err.message}`);
+      log.info(`自动穿戴护甲失败：${err.message}`);
     }
   }
 
@@ -606,7 +606,7 @@ class McEngine {
       try {
         this._noticeNearbyPlayers();
       } catch (err) {
-        log.debug(`玩家接近检测异常：${err.message}`);
+        log.info(`玩家接近检测异常：${err.message}`);
       }
     }, 2000);
     // 主动心跳：见 _keepAliveTick 的说明。这是防止"服务器生成区块时判定失联"的关键。
@@ -819,7 +819,7 @@ class McEngine {
           const confirmed = this._unstuckPending && this._unstuckPending.key === key;
           if (!confirmed) {
             this._unstuckPending = { key, at: now };
-            log.debug(`疑似被 ${stuckBlock.name} 卡住，再确认一次`);
+            log.info(`疑似被 ${stuckBlock.name} 卡住，再确认一次`);
           } else if (now - this._unstuckPending.at >= 2000) {
             this._unstuckPending = null;
             // **不"放弃"，而是"升级办法"——绝不静默。**
@@ -967,7 +967,7 @@ class McEngine {
                     dugAny += 1;
                   } catch (err) {
                     if (err instanceof CancelledError) throw err;
-                    log.debug(`挖困自救：挖 ${cell.name} 失败（${err.message}）`);
+                    log.info(`挖困自救：挖 ${cell.name} 失败（${err.message}）`);
                   }
                 }
                 if (!dugAny) log.debug('挖困自救：一格都没挖成（都不贴身了）');
@@ -1129,7 +1129,7 @@ class McEngine {
               await this.nav.goTo({ x: tx, y: null, z: tz, range: 3, signal, timeoutMs: 15000 });
             } catch (err) {
               // 撤不动（被围住/地形复杂）不算异常，别让它在日志里刷错误堆
-              log.debug(`后撤失败（可能被围住）：${err.message}`);
+              log.info(`后撤失败（可能被围住）：${err.message}`);
               this.state.note('想后撤但走不动，可能被围住了');
             }
           });
@@ -1208,7 +1208,7 @@ class McEngine {
                   const r = await this.actions.place({ ...spot, item: 'torch', signal, reach: true });
                   if (r && r.ok) this.state.note('插了个火把照亮这里');
                 } catch (err) {
-                  log.debug(`插火把失败：${err.message}`);
+                  log.info(`插火把失败：${err.message}`);
                 }
               });
             }
@@ -1227,7 +1227,7 @@ class McEngine {
                   await this.actions.craft({ item: 'torch', count: 4, signal });
                   this.state.note('做了几个火把，这里太黑了');
                 } catch (err) {
-                  log.debug(`做火把失败：${err.message}`);
+                  log.info(`做火把失败：${err.message}`);
                 }
               });
             }
@@ -1440,7 +1440,7 @@ class McEngine {
           return true;
         }
       } catch (err) {
-        log.debug(`垫方块自救失败：${err.message}`);
+        log.info(`垫方块自救失败：${err.message}`);
       }
     }
     log.warn(
@@ -1663,7 +1663,7 @@ class McEngine {
             // 自己把自己降频。
             const name = err && err.name;
             if (name === 'CancelledError' || name === 'AbortError') {
-              log.debug(`${task.name} 被取消（不算失败，不调 onFailed）`);
+              log.info(`${task.name} 被取消（不算失败，不调 onFailed）`);
               return;
             }
             if (hooks.onFailed) hooks.onFailed(err);

@@ -120,7 +120,7 @@ async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label =
       if (err instanceof CancelledError) throw err;
       fails += 1;
       lastError = describeFailure(err);
-      log.debug(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
+      log.info(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
       // **带调用栈，而且要用 warn 级别**。
       //
       // 这类"某个变量是 null"的报错只看消息定位不了是哪一行
@@ -327,7 +327,7 @@ async function dropToGround({ actions, nav, ctx, maxSegments = 16, minDrop = 2 }
           });
         } catch (err) {
           if (err instanceof CancelledError) throw err;
-          log.debug(`挖树冠 ${b.name} 失败：${err.message}`);
+          log.info(`挖树冠 ${b.name} 失败：${err.message}`);
         }
       }
     }
@@ -897,7 +897,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         break;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.debug(`向上挖阶梯失败（换方向）：${err.message}`);
+        log.info(`向上挖阶梯失败（换方向）：${err.message}`);
       }
     }
 
@@ -1120,7 +1120,7 @@ async function widenShaft({ actions, nav, ctx, bx, by, bz }) {
       return true;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.debug(`开侧洞失败（换方向）：${err.message}`);
+      log.info(`开侧洞失败（换方向）：${err.message}`);
     }
   }
   return false;

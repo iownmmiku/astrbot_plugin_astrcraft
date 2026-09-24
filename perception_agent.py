@@ -195,7 +195,7 @@ class PerceptionAgent:
         try:
             provider = await plugin.context.get_using_provider_async()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("取 provider 失败：%s", exc)
+            logger.info("取 provider 失败：%s", exc)
             provider = None
         if provider is None:
             return None, []
