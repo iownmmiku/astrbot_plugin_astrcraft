@@ -17,7 +17,7 @@
  * 一轮 6 步最多挖几格，**她永远挖不通一条路**。
  */
 
-const { skillResult, pillarUpOne, isDangerousBlock } = require('./common');
+const { skillResult, pillarUpOne, stairUpOne, isDangerousBlock } = require('./common');
 const { vec3, delay, distance } = require('../util');
 const log = require('../log');
 
@@ -98,7 +98,21 @@ async function pave({ actions, nav, ctx, direction = 'forward', count = 4, item 
           }
         }
       }
-      const ok = await pillarUpOne({ actions, ctx, bx, by, bz });
+      // **先试螺旋阶梯**（这一轮加的）。
+      //
+      // 用户实测："往高处垫的时候，还是做不到跳起来然后往脚下垫方块，
+      // **很多时候只能往旁边放**。"
+      //
+      // 这句话就是答案：**"往旁边放"可靠，"往脚下放"不可靠**。
+      // 螺旋阶梯 = 往旁边放一块 → 跳上去 → 重复，**全程站着放**，
+      // 所以没有那个"要趁跳跃空中发包"的窗口。
+      //
+      // `pillarUpOne`（跳起来往脚下放）降级成备选：它在四周被挡住、
+      // 没地方放旁边时还有用。
+      let ok = await stairUpOne({ actions, nav, ctx, bx, by, bz });
+      if (!ok) {
+        ok = await pillarUpOne({ actions, ctx, bx, by, bz });
+      }
       if (!ok) break;
       done += 1;
       ctx.progress(`垫高 ${done}/${n} 格`);

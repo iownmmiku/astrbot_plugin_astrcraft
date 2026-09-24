@@ -121,13 +121,21 @@ async function runSkill(skill, params, sec = 120) {
 (async () => {
   const rcon = Rcon.fromDir(RCON_DIR, 25576);
   const USER = 'Pit' + Math.floor(Math.random() * 9000);
+  // **每次运行换一块地**（这一轮加的）。
+  //
+  // 为什么必须：`stairUpOne` / `digStepUp` 会**在坑里留下方块**（那正是它们的作用）。
+  // 于是第二次跑同一个坐标时，坑已经被填了一部分 ——
+  // 测出来的就不是"能不能爬出来"，而是"在一个被填过的坑里能不能爬出来"。
+  // 实测症状：单跑一个新坐标 100% 成功，而连跑时第 1 项会红。
+  // 这和 `test_pathfinding` 那个"六个场景共用一片地"是同一个病。
+  const BASE = 2000 + Math.floor(Math.random() * 4000);
   await call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER }, 60000);
   await sleep(6000);  console.log('=== 从坑里出来（三种真实情况）===\n');
 
   // ---------- 情况 1：有方块（应该能垫出来）----------
   console.log('[1] 3 格深的坑 + 背包里有 32 个圆石（没有镐）');
   {
-    const p = await makePit(rcon, USER, 200, 3);
+    const p = await makePit(rcon, USER, BASE + 0, 3);
     await rcon.command(`give ${USER} cobblestone 32`);
     await sleep(1500);
     await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
@@ -145,7 +153,7 @@ async function runSkill(skill, params, sec = 120) {
   // ---------- 情况 2：有镐（应该能挖出来）----------
   console.log('\n[2] 3 格深的坑 + 有石镐（泥土/石头壁可挖）');
   {
-    const p = await makePit(rcon, USER, 260, 3);
+    const p = await makePit(rcon, USER, BASE + 60, 3);
     await rcon.command(`give ${USER} stone_pickaxe 1`);
     await sleep(1500);
     await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
@@ -163,7 +171,7 @@ async function runSkill(skill, params, sec = 120) {
   // ---------- 情况 3：什么都没有（应该如实说"出不去"）----------
   console.log('\n[3] 3 格深的坑 + 什么都没有（没有方块也没有镐）');
   {
-    const p = await makePit(rcon, USER, 320, 3);
+    const p = await makePit(rcon, USER, BASE + 120, 3);
     await rcon.command(`clear ${USER}`);
     await sleep(1500);
     await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
@@ -194,7 +202,7 @@ async function runSkill(skill, params, sec = 120) {
   // 前面那三条都太浅（3 格），盖不到这个情况。
   console.log('\n[4] 真实场景：10 格深的 1x1 竖井 + 有镐 + 有圆石（挖矿回来的样子）');
   {
-    const p = await makePit(rcon, USER, 380, 10);
+    const p = await makePit(rcon, USER, BASE + 180, 10);
     await rcon.command(`give ${USER} stone_pickaxe 1`);
     await rcon.command(`give ${USER} cobblestone 32`);
     await sleep(1500);

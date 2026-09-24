@@ -686,6 +686,114 @@ function isOpenSky(bot, need = 3) {
   return true;
 }
 
+/**
+ * **螺旋阶梯上升：往旁边放一块，跳上去，重复。**
+ *
+ * ## 为什么要这个（用户实测反馈）
+ *
+ * 用户说："往高处垫的时候，还是做不到跳起来然后往脚下垫方块，
+ * **很多时候只能往旁边放**。"
+ *
+ * 这句话点出了关键：**"往旁边放"是可靠的，"往自己脚下放"不是。**
+ *
+ * 为什么：
+ *   · **往旁边放** —— 那一格不归她占，她**站在地上**放，服务端接受。
+ *   · **往脚下放** —— 必须**趁跳跃的空中**把包发出去，而 MC 的跳跃全程只有
+ *     约 0.5 秒、最高点在 ~0.25 秒。等放置包到达服务端时她**已经落回那一格**了，
+ *     服务端回 `Server refused to place ... the block is still [occupied]`。
+ *     （试过"起跳前先瞄准"省掉转头那次往返，也没解决。）
+ *
+ * ## 做法：既然"往旁边放"可靠，就用它来上升
+ *
+ *   ① 她站在实地上 `(bx, by, bz)`
+ *   ② **往旁边那一格的地面位置放一块**（`(nx, by, nz)`）—— 站着放
+ *   ③ **跳上那一块**（1 格台阶）→ 她现在在 `(nx, by+1, nz)`
+ *   ④ 重复 ②③ → 高度 +1、+1、+1…**螺旋上升**
+ *
+ * **每一步都不涉及"往自己脚下放"** —— 所以没有那个时序窗口。
+ *
+ * @returns true = 真的升上去了（**验证高度**，不信 goTo 的返回值）
+ */
+async function stairUpOne({ actions, nav, ctx, bx, by, bz }) {
+  const bot = actions.bot;
+  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
+  const filler = CANDIDATES.find((n) => actions.countItem(n) > 0);
+  if (!filler) return false;
+
+  // **必须站在地上**：跳跃只有站在地上才有效（下落中 jump 是空的）
+  {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 4000) {
+      if (bot.entity && bot.entity.onGround) break;
+      await delay(100, { signal: ctx.signal });
+    }
+    if (!bot.entity.onGround) return false;
+  }
+  // 用**现在**的位置（调用方的 by 可能是过期的 —— 这个坑踩过）
+  const now = bot.entity.position;
+  bx = Math.floor(now.x);
+  by = Math.floor(now.y);
+  bz = Math.floor(now.z);
+
+  const dirs = [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ];
+  for (const [dx, dz] of dirs) {
+    const nx = bx + dx;
+    const nz = bz + dz;
+    const foot = blockAt(bot, nx, by, nz); // 要放方块的那一格（她脚的高度）
+    const stand = blockAt(bot, nx, by + 1, nz); // 跳上去之后站的位置
+    const above = blockAt(bot, nx, by + 2, nz); // 头顶
+    if (!foot || !stand || !above) continue;
+    // 那一格得是空的才能放；站的位置和头顶也得是空的
+    const empty = (b) => b.boundingBox === 'empty' || b.name === 'air';
+    if (!empty(stand) || !empty(above)) continue;
+    if (isDangerousBlock(stand.name) || isDangerousBlock(above.name)) continue;
+
+    // **脚那一格已经有方块了 → 不用放，直接跳上去就行**
+    const needPlace = empty(foot);
+    if (needPlace) {
+      if (!empty(foot)) continue;
+      ctx.progress(`往旁边垫一块（(${nx}, ${by}, ${nz})），再跳上去`);
+      try {
+        // **站着放** —— 这是关键：没有跳跃窗口，服务端会接受
+        await actions.place({ x: nx, y: by, z: nz, item: filler, signal: ctx.signal, reach: true });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        log.info(`螺旋阶梯：往 (${nx}, ${by}, ${nz}) 放 ${filler} 失败：${String(err.message).slice(0, 60)}`);
+        continue;
+      }
+      await delay(250, { signal: ctx.signal });
+      const placed = blockAt(bot, nx, by, nz);
+      if (!placed || placed.boundingBox !== 'block') {
+        log.info(`螺旋阶梯：放了但读不到（(${nx}, ${by}, ${nz}) = ${placed ? placed.name : 'null'}）`);
+        continue;
+      }
+    }
+
+    // 跳上去（1 格台阶）
+    const beforeY = Math.floor(bot.entity.position.y);
+    try {
+      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.2, signal: ctx.signal, timeoutMs: 6000 });
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      log.info(`螺旋阶梯：跳上 (${nx}, ${by + 1}, ${nz}) 失败：${String(err.message).slice(0, 60)}`);
+      continue;
+    }
+    await delay(250, { signal: ctx.signal });
+    const afterY = Math.floor(bot.entity.position.y);
+    if (afterY > beforeY) {
+      log.info(`螺旋阶梯：升上去了（y ${beforeY} → ${afterY}）`);
+      return true;
+    }
+    log.info(`螺旋阶梯：放了但没跳上去（还在 y=${afterY}，目标是 ${by + 1}）`);
+  }
+  return false;
+}
+
 async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   const bot = actions.bot;
   if (!isUnderground(bot)) return { ok: true, steps: 0, already: true };
@@ -824,6 +932,16 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         climbed += 1;
         continue;
       }
+      // **先试螺旋阶梯**（这一轮加的）。
+      //
+      // 为什么排在"垫脚上升"前面：用户实测"跳起来往脚下放"做不到，
+      // **而"往旁边放"是可靠的** —— 螺旋阶梯只用到"往旁边放"，
+      // 所以它没有那个几十毫秒的跳跃窗口。
+      if (await stairUpOne({ actions, nav, ctx, bx, by, bz })) {
+        climbed += 1;
+        continue;
+      }
+      // 垫脚上升降级成备选：它有时能用（比如四周都被挡住、没地方放旁边）
       if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
         climbed += 1;
         continue;
@@ -1029,4 +1147,5 @@ module.exports = {
   // 见 digStepUp 的注释——它的设计一直写在 climbToSurface 的文档里，
   // 但实现里从来没有，用户实测"有镐却爬不出来"就是这个原因。
   digStepUp,
+  stairUpOne,
 };
