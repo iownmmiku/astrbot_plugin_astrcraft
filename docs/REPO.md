@@ -55,16 +55,20 @@
 
 ---
 
-## 那开发仓库怎么办
+## 开发仓库：**已退休**（改名为 `mc-astrbot-RETIRED`）
 
-**没有删。** 它还在 `D:\工作台\mc-astrbot`，里面的 `node_modules` 和
-`.testserver` 还在被测试用（通过目录联接）。
+它原来在 `D:\工作台\mc-astrbot`，现在改名为 **`mc-astrbot-RETIRED`**。
 
-**建议**：
-1. **别再往里写代码** —— 改了这里就够了
-2. 等确认一段时间没问题之后，再决定要不要把它变成这里的一个 clone
-   （`git clone Astrcraft mc-astrbot`），或者直接删掉
-3. **在删掉之前，别再做"同步"这个动作** —— 那正是出事故的来源
+**没有删** —— 改名是**可逆**的，删除不是。确认一段时间没问题之后再删也不迟。
+
+删之前我把"只在它里面有"的东西搬了过来（比对过 122 个源码文件）：
+  · `docs/ACCEPTANCE.md`（1068 行验收清单，带实测结果）→ 搬到这里
+  · `PLAN.md` → 搬成 `docs/archive/PLAN_v1.md`（已被 `docs/PLAN_v2.md` 取代）
+  · `scripts/install.ps1`（npm 缓存目录的变通）→ 搬成 `dev-tools/install.ps1`
+  · `scripts/verify.ps1` → **没搬**：它做的就是 `run_all.py` 现在做的事
+  · `bot/tools/_su2.js` → **没搬**：那是我调试时留下的临时探针
+
+**别再做"同步"这个动作** —— 那正是出事故的来源。
 
 ---
 
