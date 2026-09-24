@@ -91,22 +91,40 @@ const bad = (m, d) => {
 /** 造一个 depth 格深的坑，把她放进去 */
 async function makePit(rcon, user, X, depth) {
   const Z = 0;
-  // **地板要跟着深度往下铺**（第一版写死到 -64，depth=10 时挖穿了地板，
-  // 她直接掉到 y=-88 的虚空里、圆石也摔掉了 —— 测出来全是假的）。
-  const floorBottom = -61 - depth - 6;
-  await rcon.command(`fill ${X - 6} ${floorBottom} ${Z - 6} ${X + 6} -61 ${Z + 6} minecraft:stone`);
-  await rcon.command(`fill ${X - 6} -60 ${Z - 6} ${X + 6} -40 ${Z + 6} minecraft:air`);
-  await sleep(2000);
-  // 在她那一格往下挖 depth 格
-  const top = -61; // 站在 -60，支撑在 -61
+
+  // **世界最低高度是 -64，不能往下挖穿它。**
+  //
+  // 踩过两次，都是"往下挖"：
+  //   ① 第一版写死到 -64，depth=10 时挖穿了地板 → 她掉到 y=-88 的虚空
+  //   ② 第二版改成 `-61 - depth - 6` → depth=10 时是 **-77，超出世界高度**，
+  //      服务端直接回 "That position is out of this world!"，
+  //      **整条 fill 被拒绝、一块地板都没铺** → 她掉到 y=-111
+  //
+  // 所以：**深坑要往上堆，不是往下挖。**
+  // 从 -64（世界底）往上堆到 `-61 + depth`，她站在顶上，
+  // 然后把脚下 depth 格挖空 —— 坑底永远是 -63，稳稳在世界里。
+  const FLOOR = -63;                       // 坑底（世界最低是 -64，留一格）
+  const SURFACE = FLOOR + depth;           // 坑口那一层（她站在它上面）
+  const standY = FLOOR + 1;                // 她脚的位置
+  const top = SURFACE;                     // 她脚下的支撑层
+
+  // 从世界底往上堆到坑口
   await rcon.command(
-    `fill ${X} ${top - depth + 1} ${Z} ${X} ${top} ${Z} minecraft:air`,
+    `fill ${X - 6} -64 ${Z - 6} ${X + 6} ${top} ${Z + 6} minecraft:stone`,
+  );
+  // 上面清空
+  await rcon.command(
+    `fill ${X - 6} ${top + 1} ${Z - 6} ${X + 6} ${top + 20} ${Z + 6} minecraft:air`,
+  );
+  await sleep(2500);
+  // 在她那一格往下挖 depth 格（从坑口往下）
+  await rcon.command(
+    `fill ${X} ${standY} ${Z} ${X} ${top} ${Z} minecraft:air`,
   );
   await sleep(1500);
-  const standY = top - depth + 1; // 坑底：脚站在这里
   await rcon.command(`tp ${user} ${X + 0.5} ${standY} ${Z + 0.5}`);
   await sleep(2500);
-  return { X, Z, standY, surfaceY: -60 };
+  return { X, Z, standY, surfaceY: SURFACE };
 }
 
 async function runSkill(skill, params, sec = 120) {
