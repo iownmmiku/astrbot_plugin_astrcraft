@@ -140,11 +140,20 @@ print("\n=== 提示词里的步数必须和 MAX_STEPS 一致 ===")
 from astrcraft_plugin.action_agent import ACTION_PROMPT, _STEPS_TOKEN  # noqa: E402
 
 ok("提示词里没有残留占位符", _STEPS_TOKEN not in ACTION_PROMPT, _STEPS_TOKEN)
-_step_nums = re.findall(r"(\d+)\s*步", ACTION_PROMPT)
+# **只认"最多 N 步"这种"声称步数预算"的表述**（这一轮收窄的）。
+#
+# 原来是 `(\d+)\s*步` —— 太宽：提示词里新加了一句
+# "一次给出 2~5 步"（说的是**计划长度**，不是步数预算），
+# 也被它当成"声称了一个不同的 MAX_STEPS"，于是测试红了。
+#
+# 断言的**真实意图**是"提示词不能声称一个和代码不一致的**步数上限**"，
+# 所以只该匹配"最多 N 步"。宽的正则会让**正确的文案**被判成错 ——
+# 那种测试最后只会被人改成"反正它老红，跳过吧"。
+_step_nums = re.findall(r"最多\s*(\d+)\s*步", ACTION_PROMPT)
 ok("提示词里确实提到了步数（断言本身有效）", len(_step_nums) >= 1, f"找到 {_step_nums}")
 _step_bad = sorted({int(n) for n in _step_nums if int(n) != MAX_STEPS})
 ok(
-    "提示词里所有步数都等于 MAX_STEPS",
+    "提示词里声称的步数上限等于 MAX_STEPS",
     not _step_bad,
     f"提示词={_step_nums}，MAX_STEPS={MAX_STEPS}"
     + (f"，不一致的有 {_step_bad}" if _step_bad else ""),
