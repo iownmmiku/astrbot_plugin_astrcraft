@@ -123,6 +123,37 @@ async function waitTask(c, id, ms) {
   await c.call('connect', { host: '127.0.0.1', port: PORT, version: '1.20.1', username: USER, spawnProtectionRadius: 0 }, 60000);
   await sleep(5000);
 
+  // **先把她送到一片新区域**（这一轮加的）。
+  //
+  // 为什么必须：这个测试用的是**她的出生位置**，而她每次都出生在同一个世界出生点 ——
+  // 那片地早就被历次测试挖光了。
+  // 实测症状：连跑第 3 次报"一个圆石都没挖到（背包变化 {"dirt":2}）"——
+  // **挖到的是泥土，说明那片已经没有石头了**。
+  // 这和 test_pathfinding 的"六个场景共用一片地"、test_pit_escape 的固定坐标
+  // 是同一个病：**测试之间没有隔离**。
+  const AREA_X = 3000 + Math.floor(Math.random() * 6000);
+  const AREA_Z = 3000 + Math.floor(Math.random() * 6000);
+  await rcon.command(`forceload add ${AREA_X - 32} ${AREA_Z - 32} ${AREA_X + 32} ${AREA_Z + 32}`);
+  await sleep(2000);
+  // 铺一层石头地面（超平坦世界只有 4 层，下面直接是基岩，挖不到圆石）
+  // **往上堆一个高台**，不是只铺 4 层。
+  //
+  // 踩过：第一版只铺 -64..-61（超平坦世界的 4 层），而 **-64 以下就是虚空**，
+  // 挖不了更多 —— 于是测试**稳定地**报"只挖到圆石 ×6（目标 8）"，
+  // 四次一模一样（稳定，但稳定地失败）。
+  //
+  // 堆到 -40 就有 25 层石头可挖。
+  await rcon.command(
+    `fill ${AREA_X - 16} -64 ${AREA_Z - 16} ${AREA_X + 16} -40 ${AREA_Z + 16} minecraft:stone`,
+  );
+  await rcon.command(
+    `fill ${AREA_X - 16} -39 ${AREA_Z - 16} ${AREA_X + 16} -20 ${AREA_Z + 16} minecraft:air`,
+  );
+  await sleep(3000);
+  await rcon.command(`tp ${USER} ${AREA_X + 0.5} -39 ${AREA_Z + 0.5}`);
+  await sleep(2500);
+  console.log(`  测试区域：(${AREA_X}, ${AREA_Z})`);
+
   const st0 = await c.call('state.get', { detail: 'brief' });
   const bp = st0.block_position;
   console.log(`出生位置 (${bp.x}, ${bp.y}, ${bp.z})，脚下 ${st0.standing_on}`);
@@ -180,7 +211,7 @@ async function waitTask(c, id, ms) {
 
   console.log('\n[3] 盖一个带门的小屋：build_shelter(size=3)');
   const r3 = await c.call('skill.run', { skill: 'build_shelter', params: { size: 3 } });
-  const t3 = await waitTask(c, r3.task_id, 300000);
+  const t3 = await waitTask(c, r3.task_id, 420000);
   console.log(`    任务 ${t3.status}${t3.error ? ' 错误：' + t3.error : ''}`);
   if (t3.status === 'done') {
     ok('庇护所建成');

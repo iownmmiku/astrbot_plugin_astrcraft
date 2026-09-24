@@ -73,7 +73,7 @@ TIMEOUTS = {
     "test_pathfinding.js": 420,
     "test_mine_return.js": 420,
     "test_pit_escape.js": 420,
-    "test_survival_chain.js": 420,
+    "test_survival_chain.js": 900,  # 盖房那步最长 420 秒
     "test_blueprint.js": 420,
     "test_integration.py": 420,
     "test_all_tools.py": 420,
