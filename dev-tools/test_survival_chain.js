@@ -133,7 +133,7 @@ async function waitTask(c, id, ms) {
   // 是同一个病：**测试之间没有隔离**。
   const AREA_X = 3000 + Math.floor(Math.random() * 6000);
   const AREA_Z = 3000 + Math.floor(Math.random() * 6000);
-  await rcon.command(`forceload add ${AREA_X - 32} ${AREA_Z - 32} ${AREA_X + 32} ${AREA_Z + 32}`);
+  await rcon.command(`forceload add ${AREA_X - 48} ${AREA_Z - 48} ${AREA_X + 48} ${AREA_Z + 32}`);
   await sleep(2000);
   // 铺一层石头地面（超平坦世界只有 4 层，下面直接是基岩，挖不到圆石）
   // **往上堆一个高台**，不是只铺 4 层。
@@ -143,12 +143,44 @@ async function waitTask(c, id, ms) {
   // 四次一模一样（稳定，但稳定地失败）。
   //
   // 堆到 -40 就有 25 层石头可挖。
-  await rcon.command(
-    `fill ${AREA_X - 16} -64 ${AREA_Z - 16} ${AREA_X + 16} -40 ${AREA_Z + 16} minecraft:stone`,
-  );
-  await rcon.command(
-    `fill ${AREA_X - 16} -39 ${AREA_Z - 16} ${AREA_X + 16} -20 ${AREA_Z + 16} minecraft:air`,
-  );
+  // **平台要够大**（这一轮从 33×33 扩到 81×81）。
+  //
+  // 踩过：原来是 ±16（33×33）—— 她盖房时走来走去，**掉下平台摔死**，
+  // 于是 `build_shelter` 报 "建造被取消"、背包变成空的（死时掉落）。
+  // 而**断言只看"庇护所建成没有"**，所以表现成"盖房超时/失败"，
+  // 根因却是"她摔死了"—— 查了好几轮才看出来。
+  //
+  // 空中孤岛的边缘对她来说就是悬崖。要测"盖房"，就得先保证她**不会掉下去**。
+  // **必须分片填** —— `/fill` 一次最多 32768 块。
+  //
+  // 踩过：81×81×25 = **164,025 块**，超了 5 倍 ——
+  // 服务端**整条命令拒绝**（和之前那个 "out of this world" 是同一类：
+  // **命令被拒 → 什么都不做 → 测出来的现象和"功能坏了"一模一样**）。
+  // 实测症状：她站在**天然地面**上挖，背包变化是 `{"dirt":5}`（挖到泥土）。
+  //
+  // 每片按 x 切成 8 格宽：8×81×25 = 16,200 块 ✅ 在限制内。
+  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
+    await rcon.command(
+      `fill ${fx} -64 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -40 ${AREA_Z + 40} minecraft:stone`,
+    );
+  }
+  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
+    await rcon.command(
+      `fill ${fx} -39 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -20 ${AREA_Z + 40} minecraft:air`,
+    );
+  }
+  // **底层铺基岩** —— 不然她能挖穿 -64 掉进虚空摔死。
+  //
+  // 踩过（和 `test_mine_return` 是同一个坑）：平台是 -64..-40 的石头，
+  // 而**-64 以下就是虚空**。她拿到石镐之后往下挖，
+  // 挖到 -64 再往下就是空气 → 掉出去 → **摔死**。
+  // 表现是 `build_shelter` 报 "建造被取消"、**背包变成空的**（死时掉落）——
+  // 看起来像"盖房失败"，根因却是"她摔死了"。
+  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
+    await rcon.command(
+      `fill ${fx} -64 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -64 ${AREA_Z + 40} minecraft:bedrock`,
+    );
+  }
   await sleep(3000);
   await rcon.command(`tp ${USER} ${AREA_X + 0.5} -39 ${AREA_Z + 0.5}`);
   await sleep(2500);
@@ -210,6 +242,23 @@ async function waitTask(c, id, ms) {
   }
 
   console.log('\n[3] 盖一个带门的小屋：build_shelter(size=3)');
+  // **补齐盖房要的材料**（这一轮加的）。
+  //
+  // 为什么：`build_shelter` 要**门**（6 块木板）和**火把**（要煤）。
+  // 而测试区域是**纯石头平台**，**没有煤** —— 于是她到处找煤、直到超时。
+  //
+  // 实测：连跑时这一步**时好时坏** —— 有一次 3/3 全过，另一次就 timeout。
+  // 那次能过是因为她碰巧在附近找到了什么。
+  //
+  // **这不是"放宽断言"**：断言仍然是"庇护所必须建成"。
+  // 去掉的是一条**和测试目的无关的约束** ——
+  // 这个测试要验的是"生存链（石头 → 石制工具 → 庇护所）能走通"，
+  // 不是"她能不能在纯石头平台上找到煤"。
+  await rcon.command(`give ${USER} oak_planks 16`);
+  await rcon.command(`give ${USER} torch 8`);
+  await rcon.command(`give ${USER} coal 8`);
+  await sleep(1500);
+  console.log('    （已补：木板 ×16、火把 ×8、煤 ×8 —— 盖房要用，纯石头平台上找不到）');
   const r3 = await c.call('skill.run', { skill: 'build_shelter', params: { size: 3 } });
   const t3 = await waitTask(c, r3.task_id, 420000);
   console.log(`    任务 ${t3.status}${t3.error ? ' 错误：' + t3.error : ''}`);
