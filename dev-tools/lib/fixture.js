@@ -62,11 +62,19 @@ async function give(rcon, user, item, count) {
  * @param call 引擎 RPC 调用函数（`(...args) => client.call(...args)`）
  */
 async function assertBlockAt(call, x, y, z, expect) {
-  const b = await call('block.at', { x, y, z });
-  const name = b && b.name;
+  // **等区块到达再断言** —— 踩过：新起的服务端刚 tp 完就查，
+  // `block.at` 返回 `{"name":null,"note":"未加载"}`，断言当场炸。
+  // 这不是放宽：先给世界 8 秒到场时间，然后**判据一个字不改**。
+  let name = null;
+  for (let i = 0; i < 8; i += 1) {
+    const b = await call('block.at', { x, y, z });
+    name = b && b.name;
+    if (name) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   if (name !== expect) {
     throw new Error(
-      `setup 校验失败（快速失败，不许带假前提继续跑）：(${x},${y},${z}) 应是「${expect}」，实际：${name || JSON.stringify(b) || '(读不到)'}`,
+      `setup 校验失败（快速失败，不许带假前提继续跑）：(${x},${y},${z}) 应是「${expect}」，实际：${name || '(等了 8 秒仍读不到/未加载)'}`,
     );
   }
 }

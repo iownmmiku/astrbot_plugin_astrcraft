@@ -589,8 +589,9 @@ async function stepUpOnePrelude({ actions, ctx, bx, by, bz, tag }) {
  */
 async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   let goToFailed = null;
+  let goResult = null;
   try {
-    await nav.goTo({ x: nx, y: by + 1, z: nz, range: STEP_UP_RANGE, signal: ctx.signal, timeoutMs: STEP_UP_TIMEOUT_MS });
+    goResult = await nav.goTo({ x: nx, y: by + 1, z: nz, range: STEP_UP_RANGE, signal: ctx.signal, timeoutMs: STEP_UP_TIMEOUT_MS });
   } catch (err) {
     if (err instanceof CancelledError) throw err;
     goToFailed = String(err.message).slice(0, 70);
@@ -601,9 +602,14 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   if (ok) {
     log.info(`${tag}：升上去了（现在 y=${afterY}）`);
   } else {
+    // **失败日志必须带 goTo 的 arrived/距离** —— 合并那轮我把这行删了，
+    // 结果下一次「没上去」就分不清「goTo 认为到了但高度没变」还是「根本没走到」，
+    // 又得猜一轮（判据教训：失败现场的字段少一个，定性就慢一倍）。
+    const arrived = goResult ? `arrived=${goResult.arrived}` : 'goTo 无返回';
+    const dist = goResult && goResult.distance_to_target !== undefined ? ` 距离=${goResult.distance_to_target}` : '';
     log.info(
-      `${tag}：没上去（还在 y=${afterY}，目标是 ${by + 1}）` +
-        (goToFailed ? `；goTo 说：${goToFailed}` : '；goTo 没报错'),
+      `${tag}：没上去（还在 y=${afterY}，目标是 ${by + 1}）；${arrived}${dist}` +
+        (goToFailed ? `；goTo 说：${goToFailed}` : ''),
     );
   }
   return ok;

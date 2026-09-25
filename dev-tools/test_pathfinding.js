@@ -142,8 +142,16 @@ async function walkTo(x, z, ms = 60000, range = null) {
     await rcon.command(
       `fill ${sx - 40} -61 ${BASE_Z - 40} ${sx + 40} -61 ${BASE_Z + 40} minecraft:grass_block replace air`,
     );
+    // **清空分两片** —— 81×81×6 = 39,366 块超了 /fill 的 32768 上限，
+    // 这条命令**从来就没执行成功过**（服务端一直整条拒绝），测试却照样绿 ——
+    // 因为超平坦世界 -60 以上本来就是空气（这条清理是冗余的）。
+    // 严格 rcon 断言把它揪出来了。分片后它真的会执行（清空气 = "No blocks were
+    // filled"，是合法响应，不在拒绝清单里）。
     await rcon.command(
-      `fill ${sx - 40} -60 ${BASE_Z - 40} ${sx + 40} -55 ${BASE_Z + 40} minecraft:air replace`,
+      `fill ${sx - 40} -60 ${BASE_Z - 40} ${sx + 40} -58 ${BASE_Z + 40} minecraft:air replace`,
+    );
+    await rcon.command(
+      `fill ${sx - 40} -57 ${BASE_Z - 40} ${sx + 40} -55 ${BASE_Z + 40} minecraft:air replace`,
     );
   }
   await sleep(1800);

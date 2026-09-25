@@ -94,12 +94,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // 现在实现和注释都只有一份（buildPlatform 内部自带 forceload）。
   await sleep(2000);
   await buildPlatform(rcon, { x: X, z: 0, half: 10, stoneTop: -50, clearTop: -30 });
-  await assertBlockAt(call, X, -50, 0, 'stone'); // 引擎侧查询（RCON 没有查方块的通用命令） // 平台面必须是石头（不符直接炸）
   await sleep(2500);
   await rcon.command(`give ${USER} stone_pickaxe 1`);
   await sleep(1200);
   await rcon.command(`tp ${USER} ${X + 0.5} -49 0.5`);
   await sleep(2500);
+  // **断言必须在 tp 之后** —— 踩过：放在 tp 前时 bot 还在出生点，
+  // (X,-50,0) 的区块从没流进客户端 → `block.at` 永远"未加载" → 断言误炸。
+  // （survival 的同款断言放在 tp 后，所以它是绿的 —— 抄的时候顺序抄错了。）
+  await assertBlockAt(call, X, -50, 0, 'stone'); // 平台面必须是石头（不符直接炸）
 
   const st0 = await call('state.get', { detail: 'brief' });
   console.log(`=== 挖矿之后能不能回地面 ===`);
