@@ -23,7 +23,7 @@ const RCON_DIR = process.env.MC_RCON_DIR || path.join(__dirname, '..', '.testser
 
 const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'warn' },
+  env: { ...process.env, MC_ENGINE_LOG_LEVEL: process.env.MC_ENGINE_LOG_LEVEL || 'warn' },
 });
 let buf = '';
 let id = 1;
@@ -57,7 +57,18 @@ child.stdout.on('data', (c) => {
   }
 });
 child.stderr.setEncoding('utf8');
-child.stderr.on('data', () => {});
+// **引擎日志走 stderr**（stdout 是 JSON-RPC 协议）。
+// 原来这里是一句 `on('data', () => {})` —— **日志被读出来直接扔掉**，
+// 于是测试红了之后**引擎侧零线索**，只能靠猜（这次为查一个回归浪费了好几轮）。
+// 改成环形保留最近 300 行，**失败时随结果一起打印**。
+const engineLog = [];
+child.stderr.on('data', (c) => {
+  for (const l of c.split('\n')) {
+    if (!l.trim()) continue;
+    engineLog.push(l);
+    if (engineLog.length > 300) engineLog.shift();
+  }
+});
 
 const call = (method, params = {}, t = 180000) =>
   new Promise((res, rej) => {
@@ -257,6 +268,11 @@ async function runSkill(skill, params, sec = 120) {
   child.kill();
   await sleep(1500);
   console.log(`\n=== 结果：${pass} 通过，${fail} 失败 ===`);
+  if (fail > 0 && engineLog.length) {
+    // **失败了就把引擎日志一起交出来** —— 没有现场的失败只能靠猜
+    console.log(`--- 引擎日志（stderr 最近 ${engineLog.length} 行，从这里查原因）---`);
+    for (const l of engineLog.slice(-150)) console.log('  ' + l);
+  }
   process.exit(fail > 0 ? 1 : 0);
 })().catch((e) => {
   console.error('ERR', e.message);

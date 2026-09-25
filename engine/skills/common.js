@@ -533,9 +533,89 @@ function surfaceHeightAt(bot, x, z, fromY) {
  *
  * @returns true = 真的升上去了（会**验证高度**，不靠"走完了"就当成功）
  */
-async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
+// ============ 「升一格」的共享地基（stepUpOne 三策略共用） ============
+//
+// 抽出来的理由：这三个策略**各自抄了一份**前置和验证，
+// 于是每份都可能被抄漏 —— 实测代价：
+//   · `stairUpOne` 抄丢了 `digStepUp` 的 range 教训（1.2 vs 1.5，害我查了几轮）
+//   · `digStepUp` 抄丢了「等落地 + 刷新坐标」（pillar 注释里记着的坑：
+//     调用方的 by 过期 → 往头顶放 → 服务端 "the block is still there"）
+//   · 判据还不统一（dig 绝对层 / stair 相对高度）—— 同一个 bug 修两遍
+// **从此只有一份，改这里三个策略同时生效。**
+const STEP_UP_RANGE = 1.5; // 到达判据：0.6/1.2 会把「停在 1.58 格」判成没走到（实测）
+const STEP_UP_TIMEOUT_MS = 6000; // dig 原来 5000、stair 6000 —— 统一成较长的那个
+
+/**
+ * 共享前置：**等落地 + 用「现在」的坐标**（返回刷新后的 {bx,by,bz}，落地失败返回 null）。
+ *
+ * 两个教训都写死在这里：
+ * ① 跳跃/寻路都要求站在地上（下落中 jump 是空动作）；
+ * ② 调用方的 bx/by/bz 可能是过期快照 —— pillar 实测踩过：
+ *    目标格算成 (501,-53,0) 而她人在 -55 → 等于往头顶放 → 被服务端拒。
+ */
+async function stepUpOnePrelude({ actions, ctx, bx, by, bz, tag }) {
+  const bot = actions.bot;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 4000) {
+    if (bot.entity && bot.entity.onGround) break;
+    await delay(100, { signal: ctx.signal });
+  }
+  if (!bot.entity.onGround) {
+    log.info(`${tag}：等了 4 秒还没落地，这次跳过`);
+    return null;
+  }
+  const now = bot.entity.position;
+  const fresh = { bx: Math.floor(now.x), by: Math.floor(now.y), bz: Math.floor(now.z) };
+  if (fresh.bx !== bx || fresh.by !== by || fresh.bz !== bz) {
+    log.info(
+      `${tag}：位置变了（调用方给 ${bx},${by},${bz}，她现在在 ${fresh.bx},${fresh.by},${fresh.bz}）——按现在的算`,
+    );
+  }
+  return fresh;
+}
+
+/**
+ * 共享的「走到目标层并验证」—— **range / 超时 / 验证标准只写这一份**。
+ *
+ * 三条教训（每条都真踩过，两处实现各踩一次）：
+ * ① `range` 必须 1.5：站上 1×1 台阶很难停在格子中心（0.7 常态、1.58 出现过），
+ *    range 小了 goTo 会**抛异常**，直接把调用方打到 continue、走不到验证；
+ * ② **goTo 抛异常也要验高度**：她可能已经上去了，只是 goTo 觉得没到位；
+ * ③ 判据是**绝对层 `afterY >= by + 1`**，不是「比刚才高」：
+ *    上一个方向可能已经把她送上去，相对判据会把「已经到了」判成「没动」，
+ *    四个方向全失败（dig 的注释里记着这个现场）。
+ *
+ * @returns true = 真的站到目标层了
+ */
+async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
+  let goToFailed = null;
+  try {
+    await nav.goTo({ x: nx, y: by + 1, z: nz, range: STEP_UP_RANGE, signal: ctx.signal, timeoutMs: STEP_UP_TIMEOUT_MS });
+  } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    goToFailed = String(err.message).slice(0, 70);
+  }
+  await delay(250, { signal: ctx.signal });
+  const afterY = Math.floor(actions.bot.entity.position.y);
+  const ok = afterY >= by + 1;
+  if (ok) {
+    log.info(`${tag}：升上去了（现在 y=${afterY}）`);
+  } else {
+    log.info(
+      `${tag}：没上去（还在 y=${afterY}，目标是 ${by + 1}）` +
+        (goToFailed ? `；goTo 说：${goToFailed}` : '；goTo 没报错'),
+    );
+  }
+  return ok;
+}
+
+async function digStepUpImpl({ actions, nav, ctx, bx, by, bz }) {
   const bot = actions.bot;
   log.info(`挖台阶：开始试（我在 ${bx}, ${by}, ${bz}）`);
+  // 共享前置：等落地 + 刷新坐标（原来 dig 没有这步 —— 抄丢了 pillar 的教训）
+  const fresh0 = await stepUpOnePrelude({ actions, ctx, bx, by, bz, tag: '挖台阶' });
+  if (!fresh0) return false;
+  ({ bx, by, bz } = fresh0);
   const dirs = [
     [1, 0],
     [-1, 0],
@@ -618,46 +698,8 @@ async function digStepUp({ actions, nav, ctx, bx, by, bz }) {
         log.info(`挖台阶 (${nx}, ${y}, ${nz}) 失败：${err.message}`);
       }
     }
-    // 走过去（pathfinder 会自动跳 1 格台阶）
-    const beforeY = Math.floor(bot.entity.position.y);
-    const t1 = Date.now();
-    log.info(`挖台阶：垫好了，试着走上 (${nx}, ${by + 1}, ${nz})（现在 y=${beforeY}）`);
-    try {
-      // **`range` 从 0.6 放宽到 1.5**（这一轮修的"不稳定"）。
-      //
-      // 实测对比：成功那次 `距离 0.71`（arrived=true），失败那次 `距离 1.58`
-      // （arrived=false）—— 而判据是 `range(0.6) + 0.5 = 1.1`，
-      // 于是 1.58 就被判"没走到"，`digStepUp` 直接放弃这个方向。
-      //
-      // 但**这一步该不该算成功，真正的判据是"她有没有站到目标那一层"**
-      // （下面那个 `afterY >= by + 1`）。站上一格 1x1 的台阶，
-      // 人本来就很难正好停在格子中心（0.7 格是常态），拿 0.6 去卡没有意义。
-      // 放宽之后由高度判据说了算 —— 站上去了就是成功，没上去就换方向。
-      const r = await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.5, signal: ctx.signal, timeoutMs: 5000 });
-      log.info(
-        `挖台阶：goTo 返回 arrived=${r && r.arrived} 用时 ${Date.now() - t1}ms` +
-          `（现在 y=${Math.floor(bot.entity.position.y)}，距离 ${r && r.distance_to_target}）`,
-      );
-    } catch (err) {
-      if (err instanceof CancelledError) throw err;
-      log.info(`走上一级台阶失败（用时 ${Date.now() - t1}ms）：${String(err.message).slice(0, 90)}`);
-      continue;
-    }
-    // **验证真的站在目标高度上了**（这一轮找到的最后一层）。
-    //
-    // 原来的判据是 `afterY > beforeY`（比走之前高）—— 而实测发现：
-    // **上一个方向其实已经把她送上去了**，只是她"升上去"发生在
-    // `goTo` 返回之后的一瞬间，于是这次检查看到的是旧高度 → 判"没上去"
-    // → 去试下一个方向；而那时她已经站在目标高度了，`goTo` 立刻返回
-    // `arrived=true`（"我已经在那了"）→ 又判"没上去"……
-    // **四个方向全被判失败**，日志里就是连续四条 arrived=true 却全 return false。
-    //
-    // 正确的判据是**"她在不在目标那一层"**，而不是"她比刚才高了没有"：
-    // 到目标层就算成功（哪怕是被上一个方向送上去的）。
-    await delay(250, { signal: ctx.signal }); // 等她落定（刚跳上去那几帧位置还在抖）
-    const afterY = Math.floor(bot.entity.position.y);
-    if (afterY >= by + 1) return true;
-    log.info(`挖了台阶但没上去（还在 y=${afterY}，目标是 ${by + 1}）`);
+    // 走过去并验证 —— goTo/range/判据都收在 stepUpOneGoTo（见那里的三条教训）
+    if (await stepUpOneGoTo({ actions, nav, ctx, tag: '挖台阶', nx, by, nz })) return true;
   }
   return false;
 }
@@ -714,26 +756,16 @@ function isOpenSky(bot, need = 3) {
  *
  * @returns true = 真的升上去了（**验证高度**，不信 goTo 的返回值）
  */
-async function stairUpOne({ actions, nav, ctx, bx, by, bz }) {
+async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz }) {
   const bot = actions.bot;
   const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
   const filler = CANDIDATES.find((n) => actions.countItem(n) > 0);
   if (!filler) return false;
 
-  // **必须站在地上**：跳跃只有站在地上才有效（下落中 jump 是空的）
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 4000) {
-      if (bot.entity && bot.entity.onGround) break;
-      await delay(100, { signal: ctx.signal });
-    }
-    if (!bot.entity.onGround) return false;
-  }
-  // 用**现在**的位置（调用方的 by 可能是过期的 —— 这个坑踩过）
-  const now = bot.entity.position;
-  bx = Math.floor(now.x);
-  by = Math.floor(now.y);
-  bz = Math.floor(now.z);
+  // 共享前置：等落地 + 刷新坐标（等落地 / 过期坐标两个坑都在 stepUpOnePrelude 里）
+  const fresh0 = await stepUpOnePrelude({ actions, ctx, bx, by, bz, tag: '螺旋阶梯' });
+  if (!fresh0) return false;
+  ({ bx, by, bz } = fresh0);
 
   const dirs = [
     [1, 0],
@@ -774,41 +806,10 @@ async function stairUpOne({ actions, nav, ctx, bx, by, bz }) {
       }
     }
 
-    // 跳上去（1 格台阶）
-    const beforeY = Math.floor(bot.entity.position.y);
-    //
-    // **两个修正，都是从 `digStepUp` 那边学来的**（我在那里踩过、修过，
-    // 写 `stairUpOne` 时却忘了抄过来 —— 于是这个坑又踩了一次）：
-    //
-    // ① **`range` 用 1.5，不是 1.2**
-    //    实测：站上一格 1×1 的台阶，人很难正好停在格子中心，
-    //    **0.7 格是常态、1.58 格也出现过**。而 `arrived` 的判据是
-    //    `range + 0.5`，1.2 就变成 1.7 —— 1.58 勉强过；但 goTo 自己
-    //    会先按 range 判"没走到"并**抛异常**，把我这里直接打到 `continue`，
-    //    **根本走不到下面的高度检查**。
-    // ② **goTo 失败也要检查高度**
-    //    该不该算成功，真正的判据是"她有没有站到那一层"（下面的 afterY），
-    //    不是"goTo 有没有报 arrived"。她可能已经上去了，只是 goTo 认为没到位。
-    let goToFailed = null;
-    try {
-      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.5, signal: ctx.signal, timeoutMs: 6000 });
-    } catch (err) {
-      if (err instanceof CancelledError) throw err;
-      goToFailed = String(err.message).slice(0, 70);
-    }
-    await delay(250, { signal: ctx.signal });
-    const afterY = Math.floor(bot.entity.position.y);
-    if (afterY > beforeY) {
-      log.info(`螺旋阶梯：升上去了（y ${beforeY} → ${afterY}）`);
-      return true;
-    }
-    // **日志要把"放置成功了但走不上去"说清楚** ——
-    // 因为上层那句 "既没有方块可以垫脚" 是猜的，
-    // 而实际情况可能是"放了但跳不上去"。这两件事的修法完全不同。
-    log.info(
-      `螺旋阶梯：放了方块但没跳上去（还在 y=${afterY}，目标是 ${by + 1}）` +
-        (goToFailed ? `；goTo 说：${goToFailed}` : '；goTo 没报错'),
-    );
+    // 跳上去并验证（共用 stepUpOneGoTo —— 顺带把判据从「相对高了」
+    // 统一成 dig 注释里论证过的「绝对层 >= by+1」：上一个方向可能已经把她送上去，
+    // 相对判据会把「已经到了」判成「没动」→ 四个方向全失败）
+    if (await stepUpOneGoTo({ actions, nav, ctx, tag: '螺旋阶梯', nx, by, nz })) return true;
   }
   return false;
 }
@@ -994,45 +995,17 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
  *   2. 必须**趁跳起来的时候**放——站在地上放，那格是她自己占着的，服务端会拒
  *   3. 放完要等一下让她落在那块上
  */
-async function pillarUpOne({ actions, ctx, bx, by, bz }) {
+async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
   const bot = actions.bot;
   const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
   const block = CANDIDATES.find((n) => actions.countItem(n) > 0);
   if (!block) return false;
 
-  // **用她"现在"的位置，不要用调用方传进来的快照**（这一轮找到的根因）。
-  //
-  // 踩过：调用方（`climbToSurface`）在每轮迭代开头算一次 `by = Math.floor(p.y)`，
-  // 而**那一轮里她可能又往下掉了**（挖矿挖掉自己脚下那块、或者刚被 tp 到半空）。
-  // 于是 `by` 变成过期值 —— 实测报错里目标格是 `(501, -53, 0)`，
-  // 而她人已经在 **-55**：等于**往她头顶上方放**，那里还是石头，
-  // 服务端回 "the block is still there"。
-  //
-  // 判据：**必须站在实地上才能跳**（在下落时 `jump` 无效、
-  // 而且 `p.y - by` 是负的，那个"离地 0.7 格"永远不成立）。
-  {
-    const t0 = Date.now();
-    while (Date.now() - t0 < 4000) {
-      if (bot.entity && bot.entity.onGround) break;
-      await delay(100, { signal: ctx.signal });
-    }
-    if (!bot.entity.onGround) {
-      log.info('垫脚上升：等了 4 秒还没落地，这次跳过');
-      return false;
-    }
-  }
-  const now = bot.entity.position;
-  const nbx = Math.floor(now.x);
-  const nby = Math.floor(now.y);
-  const nbz = Math.floor(now.z);
-  if (nbx !== bx || nby !== by || nbz !== bz) {
-    log.info(
-      `垫脚上升：位置变了（调用方给的是 ${bx},${by},${bz}，她现在在 ${nbx},${nby},${nbz}）——按现在的算`,
-    );
-  }
-  bx = nbx;
-  by = nby;
-  bz = nbz;
+  // 共享前置：等落地 + 刷新坐标 —— 上面那段「过期坐标」的教训
+  // 已经搬进 stepUpOnePrelude（原来这里有一份单独实现 + 一份长注释）
+  const fresh0 = await stepUpOnePrelude({ actions, ctx, bx, by, bz, tag: '垫脚上升' });
+  if (!fresh0) return false;
+  ({ bx, by, bz } = fresh0);
 
   try {
     // **跳起来，然后等"她真的离地了"再放。**
@@ -1101,6 +1074,37 @@ async function pillarUpOne({ actions, ctx, bx, by, bz }) {
 }
 
 /**
+ * **统一的「升一格」入口（带策略）。**
+ *
+ * 三个策略共享同一套前置（等落地+刷新坐标）、同一套
+ * goTo/range/验证标准（stepUpOneGoTo / stepUpOnePrelude），
+ * 只有「怎么动那一步」不同：
+ *   · `dig`   —— 挖斜上方两级（顺带先给落脚点垫一块）
+ *   · `stair` —— 往旁边放一块、跳上去（螺旋）
+ *   · `pillar` —— 跳起来往自己脚下放（时机敏感，是 stair 的降级备选）
+ *
+ * 抽在这里的原因：**三个平行实现 = 同一个坑要踩三遍**（已实测两次）。
+ * 调用点/导出名保持不变（`digStepUp` / `stairUpOne` / `pillarUpOne` 是下面的薄壳）。
+ */
+async function stepUpOne({ strategy, actions, nav, ctx, bx, by, bz }) {
+  if (strategy === 'dig') return digStepUpImpl({ actions, nav, ctx, bx, by, bz });
+  if (strategy === 'stair') return stairUpOneImpl({ actions, nav, ctx, bx, by, bz });
+  if (strategy === 'pillar') return pillarUpOneImpl({ actions, ctx, bx, by, bz });
+  throw new Error(`未知的 stepUpOne 策略：${String(strategy)}`);
+}
+
+// 薄壳：调用点（climbToSurface / traverse 的 pave）和 module.exports 名字都不用动
+async function digStepUp(args) {
+  return stepUpOne({ ...args, strategy: 'dig' });
+}
+async function stairUpOne(args) {
+  return stepUpOne({ ...args, strategy: 'stair' });
+}
+async function pillarUpOne(args) {
+  return stepUpOne({ ...args, strategy: 'pillar' });
+}
+
+/**
  * **开侧洞**：把竖井侧面挖一格，造出一个落脚点，之后就能挖正常阶梯了。
  *
  * 为什么需要：竖井里四个方向的"斜上方"那一格**下面没有地板**，
@@ -1162,6 +1166,7 @@ module.exports = {
   // 不导出的话只能复制一份——而它的时序很讲究（跳起来、等真离地 0.7 格以上、
   // 趁空中往脚下放，站地上放会被服务端拒绝），复制一份必然会走样。
   pillarUpOne,
+  stepUpOne,
   // **挖阶梯**（这一轮补的）：有镐没方块时唯一能出来的路。
   // 见 digStepUp 的注释——它的设计一直写在 climbToSurface 的文档里，
   // 但实现里从来没有，用户实测"有镐却爬不出来"就是这个原因。
