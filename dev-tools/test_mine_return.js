@@ -10,6 +10,7 @@
 const path = require('path');
 const { spawn } = require('child_process');
 const { Rcon } = require('./lib/rcon');
+const { buildPlatform, assertBlockAt } = require('./lib/fixture');
 
 const PORT = Number(process.env.MC_PORT || 25566);
 const RCON_DIR = process.env.MC_RCON_DIR || path.join(__dirname, '..', '.testserver');
@@ -88,18 +89,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   //
   // 做法：把 -64..-50 铺成石头（她在 -49 站着，下面是 15 格可挖的石头），
   // 上面清空。
-  await rcon.command(`forceload add ${X - 16} -16 ${X + 16} 16`);
+  // 平台/材料准备走**公共 fixture**（dev-tools/lib/fixture.js）——
+  // 分片 fill、底层基岩、81×81 这些坑原来在测试里各写一份，
+  // 现在实现和注释都只有一份（buildPlatform 内部自带 forceload）。
   await sleep(2000);
-  const r1 = await rcon.command(`fill ${X - 10} -64 -10 ${X + 10} -50 10 minecraft:stone`);
-  const r2 = await rcon.command(`fill ${X - 10} -49 -10 ${X + 10} -30 10 minecraft:air`);
-  // **底层要铺基岩**（这一轮修的）。
-  //
-  // 踩过：第一版直接 `fill -64..-50 stone` —— 它把超平坦世界的**基岩(-64)替换成了石头**，
-  // 而**石头是可挖的**，于是她能一路挖穿、**掉进 -64 以下的虚空**（实测掉到 -76 / -88）。
-  // 那看起来像"爬坑失败"，其实是**测试场景不真实**：
-  // 真实世界里挖矿下面还是石头和矿，不会是虚空。
-  const r3 = await rcon.command(`fill ${X - 10} -64 -10 ${X + 10} -64 10 minecraft:bedrock`);
-  console.log(`  铺平台：${String(r1).slice(0, 34)} / ${String(r2).slice(0, 34)} / ${String(r3).slice(0, 34)}`);
+  await buildPlatform(rcon, { x: X, z: 0, half: 10, stoneTop: -50, clearTop: -30 });
+  await assertBlockAt(rcon, X, -50, 0, 'stone'); // 平台面必须是石头（不符直接炸）
   await sleep(2500);
   await rcon.command(`give ${USER} stone_pickaxe 1`);
   await sleep(1200);

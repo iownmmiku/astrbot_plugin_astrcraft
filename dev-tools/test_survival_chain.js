@@ -18,8 +18,24 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const { Rcon } = require('./lib/rcon');
+const { buildPlatform, assertBlockAt } = require('./lib/fixture');
 
 const PORT = 25566;
+
+// **分步模式**：--step 1/2/3 只跑那一步（提速用 —— 完整链一次 5~6 分钟，
+// 调某一步时不用等前两步）。不带 --step = 完整链（判据不变）。
+const argStep = (() => {
+  const i = process.argv.indexOf('--step');
+  if (i < 0 || !process.argv[i + 1]) return 0;
+  const n = Number(process.argv[i + 1]);
+  if (![1, 2, 3].includes(n)) {
+    console.error(`--step 只接受 1/2/3，收到：${process.argv[i + 1]}`);
+    process.exit(2);
+  }
+  return n;
+})();
+const wantStep = (n) => argStep === 0 || argStep === n;
+if (argStep) console.log(`（分步模式：--step ${argStep}，只跑第 ${argStep} 步）`);
 
 class C {
   constructor() {
@@ -133,54 +149,10 @@ async function waitTask(c, id, ms) {
   // 是同一个病：**测试之间没有隔离**。
   const AREA_X = 3000 + Math.floor(Math.random() * 6000);
   const AREA_Z = 3000 + Math.floor(Math.random() * 6000);
-  await rcon.command(`forceload add ${AREA_X - 48} ${AREA_Z - 48} ${AREA_X + 48} ${AREA_Z + 32}`);
-  await sleep(2000);
-  // 铺一层石头地面（超平坦世界只有 4 层，下面直接是基岩，挖不到圆石）
-  // **往上堆一个高台**，不是只铺 4 层。
-  //
-  // 踩过：第一版只铺 -64..-61（超平坦世界的 4 层），而 **-64 以下就是虚空**，
-  // 挖不了更多 —— 于是测试**稳定地**报"只挖到圆石 ×6（目标 8）"，
-  // 四次一模一样（稳定，但稳定地失败）。
-  //
-  // 堆到 -40 就有 25 层石头可挖。
-  // **平台要够大**（这一轮从 33×33 扩到 81×81）。
-  //
-  // 踩过：原来是 ±16（33×33）—— 她盖房时走来走去，**掉下平台摔死**，
-  // 于是 `build_shelter` 报 "建造被取消"、背包变成空的（死时掉落）。
-  // 而**断言只看"庇护所建成没有"**，所以表现成"盖房超时/失败"，
-  // 根因却是"她摔死了"—— 查了好几轮才看出来。
-  //
-  // 空中孤岛的边缘对她来说就是悬崖。要测"盖房"，就得先保证她**不会掉下去**。
-  // **必须分片填** —— `/fill` 一次最多 32768 块。
-  //
-  // 踩过：81×81×25 = **164,025 块**，超了 5 倍 ——
-  // 服务端**整条命令拒绝**（和之前那个 "out of this world" 是同一类：
-  // **命令被拒 → 什么都不做 → 测出来的现象和"功能坏了"一模一样**）。
-  // 实测症状：她站在**天然地面**上挖，背包变化是 `{"dirt":5}`（挖到泥土）。
-  //
-  // 每片按 x 切成 8 格宽：8×81×25 = 16,200 块 ✅ 在限制内。
-  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
-    await rcon.command(
-      `fill ${fx} -64 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -40 ${AREA_Z + 40} minecraft:stone`,
-    );
-  }
-  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
-    await rcon.command(
-      `fill ${fx} -39 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -20 ${AREA_Z + 40} minecraft:air`,
-    );
-  }
-  // **底层铺基岩** —— 不然她能挖穿 -64 掉进虚空摔死。
-  //
-  // 踩过（和 `test_mine_return` 是同一个坑）：平台是 -64..-40 的石头，
-  // 而**-64 以下就是虚空**。她拿到石镐之后往下挖，
-  // 挖到 -64 再往下就是空气 → 掉出去 → **摔死**。
-  // 表现是 `build_shelter` 报 "建造被取消"、**背包变成空的**（死时掉落）——
-  // 看起来像"盖房失败"，根因却是"她摔死了"。
-  for (let fx = AREA_X - 40; fx <= AREA_X + 40; fx += 8) {
-    await rcon.command(
-      `fill ${fx} -64 ${AREA_Z - 40} ${Math.min(fx + 7, AREA_X + 40)} -64 ${AREA_Z + 40} minecraft:bedrock`,
-    );
-  }
+  // 平台/材料准备走**公共 fixture**（dev-tools/lib/fixture.js）——
+  // 分片 fill（/fill 上限 32768）、底层基岩、81×81 尺寸这三个坑
+  // 原来在三个测试里各踩一遍，现在只有一份实现和一份注释。
+  await buildPlatform(rcon, { x: AREA_X, z: AREA_Z });
   await sleep(3000);
   await rcon.command(`tp ${USER} ${AREA_X + 0.5} -39 ${AREA_Z + 0.5}`);
   await sleep(2500);
@@ -189,12 +161,14 @@ async function waitTask(c, id, ms) {
   const st0 = await c.call('state.get', { detail: 'brief' });
   const bp = st0.block_position;
   console.log(`出生位置 (${bp.x}, ${bp.y}, ${bp.z})，脚下 ${st0.standing_on}`);
+  await assertBlockAt(rcon, AREA_X, -40, AREA_Z, 'stone'); // setup 状态校验：不符直接炸
 
   // 现实准备：她本来就该先砍树做出木镐。这里直接给木镐，把验证聚焦在"挖石头"。
   await rcon.command(`give ${USER} wooden_pickaxe 1`);
   await rcon.command(`give ${USER} oak_log 8`);
   await sleep(2000);
 
+  if (wantStep(1)) {
   console.log('\n[1] 地表往下挖：mine_stone(want=8)');
   console.log('    （修复前这里必然失败：连续多次没有进展）');
   const inv0 = (await c.call('inventory.get')).items;
@@ -230,7 +204,15 @@ async function waitTask(c, id, ms) {
   else if (cobble > 0) console.log(`    （向下 ${dropped} 格，可能附近本来就有裸露石头）`);
   else bad(`没有向下挖掘（只下降 ${dropped} 格）`);
 
+  if (wantStep(2)) {
+  }
+
   console.log('\n[2] 用圆石做石制工具：make_tools(tier=stone)');
+    if (argStep === 2) {
+      // 分步模式没有第 1 步挖来的圆石 —— 直接给，聚焦验「做工具」这一步
+      await rcon.command(`give ${USER} cobblestone 16`);
+      await sleep(1500);
+    }
   const r2 = await c.call('skill.run', { skill: 'make_tools', params: { tier: 'stone', kinds: ['pickaxe', 'axe'] } });
   const t2 = await waitTask(c, r2.task_id, 240000);
   const inv2 = (await c.call('inventory.get')).items;
@@ -239,6 +221,9 @@ async function waitTask(c, id, ms) {
     ok(`做出石制工具：${['stone_pickaxe', 'stone_axe'].filter((k) => inv2[k]).map((k) => `${k}×${inv2[k]}`).join('、')}`);
   } else {
     bad(`没做出石制工具（${t2.error || '无错误信息'}）`);
+  }
+
+  if (wantStep(3)) {
   }
 
   console.log('\n[3] 盖一个带门的小屋：build_shelter(size=3)');
@@ -266,6 +251,8 @@ async function waitTask(c, id, ms) {
     ok('庇护所建成');
   } else {
     bad(`庇护所未建成：${t3.error || t3.status}`);
+  }
+
   }
 
   console.log('\n=== 最终背包 ===');
