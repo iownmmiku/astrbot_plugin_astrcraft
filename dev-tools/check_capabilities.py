@@ -125,11 +125,23 @@ def excluded_tools() -> set[str]:
 # ---------------------------------------------------------------- README 数字
 
 def check_readme_numbers() -> list[tuple[bool, str]]:
-    """核对 README 里写的数字和实际一致。
+    """核查 README 里写的「N 个X」数字和实际一致。
 
-    **只查"N 个工具" / "N 个技能" 这类明确的表述** ——
-    不猜别的数字（README 里还有"5 分钟""12,742 字符"之类，
-    那些要么是外部事实、要么量起来成本高，不该由这个检查器管）。
+    ## 扩展：README 里**所有**「N 个 X」都识别，按名词表核对
+
+    第一版只查「N 个工具」/「N 个技能」。这一轮按要求扩到全部 ——
+    但**不能无脑核对**（本函数自己的旧注释记着教训：加过一条裸「（N 个）」
+    就把「31 个脚本检查」误报成工具数）。所以分两类：
+
+      · **可对账 → 核对，对不上就是 fail**：
+        工具 / 技能（原有）+ 脚本 / 离线 / 需要服务器的（新增）。
+        后三个的数据源是 **直接 import run_all 调 discover()/needs_server()**
+        —— 和 run_all 同一个口径，**不会两处各写一份然后漂移**。
+      · **叙事数字 → 明确输出「不核对」**（如「10 个铁矿」）：
+        没有可对账的来源就**不假装核对**（在返回里如实标注）。
+
+    **裸数字（「（32 个）」没有名词）不查** —— 语义不确定。
+    因此 README 里那句被改写成带名词的「39 个离线」，让它可对账。
     """
     out: list[tuple[bool, str]] = []
     readme = PLUGIN / "README.md"
@@ -137,19 +149,40 @@ def check_readme_numbers() -> list[tuple[bool, str]]:
         return out
     text = _read(readme)
 
-    real_tools = len(registered_tools())
-    real_skills = len(engine_skills())
+    try:
+        import run_all as _ra  # dev-tools 在 sys.path[0]（本文件所在目录）
 
-    # "63 个工具" / "（63 个）" 这种
-    for m in re.finditer(r"(\d+)\s*个工具", text):
-        n = int(m.group(1))
-        out.append((n == real_tools, f"README 说 {n} 个工具，实际 {real_tools} 个"))
-    # **只认明确带"工具/技能"字样的**。
-    # 试过再加一条"（N 个）"，结果把"31 个离线检查"也当成工具数报了误报 ——
-    # 宁可少抓，也不要报假警（报假警的检查器没人会看）。
-    for m in re.finditer(r"(\d+)\s*个技能", text):
-        n = int(m.group(1))
-        out.append((n == real_skills, f"README 说 {n} 个技能，实际 {real_skills} 个"))
+        scripts = _ra.discover()
+        server_n = sum(1 for p_ in scripts if _ra.needs_server(p_))
+    except Exception as e:  # 解析器坏了**不许报绿** —— 这是本检查器的自我下限
+        return [(False, f"check_readme_numbers: import run_all 失败：{e}")]
+
+    counts = {
+        "需要服务器的": server_n,
+        "工具": len(registered_tools()),
+        "技能": len(engine_skills()),
+        "脚本": len(scripts),
+        "离线": len(scripts) - server_n,
+    }
+
+    matched: set[str] = set()
+    skipped: dict[str, set[int]] = {}
+    for m in re.finditer(r"(\d+)\s*个\s*([\u4e00-\u9fff]{1,6})", text):
+        n, noun = int(m.group(1)), m.group(2)
+        key = next((k for k in counts if noun.startswith(k)), None)
+        if key is None:
+            skipped.setdefault(noun, set()).add(n)
+            continue
+        tag = f"{noun}→{key}"
+        if tag in matched:
+            continue
+        matched.add(tag)
+        out.append(
+            (n == counts[key], f"README 说 {n} 个{noun}，实际（run_all 口径）{counts[key]}")
+        )
+
+    for noun, nums in sorted(skipped.items()):
+        out.append((True, f"不核对（叙事数字/无可对账来源）：{noun} {'/'.join(map(str, sorted(nums)))}"))
     return out
 
 

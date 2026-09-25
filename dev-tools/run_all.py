@@ -56,7 +56,7 @@ KNOWN_FLAKY = {
     #  mineflayer ↔ 服务端窗口状态机的固有脆弱点"）。
     # 实测：连跑时 [1] 挖矿和 [3] 盖房**都稳定通过**，红的总是 [2] 做工具，
     # 而它的错误就是"合成/容器操作没被服务器接受"。
-    "test_survival_chain.js": "约 1/3 的运行里 [2] 合成工作台失败（mineflayer 窗口状态机的已知脆弱点，见 README「已知问题」）",
+    "test_survival_chain.js": "偶发 [2] 合成失败（mineflayer 窗口状态机，见 README「已知问题」）—— 实测修完平台/材料后 15+ 次里约 1 次（_sc_e2），重跑通常就好",
     "minetest.js": "偶发 12/13，原因未深查",
 }
 

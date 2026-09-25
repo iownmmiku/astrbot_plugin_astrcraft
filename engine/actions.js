@@ -980,6 +980,21 @@ class Actions {
     );
     const after = this.inventoryMap();
     const delta = diffInventory(before, after);
+    if (produced <= 0) {
+      // **静默失败的现场快照**（这一轮加的）—— 「合成没有产出」这类问题
+      // 没有现场就只能靠猜（README 的 1/6→1/15 口径也是靠事后翻输出数出来的）。
+      // 只在失败分支打，成功路径一行都不动。
+      try {
+        const win = bot.currentWindow;
+        log.info(
+          `合成 ${want} 最终没有产出，现场快照：窗口=${win ? `${win.title || '?'} 槽位${win.slots.length}` : '已关'}、` +
+            `背包产出 ${want}: ${before[want] || 0}→${after[want] || 0}、` +
+            `delta=${JSON.stringify(delta).slice(0, 160)}`,
+        );
+      } catch (e) {
+        log.info(`合成 ${want} 没产出，且现场快照读取失败：${e.message}`);
+      }
+    }
     return {
       ok: produced > 0,
       item: want,

@@ -273,6 +273,17 @@ async function waitTask(c, id, ms) {
   console.log('  ' + JSON.stringify(invF));
 
   console.log(`\n=== 结果：${pass} 通过，${fail} 失败 ===`);
+  if (fail > 0 && c.logs && c.logs.length) {
+    // **失败就把引擎 stderr 一起交出来**（原来 logs 收了但从不打印 ——
+    // 红了之后引擎侧零线索。合成类失败的窗口/背包快照现在也走这里）
+    const tail = c.logs
+      .join('')
+      .split('\n')
+      .filter((l) => l.trim())
+      .slice(-150);
+    console.log(`--- 引擎日志（stderr 最近 ${tail.length} 行，失败现场）---`);
+    for (const l of tail) console.log('  ' + l);
+  }
   rcon.close();
   await c.call('disconnect').catch(() => {});
   await sleep(500);

@@ -13,6 +13,39 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 
+/**
+ * **服务端拒绝信号（文案全部来自 RCON 实测探针，不是猜的）：**
+ *
+ *   · `Too many blocks in the specified area (maximum 32768, specified 3723365)`
+ *     —— /fill 超 32768 上限，**整条命令被拒、什么都不做**
+ *   · `That position is out of this world!` —— 坐标低于世界底，整条被拒
+ *   · `The block is still ...` —— 放置目标格被占，被拒
+ *   · `Unknown command` —— 命令名不存在（拼错/版本差异）
+ *
+ * **为什么默认断言**：这些拒绝的可怕之处是**没有任何异常** ——
+ * 命令"成功"返回、测试继续跑，而世界根本没变，现象和「功能坏了」
+ * 一模一样（本轮 `/fill` 超限那次害了好几轮才定位到）。
+ * 所以 `command()` 在 resolve 之前拦一道：命中就 **reject（带服务端原文）**，
+ * 测试 setup 会当场炸出来，而不是带着假前提跑到底。
+ *
+ * **刻意不列的**：`No blocks were filled` —— 探针实测 **air→air 清理
+ * 就返回这句话**，是合法场景；列进来会把绿测试搞红（那就是「放宽/搞乱判据」）。
+ * 还没测到过的其它拒绝文案会原样返回（不拦）——
+ * 根治靠 setup 后验证目标状态（fill 完读方块），消息断言只是第一道网。
+ */
+const REJECT_PATTERNS = [
+  /Too many blocks in the specified area/i,
+  /That position is out of this world/i,
+  /The block is still/i,
+  /Unknown command/i,
+];
+
+function matchReject(body) {
+  const s = String(body || '');
+  const hit = REJECT_PATTERNS.find((re) => re.test(s));
+  return hit ? hit.source : null;
+}
+
 /** Minecraft RCON 协议：长度(4) + 请求ID(4) + 类型(4) + 载荷 + \0\0 */
 function packet(id, type, body) {
   const bodyBuf = Buffer.from(body, 'utf8');
@@ -160,6 +193,16 @@ class Rcon {
         body: '',
         resolve: (v) => {
           clearTimeout(timer);
+          // **默认断言**：命中拒绝信号就 reject（见 REJECT_PATTERNS 的说明）
+          const hit = matchReject(v);
+          if (hit) {
+            reject(
+              new Error(
+                `服务端拒绝了这条命令（${hit}）：\n  命令：${cmd}\n  原文：${String(v).trim().slice(0, 200)}`,
+              ),
+            );
+            return;
+          }
           resolve(v);
         },
         reject: (e) => {
