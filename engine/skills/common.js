@@ -776,12 +776,25 @@ async function stairUpOne({ actions, nav, ctx, bx, by, bz }) {
 
     // 跳上去（1 格台阶）
     const beforeY = Math.floor(bot.entity.position.y);
+    //
+    // **两个修正，都是从 `digStepUp` 那边学来的**（我在那里踩过、修过，
+    // 写 `stairUpOne` 时却忘了抄过来 —— 于是这个坑又踩了一次）：
+    //
+    // ① **`range` 用 1.5，不是 1.2**
+    //    实测：站上一格 1×1 的台阶，人很难正好停在格子中心，
+    //    **0.7 格是常态、1.58 格也出现过**。而 `arrived` 的判据是
+    //    `range + 0.5`，1.2 就变成 1.7 —— 1.58 勉强过；但 goTo 自己
+    //    会先按 range 判"没走到"并**抛异常**，把我这里直接打到 `continue`，
+    //    **根本走不到下面的高度检查**。
+    // ② **goTo 失败也要检查高度**
+    //    该不该算成功，真正的判据是"她有没有站到那一层"（下面的 afterY），
+    //    不是"goTo 有没有报 arrived"。她可能已经上去了，只是 goTo 认为没到位。
+    let goToFailed = null;
     try {
-      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.2, signal: ctx.signal, timeoutMs: 6000 });
+      await nav.goTo({ x: nx, y: by + 1, z: nz, range: 1.5, signal: ctx.signal, timeoutMs: 6000 });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
-      log.info(`螺旋阶梯：跳上 (${nx}, ${by + 1}, ${nz}) 失败：${String(err.message).slice(0, 60)}`);
-      continue;
+      goToFailed = String(err.message).slice(0, 70);
     }
     await delay(250, { signal: ctx.signal });
     const afterY = Math.floor(bot.entity.position.y);
@@ -789,7 +802,13 @@ async function stairUpOne({ actions, nav, ctx, bx, by, bz }) {
       log.info(`螺旋阶梯：升上去了（y ${beforeY} → ${afterY}）`);
       return true;
     }
-    log.info(`螺旋阶梯：放了但没跳上去（还在 y=${afterY}，目标是 ${by + 1}）`);
+    // **日志要把"放置成功了但走不上去"说清楚** ——
+    // 因为上层那句 "既没有方块可以垫脚" 是猜的，
+    // 而实际情况可能是"放了但跳不上去"。这两件事的修法完全不同。
+    log.info(
+      `螺旋阶梯：放了方块但没跳上去（还在 y=${afterY}，目标是 ${by + 1}）` +
+        (goToFailed ? `；goTo 说：${goToFailed}` : '；goTo 没报错'),
+    );
   }
   return false;
 }
