@@ -94,7 +94,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // 现在实现和注释都只有一份（buildPlatform 内部自带 forceload）。
   await sleep(2000);
   await buildPlatform(rcon, { x: X, z: 0, half: 10, stoneTop: -50, clearTop: -30 });
-  await assertBlockAt(rcon, X, -50, 0, 'stone'); // 平台面必须是石头（不符直接炸）
+  await assertBlockAt(call, X, -50, 0, 'stone'); // 引擎侧查询（RCON 没有查方块的通用命令） // 平台面必须是石头（不符直接炸）
   await sleep(2500);
   await rcon.command(`give ${USER} stone_pickaxe 1`);
   await sleep(1200);

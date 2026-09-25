@@ -161,7 +161,7 @@ async function waitTask(c, id, ms) {
   const st0 = await c.call('state.get', { detail: 'brief' });
   const bp = st0.block_position;
   console.log(`出生位置 (${bp.x}, ${bp.y}, ${bp.z})，脚下 ${st0.standing_on}`);
-  await assertBlockAt(rcon, AREA_X, -40, AREA_Z, 'stone'); // setup 状态校验：不符直接炸
+  await assertBlockAt((m, p_) => c.call(m, p_), AREA_X, -40, AREA_Z, 'stone'); // 引擎侧查询（RCON 没有查方块的通用命令） // setup 状态校验：不符直接炸
 
   // 现实准备：她本来就该先砍树做出木镐。这里直接给木镐，把验证聚焦在"挖石头"。
   await rcon.command(`give ${USER} wooden_pickaxe 1`);
@@ -204,9 +204,9 @@ async function waitTask(c, id, ms) {
   else if (cobble > 0) console.log(`    （向下 ${dropped} 格，可能附近本来就有裸露石头）`);
   else bad(`没有向下挖掘（只下降 ${dropped} 格）`);
 
-  if (wantStep(2)) {
   }
 
+  if (wantStep(2)) {
   console.log('\n[2] 用圆石做石制工具：make_tools(tier=stone)');
     if (argStep === 2) {
       // 分步模式没有第 1 步挖来的圆石 —— 直接给，聚焦验「做工具」这一步
@@ -223,9 +223,9 @@ async function waitTask(c, id, ms) {
     bad(`没做出石制工具（${t2.error || '无错误信息'}）`);
   }
 
-  if (wantStep(3)) {
   }
 
+  if (wantStep(3)) {
   console.log('\n[3] 盖一个带门的小屋：build_shelter(size=3)');
   // **补齐盖房要的材料**（这一轮加的）。
   //
@@ -242,8 +242,13 @@ async function waitTask(c, id, ms) {
   await rcon.command(`give ${USER} oak_planks 16`);
   await rcon.command(`give ${USER} torch 8`);
   await rcon.command(`give ${USER} coal 8`);
+  if (argStep === 3) {
+    // 分步模式没有第 1 步挖来的圆石 —— **完整链里墙就是用它砌的**（实测
+    // --step 3 不给时她报「一块墙都没放上去」）。补上，聚焦验「盖房」。
+    await rcon.command(`give ${USER} cobblestone 32`);
+  }
   await sleep(1500);
-  console.log('    （已补：木板 ×16、火把 ×8、煤 ×8 —— 盖房要用，纯石头平台上找不到）');
+  console.log(`    （已补：木板 ×16、火把 ×8、煤 ×8${argStep === 3 ? '、圆石 ×32（分步模式没有第 1 步的产出）' : ''} —— 盖房要用，纯石头平台上找不到）`);
   const r3 = await c.call('skill.run', { skill: 'build_shelter', params: { size: 3 } });
   const t3 = await waitTask(c, r3.task_id, 420000);
   console.log(`    任务 ${t3.status}${t3.error ? ' 错误：' + t3.error : ''}`);
@@ -275,6 +280,12 @@ async function waitTask(c, id, ms) {
   await c.call('disconnect').catch(() => {});
   await sleep(500);
   c.kill();
+  // **防呆：分步模式一项检查都没跑到 = 包裹结构坏了**（这轮真实踩过：
+  // 括号错位让 if1 包住全部、--step 2 变成 0 检查 exit 0 的**空转假绿**）。
+  if (argStep && pass === 0 && fail === 0) {
+    console.error(`FAIL --step ${argStep}：一项检查都没跑到（包裹结构坏了）`);
+    process.exit(1);
+  }
   process.exit(fail > 0 ? 1 : 0);
 })().catch((e) => {
   console.error('ERR', e.message);

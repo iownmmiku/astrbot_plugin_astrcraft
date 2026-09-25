@@ -52,13 +52,21 @@ async function give(rcon, user, item, count) {
 
 /**
  * setup 后验证某格是什么方块 —— 不符**直接抛**（快速失败 + 打印实测值）。
- * 用服务端的 `block x y z` 查询（返回方块名）。
+ *
+ * **走引擎的 `block.at` RPC，不走 RCON** —— 试过两条 RCON 路都不行：
+ *   · `block x y z`        → vanilla **没有**这个命令（Unknown command）
+ *   · `data get block ...` → 只对**方块实体**有效（"The target block is not a
+ *     block entity"，石头不是实体）
+ * `block.at` 是引擎自己的客户端方块查询，minetest 里实测在用、返回 `{name}`。
+ *
+ * @param call 引擎 RPC 调用函数（`(...args) => client.call(...args)`）
  */
-async function assertBlockAt(rcon, x, y, z, expect) {
-  const out = String(await rcon.command(`block ${x} ${y} ${z}`)).trim();
-  if (!out.includes(expect)) {
+async function assertBlockAt(call, x, y, z, expect) {
+  const b = await call('block.at', { x, y, z });
+  const name = b && b.name;
+  if (name !== expect) {
     throw new Error(
-      `setup 校验失败（快速失败，不许带假前提继续跑）：(${x},${y},${z}) 应含「${expect}」，服务端实际返回：${out || '(空)'}`,
+      `setup 校验失败（快速失败，不许带假前提继续跑）：(${x},${y},${z}) 应是「${expect}」，实际：${name || JSON.stringify(b) || '(读不到)'}`,
     );
   }
 }

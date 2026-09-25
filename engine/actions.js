@@ -2241,6 +2241,24 @@ class Actions {
     if (!bot || !bot.entity) return null;
     const p = bot.entity.position;
     const yaw = bot.entity.yaw;
+    // **锚点（下面那格）不能是「右键会开 GUI」的方块。**
+    //
+    // 原版规则：右键容器/工作台类方块 = **打开界面，手里的方块不会放下去**。
+    // 实测（minetest 铁镐步 3/3 失败）：锚点选到了 furnace → mineflayer
+    // 点了、但打开的是炉子界面 → 目标格还是空气 → 报
+    // `Server refused to place crafting_table at (...): the block is still air
+    // （依附方块 furnace）`。
+    // 表现是「放工作台失败」，**根因在选锚点，不在放置时序**。
+    //
+    // 这份清单只给放置用（`openContainer` 里另有一份、语义不同，别合并）。
+    const guiBlocks = [
+      'chest', 'trapped_chest', 'barrel', 'shulker_box', 'ender_chest',
+      'furnace', 'blast_furnace', 'smoker', 'hopper', 'dropper', 'dispenser',
+      'brewing_stand', 'crafting_table', 'enchanting_table', 'anvil', 'grindstone',
+      'stonecutter', 'loom', 'cartography_table', 'fletching_table', 'smithing_table',
+      'lectern', 'composter', 'beehive', 'bee_nest',
+    ];
+    const isGui = (name) => guiBlocks.some((n) => name.includes(n));
     const dirs = [
       [Math.round(-Math.sin(yaw)), Math.round(Math.cos(yaw))],
       [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1],
@@ -2254,7 +2272,7 @@ class Actions {
         const below = blockAt(bot, x, y - 1, z);
         if (!here || !below) continue;
         const hereFree = here.boundingBox === 'empty' || here.name === 'air';
-        const belowSolid = below.boundingBox === 'block';
+        const belowSolid = below.boundingBox === 'block' && !isGui(below.name);
         if (hereFree && belowSolid) return { x, y, z };
       }
     }
