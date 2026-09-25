@@ -438,8 +438,18 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
           steps.push(...pk.steps);
         }
         if (wood.countPlanks(actions) >= 3) {
-          await actions.craft({ item: doorName, count: 1, signal: ctx.signal });
-          steps.push(`合成 ${doorName}`);
+          const doorR = await actions.craft({ item: doorName, count: 1, signal: ctx.signal });
+          if (doorR.ok) {
+
+            steps.push(`合成 ${doorName}`);
+
+          } else {
+
+            log.info(`做门没产出（craft 返回 ok=false）：${doorName}`);
+
+            steps.push(`做门没产出：${doorName}`);
+
+          }
           break;
         }
       } catch (err) {
@@ -464,8 +474,8 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
         }
       }
       if ((actions.countItem('coal') > 0 || actions.countItem('charcoal') > 0) && actions.countItem('stick') >= 1) {
-        await actions.craft({ item: 'torch', count: 4, signal: ctx.signal });
-        steps.push('合成火把');
+        const torchR4 = await actions.craft({ item: 'torch', count: 4, signal: ctx.signal });
+        if (torchR4.ok) { steps.push('合成火把'); } else { log.info('火把没做出来（craft 返回 ok=false，不致命）'); }
       }
     } catch (err) {
       log.debug(`做火把失败（不致命）：${err.message}`);

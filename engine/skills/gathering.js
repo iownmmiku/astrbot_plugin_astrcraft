@@ -143,7 +143,20 @@ async function collect({ actions, nav, state, ctx, item, count = 1, autoDomain =
       try {
         const r = await actions.craft({ item: plan.recipe, count: target - already, signal: ctx.signal });
         steps.push(`合成 ${plan.recipe}×${r.produced}`);
-        result = skillResult(true, { steps, produced: { [plan.recipe]: r.produced } });
+        // **按目标状态判，不看「调用没抛异常」**（和 makePlanks 那次修复同一个标准）。
+        // craft 可以 ok:false（服务端忽略点击/材料不够时它正常返回），
+        // 原来这里无条件 true → 上面那句 `ok = now >= target || result.ok` 就被内层 true
+        // 盖过去了，**目标没到也报成功**。
+        {
+          const nowHave = actions.countItem(want);
+          const reached = nowHave >= target;
+          result = skillResult(reached, {
+            steps,
+            produced: { [plan.recipe]: r.produced },
+            note: reached ? null : `只做出 ${r.produced} 个，现有 ${want}×${nowHave}（目标 ${target}）`,
+            reason: reached ? null : `合成 ${plan.recipe} 没做到目标（现有 ${nowHave}/${target}）`,
+          });
+        }
       } catch (err) {
         if (err instanceof CancelledError) throw err;
         // 合成失败时退回"收集原材料"（例如缺原木就先去砍树）
@@ -293,6 +306,11 @@ async function collectFallbackMaterials({ actions, nav, state, ctx, steps, item,
   try {
     const r = await actions.craft({ item, count, signal: ctx.signal });
     steps.push(`合成 ${item}×${r.produced}`);
+    // craft 可以正常返回但一个都没产出（服务端忽略点击时它返回 ok:false）
+    // —— 一个都没做出来就不能报成功（和 makePlanks 那次修复同一个标准）
+    if (!r.ok) {
+      return skillResult(false, { steps, reason: `合成 ${item} 一个都没做出来（服务端可能没接受点击）` });
+    }
     return skillResult(true, { steps, produced: { [item]: r.produced } });
   } catch (err) {
     return null;
@@ -380,7 +398,9 @@ async function storeItems({ actions, nav, state, ctx, items = null, keep = ['tor
         if (!pk.ok) return skillResult(false, { steps, reason: `做箱子需要 8 个木板：${pk.reason}` });
       }
       try {
-        await actions.craft({ item: 'chest', count: 1, signal: ctx.signal });
+        const chestR = await actions.craft({ item: 'chest', count: 1, signal: ctx.signal });
+        if (!chestR.ok) return skillResult(false, { steps, reason: '合成箱子失败：一个箱子都没做出来（服务端可能没接受点击）' });
+
         steps.push('合成箱子');
       } catch (err) {
         return skillResult(false, { steps, reason: `合成箱子失败：${describeFailure(err)}` });
@@ -454,8 +474,8 @@ async function cookFood({ actions, nav, state, ctx, count = 4 }) {
   // 不够就用面包补
   if (actions.countItem('bread') < count && actions.countItem('wheat') >= 3) {
     try {
-      await actions.craft({ item: 'bread', count: Math.floor(actions.countItem('wheat') / 3), signal: ctx.signal });
-      steps.push('烤面包');
+      const breadR = await actions.craft({ item: 'bread', count: Math.floor(actions.countItem('wheat') / 3), signal: ctx.signal })
+      if (breadR.ok) { steps.push('烤面包'); } else { log.info('烤面包没做出来（craft 返回 ok=false）'); }
     } catch (err) {
       log.info(`做面包失败：${err.message}`);
     }

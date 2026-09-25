@@ -419,7 +419,9 @@ async function smeltOres({ actions, nav, state, ctx, item = null, count = null }
       steps.push(...st.steps);
     }
     try {
-      await actions.craft({ item: 'furnace', count: 1, signal: ctx.signal });
+      const furnaceR = await actions.craft({ item: 'furnace', count: 1, signal: ctx.signal });
+      if (!furnaceR.ok) return skillResult(false, { steps, reason: '合成熔炉失败：一个熔炉都没做出来（服务端可能没接受点击；需要 8 个圆石）' });
+
       steps.push('合成熔炉');
     } catch (err) {
       return skillResult(false, { steps, reason: `合成熔炉失败：${describeFailure(err)}（需要 8 个圆石）` });

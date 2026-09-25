@@ -600,9 +600,18 @@ const SKILLS = {
       }
       if (actions.countItem('torch') < 4 && (actions.countItem('coal') > 0 || actions.countItem('charcoal') > 0)) {
         try {
-          await actions.craft({ item: 'torch', count: 8, signal: ctx.signal });
-          steps.push('合成火把');
-          produced.torch = (produced.torch || 0) + 8;
+          const torchR8 = await actions.craft({ item: 'torch', count: 8, signal: ctx.signal });
+          if (torchR8.ok) {
+
+            steps.push('合成火把');
+
+            produced.torch = (produced.torch || 0) + 8;
+
+          } else {
+
+            log.info('火把没做出来（craft 返回 ok=false，不致命）');
+
+          }
         } catch {
           /* 不致命 */
         }

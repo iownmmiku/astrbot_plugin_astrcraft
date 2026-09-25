@@ -384,6 +384,17 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
       });
     }
   }
+  // **走到这里的前提是「真的做出了木棍」** —— craft 可以正常返回但 produced=0
+  // （服务端忽略点击）。原来这里无条件 true，note 会写「新增木棍 0 根」却报成功。
+  // 和 catch 分支用同一个标准：gained > 0 才算数。
+  const finalGained = actions.countItem('stick') - startHave;
+  if (finalGained <= 0) {
+    return skillResult(false, {
+      steps,
+      produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+      reason: `木棍一个都没做出来（可能服务端没接受点击；${planks} 有 ${actions.countItem(planks)} 个）`,
+    });
+  }
   return skillResult(true, {
     steps,
     produced: positiveOnly(diffOf(before, actions.inventoryMap())),
