@@ -14,7 +14,7 @@ const { Rcon } = require('./lib/rcon');
 const PORT = Number(process.env.MC_PORT || 25566);
 const RCON_DIR = process.env.MC_RCON_DIR || path.join(__dirname, '..', '.testserver');
 
-const child = spawn(process.execPath, [path.join(__dirname, '..', 'index.js')], {
+const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'info' },
 });
