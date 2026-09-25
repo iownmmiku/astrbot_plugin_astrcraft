@@ -43,6 +43,16 @@ import sys
 import time
 from pathlib import Path
 
+# **输出编码自愈** —— 踩过：控制台是 GBK 时（尤其**忘了设 PYTHONIOENCODING**），
+# 打印 ⏭️/✅ 这类字符直接 `UnicodeEncodeError`，**整个 run_all 当场崩**，
+# 看起来像测试全炸、其实一个测试都还没跑。做成自愈而不是依赖调用方的环境变量。
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 —— 自愈失败就退回原行为，不挡主流程
+        pass
+
 REPO = Path(__file__).resolve().parents[1]
 DEV = REPO / "dev-tools"
 
