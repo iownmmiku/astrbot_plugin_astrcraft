@@ -165,7 +165,12 @@ async function makePit(rcon, user, X, depth) {
   return { X, Z, standY, surfaceY: SURFACE };
 }
 
-async function runSkill(skill, params, sec = 120) {
+async function runSkill(skill, params, sec = 300) {
+  // 120 → 300：[3] 的零装备坑**按设计必卡** → 反射狂发自救任务
+  // （优先级 0 > 用户任务 20）→ pave 被排在后面 120 秒没轮到 →
+  // fullpit5 实测 `pave up → no-finish`（note 空 → 「说清原因」断言红）。
+  // r53 的引擎日志就是那波自救风暴的现场（5 次自救/5 分钟）。
+  // **只加耐心，断言一个字不动**；task_id 匹配保证迟到的结果照样能收到。
   const mark = finished.length;
   const r = await call('skill.run', { skill, params }, 60000).catch((e) => ({ err: e.message }));
   if (r.err) return { status: 'start-failed', error: r.err };
