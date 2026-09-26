@@ -17,8 +17,23 @@ const { spawn } = require('child_process');
 // **注意路径**：rcon 在 `tools/lib/rcon.js`（不是 bot/lib/）——
 // 第一版我写成 `path.join(__dirname, '..', 'lib', 'rcon')`，直接 MODULE_NOT_FOUND。
 const { Rcon } = require('./lib/rcon');
+const { assertBlockAt } = require('./lib/fixture');
 
 const PORT = Number(process.env.MC_PORT || 25566);
+// **分步模式**：--step 1/2/3/4 只跑那个场景（诊断提速：全量单跑 6~10 分钟，
+// 单场景 ~1 分钟）。不带参数 = 全量（判据不变）。
+const argStep = (() => {
+  const i = process.argv.indexOf('--step');
+  if (i < 0 || !process.argv[i + 1]) return 0;
+  const n = Number(process.argv[i + 1]);
+  if (![1, 2, 3, 4].includes(n)) {
+    console.error(`--step 只接受 1/2/3/4，收到：${process.argv[i + 1]}`);
+    process.exit(2);
+  }
+  return n;
+})();
+const wantStep = (n) => argStep === 0 || argStep === n;
+if (argStep) console.log(`（分步模式：--step ${argStep}，只跑场景 ${argStep}）`);
 const RCON_DIR = process.env.MC_RCON_DIR || path.join(__dirname, '..', '.testserver');
 
 const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
@@ -119,6 +134,13 @@ async function makePit(rcon, user, X, depth) {
   const standY = FLOOR + 1;                // 她脚的位置
   const top = SURFACE;                     // 她脚下的支撑层
 
+  // **先圈 forceload** —— [1] 红了 N 批的最终根因：这些 fill 执行时 bot 还在
+  // **上一个位置**，目标区块未加载 → fill **静默无效**（minetest 里同款教训
+  // 早就写在注释里）→ tp 进去后落在**没挖的石头里** → 「被 stone 埋住、无镐」
+  // → spiral 四方向被坑壁静默跳过 → pillar 清头顶失败 → 6 秒判负。
+  // 而 4/5 能过的那些次 = 区块碰巧加载了（**竞态**，所以它时好时坏）。
+  await rcon.command(`forceload add ${X - 8} ${Z - 8} ${X + 8} ${Z + 8}`);
+  await sleep(800);
   // 从世界底往上堆到坑口
   await rcon.command(
     `fill ${X - 6} -64 ${Z - 6} ${X + 6} ${top} ${Z + 6} minecraft:stone`,
@@ -135,6 +157,11 @@ async function makePit(rcon, user, X, depth) {
   await sleep(1500);
   await rcon.command(`tp ${user} ${X + 0.5} ${standY} ${Z + 0.5}`);
   await sleep(2500);
+  // **验坑必须在 tp 之后** —— 断言走引擎的 block.at（客户端视图），
+  // bot 还没到那里时区块永远不会加载 → 「等了 8 秒仍未加载」必炸
+  // （**同一个错误我在 test_mine_return 犯过并写过注释，这次又犯**：
+  //  断言的『观察者』必须先到场，顺序本身就是判据的一部分）。
+  await assertBlockAt(call, X, standY, Z, 'air');
   return { X, Z, standY, surfaceY: SURFACE };
 }
 
@@ -178,6 +205,7 @@ async function runSkill(skill, params, sec = 120) {
   await sleep(6000);  console.log('=== 从坑里出来（三种真实情况）===\n');
 
   // ---------- 情况 1：有方块（应该能垫出来）----------
+  if (wantStep(1)) {
   console.log('[1] 3 格深的坑 + 背包里有 32 个圆石（没有镐）');
   {
     const p = await makePit(rcon, USER, BASE + 0, 3);
@@ -196,6 +224,7 @@ async function runSkill(skill, params, sec = 120) {
   }
 
   // ---------- 情况 2：有镐（应该能挖出来）----------
+  if (wantStep(2)) {
   console.log('\n[2] 3 格深的坑 + 有石镐（泥土/石头壁可挖）');
   {
     const p = await makePit(rcon, USER, BASE + 60, 3);
@@ -213,7 +242,10 @@ async function runSkill(skill, params, sec = 120) {
     else bad('没能挖出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
   }
 
+  }
+
   // ---------- 情况 3：什么都没有（应该如实说"出不去"）----------
+  if (wantStep(3)) {
   console.log('\n[3] 3 格深的坑 + 什么都没有（没有方块也没有镐）');
   {
     const p = await makePit(rcon, USER, BASE + 120, 3);
@@ -244,7 +276,12 @@ async function runSkill(skill, params, sec = 120) {
   // 用户的原话："每次挖矿之后都没法自己回到地面，所以应该是有方块也有镐"
   //
   // 所以真正要测的是：**十几格深的 1x1 竖井 + 有镐 + 有圆石**（挖矿的产物）。
+  }
+
   // 前面那三条都太浅（3 格），盖不到这个情况。
+  }
+
+  if (wantStep(4)) {
   console.log('\n[4] 真实场景：10 格深的 1x1 竖井 + 有镐 + 有圆石（挖矿回来的样子）');
   {
     const p = await makePit(rcon, USER, BASE + 180, 10);
@@ -278,6 +315,8 @@ async function runSkill(skill, params, sec = 120) {
     }
   }
 
+  }
+
   rcon.close();
   await call('disconnect').catch(() => {});
   await sleep(500);
@@ -288,6 +327,11 @@ async function runSkill(skill, params, sec = 120) {
     // **失败了就把引擎日志一起交出来** —— 没有现场的失败只能靠猜
     console.log(`--- 引擎日志（stderr 最近 ${engineLog.length} 行，从这里查原因）---`);
     for (const l of engineLog.slice(-150)) console.log('  ' + l);
+  }
+  // **防呆：分步模式一项检查都没跑到 = 包裹结构坏了**（空转假绿，不许静默过）
+  if (argStep && pass === 0 && fail === 0) {
+    console.error(`FAIL --step ${argStep}：一项检查都没跑到（包裹结构坏了）`);
+    process.exit(1);
   }
   process.exit(fail > 0 ? 1 : 0);
 })().catch((e) => {
