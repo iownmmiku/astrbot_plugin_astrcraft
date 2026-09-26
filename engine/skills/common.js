@@ -543,7 +543,10 @@ function surfaceHeightAt(bot, x, z, fromY) {
 //   · 判据还不统一（dig 绝对层 / stair 相对高度）—— 同一个 bug 修两遍
 // **从此只有一份，改这里三个策略同时生效。**
 const STEP_UP_RANGE = 1.5; // 到达判据：0.6/1.2 会把「停在 1.58 格」判成没走到（实测）
-const STEP_UP_TIMEOUT_MS = 6000; // dig 原来 5000、stair 6000 —— 统一成较长的那个
+// **3000（从 6000 砍的）**：竖井/台阶都是 1~2 格的挪动 —— pathfinder 要么很快找到路，
+// 要么走不到；走不到时每条烧满超时 × 方向数 = 一轮几十秒（实测 f9：24~51 秒/attempt，
+// 2 分钟只升 2 格，测试预算内爬不出去）。快速失败、快速换方向/换策略。
+const STEP_UP_TIMEOUT_MS = 3000;
 
 /**
  * 共享前置：**等落地 + 用「现在」的坐标**（返回刷新后的 {bx,by,bz}，落地失败返回 null）。
@@ -575,6 +578,24 @@ async function stepUpOnePrelude({ actions, ctx, bx, by, bz, tag }) {
 }
 
 /**
+ * **等落地后读真实高度** —— 跳跃弧线中段的 `floor(pos.y)` 会**虚高 1 格**。
+ *
+ * 实测现场（mine g10）：手动补位报「y -52 → -50」、第 7 轮读到 y=-50 判为
+ * "已经出来了"（任务 done），**测试一量却是 -51.0** —— 全是没落地时读的位置。
+ * 表现为「引擎说出来了、测试说还在井里」，根因在**读数时机**不在判据。
+ *
+ * 落地即返回（常态 0 等待）；最多等 maxMs，防悬挂。
+ */
+async function settleFloorY(bot, ctx, maxMs = 1500) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    if (bot.entity && bot.entity.onGround) break;
+    await delay(100, { signal: ctx.signal });
+  }
+  return Math.floor(bot.entity.position.y);
+}
+
+/**
  * 共享的「走到目标层并验证」—— **range / 超时 / 验证标准只写这一份**。
  *
  * 三条教训（每条都真踩过，两处实现各踩一次）：
@@ -596,8 +617,9 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
     if (err instanceof CancelledError) throw err;
     goToFailed = String(err.message).slice(0, 70);
   }
-  await delay(250, { signal: ctx.signal });
-  const afterY = Math.floor(actions.bot.entity.position.y);
+  // 落地后再读 —— 跳跃/走跳的弧线中段 floor 会虚高 1 格（g10 现场：
+  // 引擎读 -50 判"出来了"，测试一量是 -51.0 —— 全是没落地时读的位置）
+  const afterY = await settleFloorY(actions.bot, ctx, 800);
   if (afterY >= by + 1) {
     log.info(`${tag}：升上去了（现在 y=${afterY}）`);
     return true;
@@ -622,13 +644,26 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
     const far = goResult && goResult.distance_to_target !== undefined ? `（隔 ${goResult.distance_to_target} 格）` : '';
     log.info(`${tag}：goTo 没走到${far}，跳过手动补位（人不在台阶旁）`);
   } else try {
+    // **先停掉 pathfinder 的活动目标** —— 上一次 goTo 留下的目标可能还在驱动移动，
+    // 和手动 forward/jump 打架（f6 现场：人在台阶旁、arrived=true 距离 0.707，
+    // 手动 900ms 纹丝没上去的嫌疑之一）。
+    try {
+      bot.pathfinder.stop();
+    } catch {
+      /* 没有活动目标也无所谓 */
+    }
+    // **先朝落脚点转头** —— 加 arrived 门那次编辑把 lookAt 整行吃掉了（自踩）：
+    // 不转头时 forward 朝着她原来面对的方向推，多半撞墙/原地跳 ——
+    // 这就是「手动走跳也没上去」的直接原因（f6 现场）。
+    await bot.lookAt(vec3(nx + 0.5, by + 0.5, nz + 0.5), true);
     bot.setControlState('forward', true);
     bot.setControlState('jump', true);
     await delay(600, { signal: ctx.signal });
     bot.setControlState('forward', false);
     bot.setControlState('jump', false);
-    await delay(300, { signal: ctx.signal });
-    const afterY2 = Math.floor(bot.entity.position.y);
+    // **等落地再读** —— 300ms 后往往还在弧线里，floor 虚高 1 格会谎报成功
+    // （g10 现场：「-52 → -50」实际落地 -51 → 后续轮次和测试读数全对不上）
+    const afterY2 = await settleFloorY(bot, ctx, 1500);
     if (afterY2 >= by + 1) {
       log.info(`${tag}：手动走跳补位成功（y ${afterY} → ${afterY2}）`);
       return true;
@@ -883,6 +918,13 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   //
   // 用来判"确实上不去了"，而不是靠 `isUnderground` 猜 —— 见下面的说明。
   let stalledRounds = 0;
+  // **内联「向上挖阶梯」试过一次走不到就不再试** —— 实测（h15/j20）：
+  // 这个策略在 1×1 竖井里四个方向**全部** `走不到`（pathfinder 磨到超时），
+  // 每轮白烧 7~20 秒，而技能总预算只有 300 秒（挖矿还要吃 ~100 秒）——
+  // j20 现场：她爬到 -51（只差 2 格）时测试先到点。
+  // 走不到是几何结论，本轮试过就不会突然变通；活路在下面的
+  // digStepUp（带垫支撑 + 手动补位，日志里成功案例全是它）。
+  let inlineFutile = false;
   let lastY = Math.floor(bot.entity.position.y);
 
   for (let i = 0; i < maxSteps; i += 1) {
@@ -920,6 +962,17 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     if (nowY > lastY) {
       stalledRounds = 0;
       lastY = nowY;
+    } else if (nowY < lastY) {
+      // **掉了 → 停滞计数重新起算**（实测铁证，f7 现场）：
+      // `lastY` 原来永远停在历史最高点 —— 掉下去之后每一轮都是 `nowY < lastY`
+      // 全被记进 else 分支当「没进展」，3 轮就误杀。f7 的日志：
+      //   第 8 轮 y=-55 → 第 9 轮 y=-54 → 第 10 轮 y=-53（**连升 3 轮**）
+      //   紧接着却报「连续 3 轮都在 y=-53」—— 因为 lastY 卡在掉落前的 -52。
+      // 掉落也是「动了」：给她 3 轮从新高度重新爬（硬上限还有 maxSteps 兜着，
+      // 最坏情况也只是把 40 轮跑满，不会无限转）。
+      log.info(`爬升：掉了 ${lastY - nowY} 格（${lastY} → ${nowY}），停滞计数重新起算`);
+      stalledRounds = 0;
+      lastY = nowY;
     } else {
       stalledRounds += 1;
       if (stalledRounds >= 3) {
@@ -934,7 +987,8 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     const bz = Math.floor(p.z);
     let advanced = false;
 
-    for (const [dx, dz] of dirs) {
+    // （inlineFutile 时 dirs 传空数组 = 本轮跳过内联尝试，直接落到 digStepUp）
+    for (const [dx, dz] of (inlineFutile ? [] : dirs)) {
       const tx = bx + dx;
       const tz = bz + dz;
       const feet = blockAt(bot, tx, by + 1, tz);
@@ -957,11 +1011,20 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         // 而她本来就在 1 格范围内，`goTo` **立刻判定"已到达"就返回了**，
         // 一次都没真的往上走。日志里就是"爬出矿道：24 格（ok=false）"：
         // 挖了 24 级台阶、一级都没踩上去。
-        await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 10000 });
+        //
+        // **超时 10000 → 1500**（这一轮砍两刀的第二刀）：
+        // 第一刀 10000→3000 后实测每轮仍要 35~40 秒 —— 这个内联尝试在 1×1 竖井里
+        // **四个方向全部走不到**（tigh 几何 pathfinder 秒判不了就磨到超时），
+        // 每轮白烧 ~20 秒，而技能总预算 300 秒（含挖矿 ~100 秒），
+        // 剩 ~200 秒 ÷ 35 秒/轮 = 只够 6 轮 —— h15 实测「共爬 6 格」后超时。
+        // 真走得通的路径（1~2 格）都在 1 秒内出结果；1.5 秒走不到 = 这条几何走不到，
+        // 快速让位给下面的 digStepUp（带垫支撑 + 手动补位，实测那条才是活路）。
+        await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 1500 });
         // **用位置验证"真的升高了"，不信 goTo 的返回值。**
         // 它可能因为"附近有可站立点"之类的判断原地成功返回——
         // 实测那样会 24 级台阶一级都没踩上，而 climbed 却在涨。
-        const nowY = Math.floor(bot.entity.position.y);
+        // （落地后再读：跳跃弧线中段 floor 虚高 1 格，同 settleFloorY 的理由）
+        const nowY = await settleFloorY(bot, ctx, 800);
         if (nowY <= by) {
           log.debug(`挖了台阶但没上去（${by} → ${nowY}），换个方向或换办法`);
           continue;
@@ -971,7 +1034,8 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         break;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
-        log.info(`向上挖阶梯失败（换方向）：${err.message}`);
+        log.info(`向上挖阶梯失败（换方向）：${err.message} —— 这条几何走不通，后续轮次跳过该策略`);
+        inlineFutile = true;
       }
     }
 
