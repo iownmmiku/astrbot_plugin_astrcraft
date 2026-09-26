@@ -174,7 +174,7 @@ async function runSkill(skill, params, sec = 120) {
     const r = await runSkill('pave', { direction: 'up', count: 4 });
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
-    console.log(`    pave up → ${r.status} ｜ ${String(r.result.note || r.error || '').slice(0, 80)}`);
+    console.log(`    pave up → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 80)}`);
     if (up >= 2) ok('垫出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
     else bad('没能垫出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
   }
@@ -192,7 +192,7 @@ async function runSkill(skill, params, sec = 120) {
     const r = await runSkill('climb_out', { max_steps: 32 });
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
-    console.log(`    climb_out → ${r.status} ｜ ${String(r.result.note || r.error || '').slice(0, 80)}`);
+    console.log(`    climb_out → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 80)}`);
     if (up >= 2) ok('挖出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
     else bad('没能挖出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
   }
@@ -209,14 +209,14 @@ async function runSkill(skill, params, sec = 120) {
     console.log(`    起点 y=${before.position.y.toFixed(1)}，背包 ${(before.inventory && before.inventory.items ? before.inventory.items.length : '?')} 种东西`);
     const r = await runSkill('pave', { direction: 'up', count: 3 }, 60);
     const after = await call('state.get', { detail: 'brief' });
-    const note = String(r.result.note || r.error || '');
+    const note = String((r.result && r.result.note) || r.error || '');
     console.log(`    pave up → ${r.status} ｜ ${note.slice(0, 90)}`);
     const saidNo = /没有能垫的方块|没有方块|垫高失败/.test(note);
     if (saidNo) ok('如实说了"没有方块可垫"（不是假装成功）', note.slice(0, 60));
     else bad('没有明确说清"出不去"的原因', note.slice(0, 80));
     // 再看 climb_out 在没镐时怎么说
     const r2 = await runSkill('climb_out', { max_steps: 16 }, 60);
-    const note2 = String(r2.result.note || r2.error || '');
+    const note2 = String((r2.result && r2.result.note) || r2.error || '');
     console.log(`    climb_out → ${r2.status} ｜ ${note2.slice(0, 90)}`);
     const up2 = after.position.y - before.position.y;
     if (up2 < 1) ok('确实出不去（符合物理：没工具没方块）', `y 没变`);
@@ -243,7 +243,7 @@ async function runSkill(skill, params, sec = 120) {
     const r = await runSkill('climb_out', { max_steps: 40 }, 240);
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
-    console.log(`    climb_out → ${r.status} ｜ ${String(r.result.note || r.error || '').slice(0, 90)}`);
+    console.log(`    climb_out → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 90)}`);
     if (after.position.y >= -60.5) {
       ok('从 10 格深的竖井里爬回地面了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
     } else {
@@ -253,7 +253,7 @@ async function runSkill(skill, params, sec = 120) {
     if (after.position.y < -60.5) {
       const r2 = await runSkill('pave', { direction: 'up', count: 12 }, 240);
       const after2 = await call('state.get', { detail: 'brief' });
-      console.log(`    pave up → ${r2.status} ｜ ${String(r2.result.note || r2.error || '').slice(0, 90)}`);
+      console.log(`    pave up → ${r2.status} ｜ ${String((r2.result && r2.result.note) || r2.error || '').slice(0, 90)}`);
       if (after2.position.y >= -60.5) {
         ok('pave up 能从深井里垫上来', `y ${after.position.y.toFixed(0)} → ${after2.position.y.toFixed(0)}`);
       } else {

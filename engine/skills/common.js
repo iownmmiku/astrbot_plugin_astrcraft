@@ -598,21 +598,69 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   }
   await delay(250, { signal: ctx.signal });
   const afterY = Math.floor(actions.bot.entity.position.y);
-  const ok = afterY >= by + 1;
-  if (ok) {
+  if (afterY >= by + 1) {
     log.info(`${tag}：升上去了（现在 y=${afterY}）`);
-  } else {
-    // **失败日志必须带 goTo 的 arrived/距离** —— 合并那轮我把这行删了，
-    // 结果下一次「没上去」就分不清「goTo 认为到了但高度没变」还是「根本没走到」，
-    // 又得猜一轮（判据教训：失败现场的字段少一个，定性就慢一倍）。
-    const arrived = goResult ? `arrived=${goResult.arrived}` : 'goTo 无返回';
-    const dist = goResult && goResult.distance_to_target !== undefined ? ` 距离=${goResult.distance_to_target}` : '';
-    log.info(
-      `${tag}：没上去（还在 y=${afterY}，目标是 ${by + 1}）；${arrived}${dist}` +
-        (goToFailed ? `；goTo 说：${goToFailed}` : ''),
-    );
+    return true;
   }
-  return ok;
+
+  // **高度不够 → 手动补一步「朝落脚点走+跳」。**
+  //
+  // 失败现场（mine_return b6 日志）证实了机制：goTo 会
+  //   · `arrived=true`（movement.js:465 的早期返回：水平 ≤1.5、高度差 ≤1.2 → 0ms 判到）
+  //   · `arrived=true 距离=1.4`（GoalNear 的 3D 判据：站目标斜下 1 格 ≈1.22 ≤ 1.5）
+  // 两种情况都**宣布到达却不发起移动** —— 于是从来没有人真的去跳那一步，
+  // 高度永远停在原地 → 「垫好落脚点但上上去」。
+  // （成功案例是 pathfinder 恰好按路径真走了 1.9 秒 —— 取决于站位，这就是它偶发的原因。）
+  //
+  // 修法：对两种"假到达"和"游走后回不来"统一兜底 —— 朝**落脚点实际坐标**走+跳。
+  // 走跳上 1 格台阶是 MC 的基础动作，没有跳跃窗口问题（目标是旁边的方块，不是自己脚下）。
+  const bot = actions.bot;
+  // **只有「goTo 说到了」才补位** —— 实测教训：人在几格之外（no-path 失败）时
+  // 朝远处台阶瞎跳 600ms，纯属噪音还可能把自己带偏（pit 的 [2] 挖爬 0 升就是这么来的）。
+  // 人不在台阶旁边，这一步没有意义：交给下一轮/下一个方向。
+  if (!goResult || !goResult.arrived) {
+    const far = goResult && goResult.distance_to_target !== undefined ? `（隔 ${goResult.distance_to_target} 格）` : '';
+    log.info(`${tag}：goTo 没走到${far}，跳过手动补位（人不在台阶旁）`);
+  } else try {
+    bot.setControlState('forward', true);
+    bot.setControlState('jump', true);
+    await delay(600, { signal: ctx.signal });
+    bot.setControlState('forward', false);
+    bot.setControlState('jump', false);
+    await delay(300, { signal: ctx.signal });
+    const afterY2 = Math.floor(bot.entity.position.y);
+    if (afterY2 >= by + 1) {
+      log.info(`${tag}：手动走跳补位成功（y ${afterY} → ${afterY2}）`);
+      return true;
+    }
+    log.info(`${tag}：手动走跳也没上去（y=${afterY2}）`);
+  } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    try {
+      bot.setControlState('forward', false);
+      bot.setControlState('jump', false);
+    } catch {
+      /* 复位失败不挡日志 */
+    }
+    log.info(`${tag}：手动走跳出错：${String(err.message).slice(0, 70)}`);
+  }
+
+  // **失败日志必须带 goTo 的 arrived/距离/note/用时** ——
+  // 判据教训：失败现场的字段少一个，定性就慢一倍。
+  // `note`/`elapsed_ms` 能分辨走了哪条路：
+  //   「已在目标附近」+0ms   = movement.js:465 的**早期立即返回**（没动）
+  //   「已到达」+几百ms      = pathfinder 的 goal_reached（真走过）
+  const arrived = goResult ? `arrived=${goResult.arrived}` : 'goTo 无返回';
+  let dist = '';
+  if (goResult && goResult.distance_to_target !== undefined) dist = ` 距离=${goResult.distance_to_target}`;
+  else if (goResult && goResult.distance !== undefined) dist = ` 距离=${goResult.distance}`;
+  const note = goResult && goResult.note ? ` 「${goResult.note}」` : '';
+  const elapsed = goResult && goResult.elapsed_ms !== undefined ? ` 用时=${goResult.elapsed_ms}ms` : '';
+  log.info(
+    `${tag}：没上去（还在 y=${afterY}，目标是 ${by + 1}）；${arrived}${dist}${note}${elapsed}` +
+      (goToFailed ? `；goTo 说：${goToFailed}` : ''),
+  );
+  return false;
 }
 
 async function digStepUpImpl({ actions, nav, ctx, bx, by, bz }) {
