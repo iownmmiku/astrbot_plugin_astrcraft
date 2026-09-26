@@ -909,7 +909,19 @@ class McEngine {
                   const res = await climbToSurface({
                     actions: this.actions,
                     nav: this.nav,
-                    ctx: { signal, checkAborted: () => { if (signal && signal.aborted) throw new CancelledError(); } },
+                    // **这个 ctx 必须有 `progress`** —— climbToSurface 和它的策略
+                    // （挖台阶/往旁边垫…）大量调用 ctx.progress；原来自造的 ctx 只有
+                    // signal+checkAborted → 「ctx.progress is not a function」任务当场崩
+                    // （p40 引擎日志实锤）→ 自救循环白烧 5 分钟 → 静默 5 分钟 →
+                    // 测试的用户任务被饿死（[1] pave 0 升、超时都源于此链）。
+                    // 转发到 state.note：爬升过程在状态里可见（和其它任务的用法一致）。
+                    ctx: {
+                      signal,
+                      checkAborted: () => {
+                        if (signal && signal.aborted) throw new CancelledError();
+                      },
+                      progress: (msg) => this.state.note(String(msg)),
+                    },
                     maxSteps: 32,
                   });
                   // **注意 `climbToSurface` 返回的是对象，不是布尔。**
