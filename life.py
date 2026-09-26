@@ -915,6 +915,9 @@ class LifeLoop(PromptRenderMixin):
 
     async def decide(self) -> LifeDecision | None:
         """决定"现在想做什么"。先问 LLM，问不到就退回规则。"""
+        # 思考时间探针：从 decide 入口到下面 INFO 行（提示词装配完成）的耗时，
+        # 配合"决策上下文分层"行的体积 —— 「更短思考」目标的基线/回归都看它。
+        t_prompt0 = time.time()
         self.drives.tick()
         suggestion = self.drives.suggest_activity()
         system = await self._system_prompt()
@@ -1103,11 +1106,13 @@ class LifeLoop(PromptRenderMixin):
 【你现在的心情】
 {suggestion['label']}（强度 {suggestion['level']}）：{suggestion['voice']}"""
 
-        # 上下文分层 + 体积分解（排查"为什么慢"时直接看日志）
+        # 上下文分层 + 体积分解（排查"为什么慢"时直接看日志）。
+        # **INFO 级 + 构建耗时**（原来是 debug，等于没人看得见）：
+        # 「思考时间」目标的基线与回归探针 —— 每轮一行，和其它决策日志同级。
         system = f"{system}\n\n{static_rules}"
-        logger.debug(
+        logger.info(
             "决策上下文分层：system %d 字（静态，可缓存）｜ user %d 字（动态）"
-            "｜ 其中 状态%d 打算%d 清单%d 经历%d 顾问%d 心情%d 记忆%d 技能%d",
+            "｜ 其中 状态%d 打算%d 清单%d 经历%d 顾问%d 心情%d 记忆%d 技能%d｜装配 %.0f ms",
             len(system),
             len(prompt),
             len(brief),
@@ -1118,6 +1123,7 @@ class LifeLoop(PromptRenderMixin):
             len(suggestion.get("voice") or ""),
             len(memo_show),
             len(skill_text),
+            (time.time() - t_prompt0) * 1000,
         )
 
         # 优先走"带感知工具"的决策：她可以先查看再决定（这才是真人在做的事）。
