@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 
@@ -101,6 +102,17 @@ def list_node_procs() -> list[tuple[int, str]]:
     return procs
 
 
+def _args_of(cmd: str) -> str:
+    """取出 node 命令行里**二进制路径之后的参数部分**（保护判据只看它）。"""
+    m = re.match(r'\s*"[^"]+"(.*)$', cmd)
+    if m:
+        return m.group(1)
+    m = re.match(r"\s*\S+\.exe\s+(.*)$", cmd, re.I)
+    if m:
+        return m.group(1)
+    return cmd
+
+
 def main() -> int:
     do_kill = "--kill" in sys.argv
     procs = list_node_procs()
@@ -110,10 +122,15 @@ def main() -> int:
 
     protected, mine, unknown = [], [], []
     for pid, cmd in procs:
-        low = cmd.lower()
-        if any(p.lower() in low for p in PROTECT):
+        # **保护判据只看参数，不看可执行文件路径** —— 踩过：我们的测试是用
+        # DSH 自带的 node 跑的（`D:\dsh\...\node.exe dev-tools\test_mine_return.js`），
+        # 二进制路径里的 `dsh` 会先命中保护 → **挂死的测试清不掉**。
+        # 保护的本意是「不杀别人的进程」，看参数就够（漏杀方向仍是安全的）。
+        args = _args_of(cmd)
+        low_args = args.lower()
+        if any(p.lower() in low_args for p in PROTECT):
             protected.append((pid, cmd))
-        elif any(m.lower() in low for m in MINE):
+        elif any(m.lower() in cmd.lower() for m in MINE):
             mine.append((pid, cmd))
         else:
             unknown.append((pid, cmd))

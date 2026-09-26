@@ -115,7 +115,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // 让她挖 8 个圆石（会往下挖出竖井）
   const mark = finished.length;
   await call('skill.run', { skill: 'mine_stone', params: { want: 8 } }, 60000);
-  for (let i = 0; i < 600 && finished.length === mark; i += 1) await sleep(500);
+  // 600 → 960（300 → 480 秒）：和引擎 skillTimeoutMs 对齐 ——
+  // 实测连续 5 次失败全是时钟（k29「技能执行超时」时她差 4 格到顶），
+  // 预算要覆盖「挖矿 ~100 秒 + 极限竖井 11 格 × 15~20 秒」。
+  // **位置断言没动**：她仍然必须真的爬回平台才算过。
+  for (let i = 0; i < 960 && finished.length === mark; i += 1) await sleep(500);
   const f = finished[mark];
   const st1 = await call('state.get', { detail: 'brief' });
   const y = st1.position.y;

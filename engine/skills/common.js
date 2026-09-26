@@ -918,6 +918,9 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
   //
   // 用来判"确实上不去了"，而不是靠 `isUnderground` 猜 —— 见下面的说明。
   let stalledRounds = 0;
+  // **「一轮四策略全灭」的连续计数**（配合下面的改判：全灭 ≠ 立即判死）
+  let allFailRounds = 0;
+  let prevClimbed = 0;
   // **内联「向上挖阶梯」试过一次走不到就不再试** —— 实测（h15/j20）：
   // 这个策略在 1×1 竖井里四个方向**全部** `走不到`（pathfinder 磨到超时），
   // 每轮白烧 7~20 秒，而技能总预算只有 300 秒（挖矿还要吃 ~100 秒）——
@@ -979,6 +982,12 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         log.info(`爬升停滞（连续 3 轮都在 y=${nowY}），停下`);
         return { ok: false, steps: climbed, reason: `连着 3 轮都没能再往上（卡在 y=${nowY}）` };
       }
+    }
+
+    // 策略成功过（climbed 涨了）→ 把「全灭轮」计数清零
+    if (climbed !== prevClimbed) {
+      allFailRounds = 0;
+      prevClimbed = climbed;
     }
 
     const p = bot.entity.position;
@@ -1088,14 +1097,25 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         log.debug('竖井里没方块可垫，改成往侧面开一格，之后再挖阶梯');
         continue;
       }
-      // 两条路都不行：**如实停下**，别假装在爬
-      return {
-        ok: false,
-        steps: climbed,
-        reason:
-          '在竖井里往上爬失败：既没有方块可以垫脚（垫脚上升），' +
-          '侧面的方块也挖不动（开侧洞）。可以让她先 mc_collect 拿点方块，或者直接放弃这个矿洞',
-      };
+      // **一轮四策略全灭 ≠ 立即判死**（m32 现场铁证）：
+      // 她试了 4 格后**碰上恰好一轮** pillar 没跳起来 + widen 没挖动，
+      // 旧代码当场 return 放弃 —— 而她背包里有 cobblestone×49，
+      // digStepUp/manual 下一轮很可能又行了（h15/k27/28 的连续成功就是证明）。
+      // 还有：旧 reason 那句「既没有方块可以垫脚」是**写死的猜测** ——
+      // pillar 可能因为任何原因失败（没跳起来/放置被拒），不一定是没方块。
+      //
+      // 改：连续 3 轮全灭才如实停（和停滞计数同款语义；maxSteps 40 仍兜底）。
+      allFailRounds += 1;
+      if (allFailRounds >= 3) {
+        return {
+          ok: false,
+          steps: climbed,
+          reason:
+            `在竖井里连着 ${allFailRounds} 轮（挖台阶/螺旋/垫脚/开侧洞）四条路都走不通。` +
+            '可以让她先 mc_collect 拿点方块，或者直接放弃这个矿洞',
+        };
+      }
+      log.info(`爬升：第 ${i + 1} 轮四条路都不通，下一轮再试（连续 ${allFailRounds} 轮）`);
     }
   }
 
