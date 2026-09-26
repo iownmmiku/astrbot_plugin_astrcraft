@@ -142,9 +142,25 @@ async function runSkill(skill, params, sec = 120) {
   const mark = finished.length;
   const r = await call('skill.run', { skill, params }, 60000).catch((e) => ({ err: e.message }));
   if (r.err) return { status: 'start-failed', error: r.err };
-  for (let i = 0; i < sec * 2 && finished.length === mark; i += 1) await sleep(500);
-  const f = finished[mark];
-  return f ? { status: f.status, result: f.result || {}, error: f.error } : { status: 'no-finish' };
+  // **按 task_id 取结果，不按数组位置** —— 踩过（n35 现场）：
+  // 原来等 `finished.length` 变了就取 `finished[mark]`，而自主任务
+  // （自救/反射）的 finished 通知会**插队** —— [3] 的 pave 拿到了别的任务的
+  // 通知（status=done、result 空）→ 「说清原因」断言红；
+  // 这也是更早 `r.result.note` TypeError 的同一个根。
+  // 载荷里一直有 task_id（bot.js `_onTaskFinished` payload），位置匹配纯属赌运气。
+  const taskId = r.task_id;
+  const deadline = Date.now() + sec * 1000;
+  while (Date.now() < deadline) {
+    const f =
+      taskId != null
+        ? finished.find((x) => x.task_id === taskId)
+        : taskId === undefined && finished.length > mark
+          ? finished[mark]
+          : null; // 老路径兜底（skill.run 没回 task_id 时才用位置）
+    if (f) return { status: f.status, result: f.result || {}, error: f.error };
+    await sleep(500);
+  }
+  return { status: 'no-finish' };
 }
 
 (async () => {
