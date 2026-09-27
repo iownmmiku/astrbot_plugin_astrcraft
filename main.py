@@ -47,7 +47,10 @@ from .llm_tools_skills import McSkillTools
 from .llm_tools_life import McLifeTools
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
-PLUGIN_VERSION = "1.0.0"
+# 1.0.0 → 1.1.0：这一批的可见标记（UI 里一看就知道更新成功了）——
+# 攀爬六根因+时钟/forceload/task_id、感知往返 4→3、真实感两维审计、
+# 看门狗预算按实测放宽；配置默认 skill_timeout 480 / life_decide_interval 10。
+PLUGIN_VERSION = "1.1.0"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
