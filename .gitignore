@@ -27,3 +27,6 @@ desktop.ini
 # 测试与调试的临时产物
 *.tmp
 _probe.txt
+
+# 运行期由 datadir.py 自建的指路文件（内含本机路径，不该进仓库）
+data_location.json
