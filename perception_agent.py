@@ -128,7 +128,14 @@ class _PlainResult:
 class PerceptionAgent:
     """只读感知循环：让模型先查、再决定。"""
 
-    def __init__(self, plugin, *, max_steps: int = 3):
+    def __init__(self, plugin, *, max_steps: int = 2):
+        # 3 → 2（「更短思考」目标；基线见 commit a173c349）：
+        # 循环**每轮 = 一次模型往返（10~30 秒）**，尾部还有 1 次强制结语 ——
+        # 原来最坏 3+1=4 次 ≈ 站着想 1~2 分钟。2 轮 =「至多查 1 次 + 直接回答」
+        # 正好够（状态简报本来就内联在 user prompt 里，见 life.PERCEPTION_PROMPT_EXTRA）；
+        # 模型执意多查时第 2 轮仍不作答 → 走尾部强制结语，**上限 3 次、不空转**。
+        # 没有测试锁 3（已 grep 确认）；action 侧 MAX_STEPS==6 被 test_action_agent
+        # 锁死，**不碰**。test_perception_rounds.py 守住这个上限。
         self.plugin = plugin
         self.max_steps = max_steps
 
