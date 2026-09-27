@@ -112,11 +112,15 @@ SERVER_PORT = int(os.environ.get("MC_PORT", "25566"))
 RCON_PORT = int(os.environ.get("MC_RCON_PORT", "25576"))
 
 # 每个脚本的超时（秒）。默认给宽一点，慢的单独调。
+# **预算必须 > 实测 p95 + 余量**：被看门狗截杀 = 状态只是「⏰ + KNOWN_FLAKY 降级」，
+# 套件里**根本没验上**（_full_v4 实况：pit 撞 420 秒）。
 DEFAULT_TIMEOUT = 300
 TIMEOUTS = {
     "test_pathfinding.js": 420,
-    "test_mine_return.js": 420,
-    "test_pit_escape.js": 420,
+    # mine 实测 205~354 秒（420 只剩 66 秒余量）→ 600
+    "test_mine_return.js": 600,
+    # pit 实测 6~10 分钟（300 秒耐心 + 逐场景 setup）→ 720
+    "test_pit_escape.js": 720,
     "test_survival_chain.js": 900,  # 盖房那步最长 420 秒
     "test_blueprint.js": 420,
     "test_integration.py": 420,
