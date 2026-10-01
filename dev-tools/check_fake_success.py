@@ -102,6 +102,8 @@ EXEMPT: dict[tuple[str, str, str, str], str] = {
         "makePlanks：上面 gained < want 的分支已先 return —— true 只在 gained >= want 到达（上上轮 makePlanks 修复的判据）",
     ("B", "wood.js", "新增木棍", ""):
         "makeSticks：上一块是本轮加的 if (finalGained <= 0) return false —— 和 catch 分支同一标准 gained>0",
+    ("B", "wood.js", "已拥有：${requestedKinds", ""):
+        "requestedKinds 非空，wantKinds 按 hasTool 的真实库存过滤；仅全部工具已存在才返回，engine_control 验证重复调用不合成也不消耗材料",
 }
 
 

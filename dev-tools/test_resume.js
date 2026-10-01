@@ -153,8 +153,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await tick();
     ok('长任务跑起来了', lowRuns === 1);
     const high1 = q.submit({
-      name: '溺水换气',
-      priority: PRIORITY.CRITICAL,
+      name: '普通生存反射',
+      priority: PRIORITY.SURVIVAL,
       preemptible: true,
       run: async () => {
         await sleep(50);
@@ -164,7 +164,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ok(
       '① 最小占用时间内**不许抢**（任务没被掐死在起跑线上）',
       q.current && q.current.name === '刚开跑的长任务',
-      `当前=${q.current ? q.current.name : '无'}（应该是长任务，不是溺水）`,
+      `当前=${q.current ? q.current.name : '无'}（应该是长任务，不是普通生存反射）`,
     );
     ok('被拦下的高优先级任务**排队等**，不是被丢掉', q.pendingCount >= 1, `排队 ${q.pendingCount} 个`);
     await q.cancelAll({ reason: '测试结束' });
@@ -191,13 +191,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await tick();
     // 第一次抢占应该成功（冷却表里还没有它）
     //
-    // **必须用 CRITICAL 级来测**：普通反射级（REFLEX）会被另一条老规则拦下
-    // （"普通反射不得打断用户/技能任务"），那样测出来的是那条规则、
-    // 不是冷却。我第一版就是用 REFLEX 测的，结果两次 preempted 都是 0，
-    // 看起来"冷却生效了"，其实第一次就根本没抢。
-    q.submit({
-      name: '溺水换气',
-      priority: PRIORITY.CRITICAL,
+    // 使用 SURVIVAL 级来测：REFLEX 会被“普通反射不得打断用户/技能任务”拦下，
+    // CRITICAL 则必须绕过防抖救命。这里检查的是普通生存反射的冷却。
+    const firstReflex = q.submit({
+      name: '普通生存反射',
+      priority: PRIORITY.SURVIVAL,
       preemptible: true,
       run: async () => {
         await sleep(200);
@@ -206,10 +204,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(80);
     const afterFirst = q.stats.preempted;
     ok('第一次抢占成功（冷却表里还没有它）', afterFirst === 1, `preempted=${afterFirst}`);
+    await firstReflex.promise;
+    await tick();
+    ok('冷却测试前长任务重新取得身体', q.current && q.current.name === '长任务2');
     // 立刻再来一次同名的（冷却应该拦下）
     q.submit({
-      name: '溺水换气',
-      priority: PRIORITY.CRITICAL,
+      name: '普通生存反射',
+      priority: PRIORITY.SURVIVAL,
       preemptible: true,
       run: async () => {
         await sleep(200);
@@ -221,6 +222,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       q.stats.preempted === afterFirst,
       `第一次后 preempted=${afterFirst}，第二次后=${q.stats.preempted}`,
     );
+    ok('冷却中的反射只排队一次', q.pendingCount === 1);
     await q.cancelAll({ reason: '测试结束' });
   }
   {
@@ -245,8 +247,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await tick();
     await tick();
     q.submit({
-      name: '溺水换气',
-      priority: PRIORITY.CRITICAL,
+      name: '普通生存反射',
+      priority: PRIORITY.SURVIVAL,
       preemptible: true,
       run: async () => {
         await sleep(50);
@@ -260,6 +262,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     );
     ok('标记了 reportThrashed（供上层如实报告"我被反复打断"）', low.reportThrashed === true);
     await q.cancelAll({ reason: '测试结束' });
+  }
+
+  console.log('\n=== CRITICAL 绕过普通防抖救命 ===');
+  {
+    const q = new TaskQueue();
+    q.minOccupancyMs = 1500;
+    q.preemptCooldownMs = 5000;
+    q.maxPreemptsPerTask = 2;
+    q._lastPreemptByName.set('溺水换气', Date.now());
+    const low = q.submit({ name: '正在挖矿', priority: PRIORITY.SKILL, run: async ({ signal }) => {
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+      throw Object.assign(new Error('被抢占'), { name: 'CancelledError' });
+    } });
+    low.preemptCount = 2;
+    await tick();
+    let saved = false;
+    const critical = q.submit({ name: '溺水换气', priority: PRIORITY.CRITICAL, run: async () => { saved = true; } });
+    await critical.promise;
+    ok('致命反射绕过最小占用、冷却和次数上限', saved && q.stats.preempted === 1);
+    ok('救命抢占没有误报防抖降级', !low.reportThrashed);
+    q.cancelAll({ reason: '测试结束' });
   }
 
   console.log('\n=== 抢占次数会露到任务结果里（可见性）===');

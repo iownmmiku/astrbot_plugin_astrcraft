@@ -15,7 +15,7 @@ const { Config, isHostileName } = require('./config');
 const { StateTracker } = require('./state');
 const { Navigator } = require('./movement');
 const { Actions } = require('./actions');
-const { TaskQueue, PRIORITY } = require('./goals');
+const { TaskQueue, PRIORITY, executionContext } = require('./goals');
 const skills = require('./skills');
 const { delay, distance, fmtVec, describeFailure, CancelledError, vec3 } = require('./util');
 const { idleLookAround } = require('./humanize');
@@ -35,6 +35,7 @@ class McEngine {
     this.state = new StateTracker({ emit });
     this.queue = new TaskQueue({
       onTaskFinished: (task) => this._onTaskFinished(task),
+      onTaskAborted: () => this._stopBody(),
       onTaskStarted: (task) => {
         this.state.setCurrentTaskText(`${task.name}${task._detail() ? `（${task._detail()}）` : ''}`);
       },
@@ -68,6 +69,8 @@ class McEngine {
     this._lastRetreatAt = 0;
     this._lastDamager = null;
     this._manualDisconnect = false;
+    this._safetyStopped = false;
+    this._ambientController = new AbortController();
     this.started = false;
   }
 
@@ -186,6 +189,7 @@ class McEngine {
     this._chunksPromise = this._waitForLocalChunks(bot);
     this.nav = new Navigator(bot, this.config);
     this.actions = new Actions({ bot, config: this.config, navigator: this.nav });
+    this.actions.setStopped(this._safetyStopped);
     // 工作站记忆：记住用过的箱子/熔炉/工作台在哪，下次走回去用（而不是重做一个）。
     // 落盘路径由 MC_DATA_DIR 决定；没设就只在这个会话里有效。
     if (!this.stations) {
@@ -451,14 +455,20 @@ class McEngine {
       this.state.note('机器人死了，自动重生');
       this._emit('bot.death', { position: this._pos() });
       // 立刻清掉当前任务：死了还继续挖没有意义
-      this.queue.cancelAll({ reason: '死亡' });
+      this.cancelAll('死亡');
     });
 
     bot.on('respawn', () => {
+      // 原始 respawn 包先到，生命和实体还未恢复；等待后续 spawn 再放行决策。
+      log.info('正在重生，等待生命恢复');
+    });
+
+    // _wireBotEvents 在首次 spawn 内安装，后续 spawn 表示重生后已恢复生命。
+    bot.on('spawn', () => {
       log.info('已重生');
       this.state.note('已重生');
       this._emit('bot.respawn', { position: this._pos() });
-      if (this.actions) {
+      if (this.actions && !this._safetyStopped) {
         this.actions.autoEquipArmor().catch(() => {});
       }
     });
@@ -507,7 +517,7 @@ class McEngine {
     log.warn(`连接断开：${reason}${wasManual ? '（主动断开）' : ''}`);
     this._stopLoops();
     this.state.detach();
-    this.queue.cancelAll({ reason: '连接断开' });
+    this.cancelAll('连接断开');
     this._emit('bot.disconnect', { reason: String(reason), manual: wasManual });
     this.bot = null;
     this.nav = null;
@@ -710,13 +720,14 @@ class McEngine {
 
   /** 空闲时每隔几秒环顾一下（只在无任务、无窗口时调用，不会干扰任何事务） */
   _maybeIdleGlance() {
+    if (this._safetyStopped) return;
     if (!this.config.get('humanize', true)) return;
     if (this._glancing) return;
     const now = Date.now();
     if (now < this._nextGlanceAt) return;
     this._nextGlanceAt = now + 4000 + Math.random() * 5000;
     this._glancing = true;
-    idleLookAround(this.bot, {})
+    executionContext.run({ signal: this._ambientController.signal }, () => idleLookAround(this.bot, { signal: this._ambientController.signal }))
       .catch(() => {})
       .finally(() => {
         this._glancing = false;
@@ -727,9 +738,13 @@ class McEngine {
     if (this._reflexTimer) clearInterval(this._reflexTimer);
     if (this._stateTimer) clearInterval(this._stateTimer);
     if (this._keepAliveTimer) clearInterval(this._keepAliveTimer);
+    if (this._mlgTimer) clearInterval(this._mlgTimer);
+    if (this._lagTimer) clearInterval(this._lagTimer);
     this._reflexTimer = null;
     this._stateTimer = null;
     this._keepAliveTimer = null;
+    this._mlgTimer = null;
+    this._lagTimer = null;
   }
 
   /**
@@ -737,6 +752,7 @@ class McEngine {
    * 这一层决定了机器人"会不会自己找死"，是自主性的地板。
    */
   async _reflexTick() {
+    if (this._safetyStopped) return;
     const bot = this.bot;
     if (!bot || !bot.entity || !this.actions) return;
     if (this._currentReflexRunning) return;
@@ -770,6 +786,8 @@ class McEngine {
       // 触发额外的寻路和移动——用户看到的"走来走去"有很大一部分来自这里。
       // 现在：**只有在完全没有任务时**才做这两件事。
       const idle = !this.queue.current;
+      // Fatal hazards take precedence over stuck confirmation and its backoff.
+      if (this._submitImmediateSurvival(bot)) return;
 
       // MLG 不在这里做——它挂在 100ms 的专用循环上（见 _mlgTick）。
       // 原因：这个反射循环 1 秒才跑一次，而 18 格坠落只有 1.2 秒，
@@ -1050,57 +1068,13 @@ class McEngine {
         }
       }
 
-      // 1) 溺水 → 上浮（致命：必须立刻抢占）
-      if (bot.entity.isInWater && bot.entity.oxygenLevel !== undefined && bot.entity.oxygenLevel < 12) {
-        this._submitReflex(
-          '浮上水面换气',
-          async ({ signal }) => {
-            bot.setControlState('jump', true);
-            await delay(1500, { signal });
-            bot.setControlState('jump', false);
-            await delay(600, { signal });
-          },
-          'critical',
-        );
-        return;
-      }
-      // 2) 岩浆 → 立刻逃（致命）
-      if (bot.entity.isInLava) {        this._submitReflex(
-          '从岩浆里逃出来',
-          async ({ signal }) => {
-            bot.setControlState('jump', true);
-            bot.setControlState('forward', true);
-            await delay(1200, { signal });
-            bot.setControlState('jump', false);
-            bot.setControlState('forward', false);
-            this.state.note('刚从岩浆里爬出来，血量可能很低');
-          },
-          'critical',
-        );
-        return;
-      }
-      // 3) 着火 → 找水/撤离（致命）
-      if (bot.entity.isOnFire || (bot.entity.fireTicks && bot.entity.fireTicks > 0)) {
-        this._submitReflex(
-          '身上着火了，赶紧处理',
-          async ({ signal }) => {
-            const water = this.state.findNearestBlock(['water'], { radius: 16 });
-            if (water) {
-              this.state.note('着火了，冲向附近的水');
-              await this.nav.goTo({ x: water.x, y: water.y, z: water.z, range: 1, signal, timeoutMs: 12000 });
-            } else {
-              this.state.note('着火了，向反方向脱离火源');
-              bot.setControlState('forward', true);
-              await delay(2500, { signal });
-              bot.setControlState('forward', false);
-            }
-          },
-          'critical',
-        );
-        return;
-      }
-      // 3) 饿 → 吃
-      if (this.config.get('autoEat') && bot.food < (Number(this.config.get('eatFoodLevel')) || 14)) {
+      // 有近身威胁时先后撤，不能站着等吃完或等长任务结束。
+      const lowHealth = Number(this.config.get('retreatHealth')) || 8;
+      const retreatThreats = bot.health <= lowHealth
+        ? this.state.nearbyEntities({ radius: 12, limit: 4, hostileOnly: true }) : [];
+      // 3) 饿或受伤需要回血 → 吃；有威胁且残血时留给下面的紧急后撤。
+      if (!retreatThreats.length && this.config.get('autoEat') &&
+          (bot.food < (Number(this.config.get('eatFoodLevel')) || 14) || (bot.health <= 12 && bot.food < 18))) {
         // **饿了也要上报**（W4）：反射层会自己找东西吃，但决策层不知道"她饿了"——
         // 于是她可能一边饿着一边安排长任务（挖矿/盖房），做到一半没力气。
         // 事件带冷却：饥饿是持续状态，不加冷却会每 200ms 刷一条把队列刷满。
@@ -1118,11 +1092,10 @@ class McEngine {
         }
       }
       // 4) 血量过低 → 后撤（不硬拼）
-      const lowHealth = Number(this.config.get('retreatHealth')) || 8;
       if (bot.health <= lowHealth) {
         // 只在"确实有威胁"时撤。早期版本无条件撤，导致残血被困时每 5 秒
         // 反复提交后撤任务、反复失败刷屏（日志里能看到连续 6 条一样的失败）。
-        const threats = this.state.nearbyEntities({ radius: 12, limit: 4, hostileOnly: true });
+        const threats = retreatThreats;
         const canRetreatNow = Date.now() - this._lastRetreatAt > 20000;
         if (!threats.length || !canRetreatNow) {
           // 没威胁，或刚撤过：不动。让上层（吃/回血）来处理
@@ -1144,7 +1117,7 @@ class McEngine {
               log.info(`后撤失败（可能被围住）：${err.message}`);
               this.state.note('想后撤但走不动，可能被围住了');
             }
-          });
+          }, 'critical');
           return;
         }
       }
@@ -1257,6 +1230,7 @@ class McEngine {
    * 只做最便宜的判断（在不在下坠），确认有危险才去查方块、才动手。
    */
   async _mlgTick() {
+    if (this._safetyStopped) return;
     const bot = this.bot;
     // 诊断：确认这个 100ms 的检查真的在跑（排查"MLG 完全不触发"时第一件事）
     this._mlgTicks = (this._mlgTicks || 0) + 1;
@@ -1312,7 +1286,8 @@ class McEngine {
     try {
       // 这里**直接做**，不排队：落地水是"晚 100 毫秒就没用"的事，
       // 排进任务队列再等抢占，人已经摔在地上了。
-      await this._mlgSave(danger);
+      await executionContext.run({ signal: this._ambientController.signal },
+        () => this._mlgSave(danger, { signal: this._ambientController.signal }));
     } finally {
       this._mlgRunning = false;
     }
@@ -1375,7 +1350,7 @@ class McEngine {
     if (this.actions.countItem('water_bucket') > 0) {
       try {
         this.state.note(`要从 ${drop} 格高摔下来，往脚下倒水`);
-        await this.actions.holdItem({ item: 'water_bucket' });
+        await this.actions.holdItem({ item: 'water_bucket', signal });
         this._mlgNote = 'holdItem ok';
         // 看向正下方那一格（水会倒在那儿）
         const below = bot.blockAt(vec3(bx, by - 1, bz));
@@ -1426,19 +1401,13 @@ class McEngine {
         for (let i = 0; i < 6 && !placed; i += 1) {
           const pp = bot.entity.position;
           try {
-            await Promise.race([
-              this.actions.place({
+            await this.actions._raceAbort(() => this.actions.place({
                 x: Math.floor(pp.x),
                 y: Math.floor(pp.y) - 1,
                 z: Math.floor(pp.z),
                 item: block,
-                signal,
                 reach: false,
-              }),
-              delay(400, { signal }).then(() => {
-                throw new Error('垫方块超时（坠落中不能等）');
-              }),
-            ]);
+              }), signal, 400, '垫方块超时（坠落中不能等）');
             placed = true;
           } catch (err) {
             this._mlgNote = `垫方块第 ${i + 1} 次没成：${err.message}`;
@@ -1614,6 +1583,77 @@ class McEngine {
     return null;
   }
 
+  _reflexNeeded(name) {
+    const bot = this.bot;
+    if (!bot || !bot.entity || !this.actions) return false;
+    if (name.includes('水面')) return !!bot.entity.isInWater && Number.isFinite(bot.oxygenLevel) && bot.oxygenLevel < 12;
+    if (name.includes('岩浆')) return !!bot.entity.isInLava;
+    if (name.includes('着火')) return !!(bot.entity.isOnFire || bot.entity.fireTicks > 0);
+    if (name.startsWith('吃 ')) return !!this.config.get('autoEat') &&
+      (bot.food < (Number(this.config.get('eatFoodLevel')) || 14) || (bot.health <= 12 && bot.food < 18)) &&
+      !!this.actions._pickBestFood();
+    if (name.includes('血量过低')) return bot.health <= (Number(this.config.get('retreatHealth')) || 8) &&
+      this.state.nearbyEntities({ radius: 12, limit: 1, hostileOnly: true }).length > 0;
+    if (name.startsWith('反击')) return !!this.config.get('autoDefend') &&
+      bot.health > (Number(this.config.get('retreatHealth')) || 8) + 4 &&
+      this.state.nearbyEntities({ radius: 6, limit: 1, hostileOnly: true }).length > 0;
+    if (name.includes('脱困') || name.includes('挖开')) return !!this._blockingSelf();
+    if (name.includes('掉落物')) return this.config.get('autoCollectDrops') !== false &&
+      this.state.nearbyEntities({ radius: 6, limit: 5 }).some((e) => e.name === 'item' || e.type === 'object');
+    if (name.includes('火把')) {
+      const light = this.state.snapshot('brief').light;
+      return this.config.get('autoTorch') !== false && typeof light === 'number' && light <= 4;
+    }
+    return true;
+  }
+
+  _submitImmediateSurvival(bot) {
+    if (bot.entity.isInWater && Number.isFinite(bot.oxygenLevel) && bot.oxygenLevel < 12) {
+      this._submitReflex('浮上水面换气', async ({ signal }) => {
+        bot.setControlState('jump', true);
+        try {
+          const deadline = Date.now() + 5000;
+          while (bot.entity.isInWater && bot.oxygenLevel < 18 && Date.now() < deadline) {
+            await delay(100, { signal });
+          }
+        } finally {
+          if (!signal.aborted) bot.setControlState('jump', false);
+        }
+        return { ok: true };
+      }, 'critical');
+      return true;
+    }
+    if (bot.entity.isInLava) {
+      this._submitReflex('从岩浆里逃出来', async ({ signal }) => {
+        bot.setControlState('jump', true);
+        bot.setControlState('forward', true);
+        try { await delay(1200, { signal }); }
+        finally {
+          if (!signal.aborted) {
+            bot.setControlState('jump', false);
+            bot.setControlState('forward', false);
+          }
+        }
+        return { ok: true };
+      }, 'critical');
+      return true;
+    }
+    if (bot.entity.isOnFire || bot.entity.fireTicks > 0) {
+      this._submitReflex('身上着火了，赶紧处理', async ({ signal }) => {
+        const water = this.state.findNearestBlock(['water'], { radius: 16 });
+        if (water) await this.nav.goTo({ ...water, range: 1, signal, timeoutMs: 12000 });
+        else {
+          bot.setControlState('forward', true);
+          try { await delay(2500, { signal }); }
+          finally { if (!signal.aborted) bot.setControlState('forward', false); }
+        }
+        return { ok: true };
+      }, 'critical');
+      return true;
+    }
+    return false;
+  }
+
   /**
    * 提交一个反射层任务。
    * @param {'critical'|'normal'} level critical = 溺水/岩浆/着火，必须立即抢占；
@@ -1635,13 +1675,19 @@ class McEngine {
    * @param {number} bid 出价，越大越优先
    */
   _bid({ name, run, bid, kind = 'reflex', hooks = {}, preemptible = true }) {
-    // 同名的任务已经在跑就不重复提交（原来就有，保留）
-    const cur = this.queue.current;
-    if (cur && cur.name === name) return null;
+    if (this._safetyStopped) return null;
+    const key = name.startsWith('吃 ') ? '进食' : name;
+    if (this.queue.hasTask((t) => t.kind === kind &&
+        (t.meta.reflexKey || t.name) === key && ['pending', 'running'].includes(t.status))) return null;
     const priority = this._priorityForBid(bid);
     const task = this.queue.submit({
       name,
-      run,
+      run: async (ctx) => {
+        if (this._safetyStopped || !this._reflexNeeded(name) || (hooks.shouldRun && !hooks.shouldRun())) {
+          return { ok: true, skipped: true, note: '状态已变化，无需执行此反射' };
+        }
+        return run(ctx);
+      },
       priority,
       // **preemptible 的语义是"允许被出价更高的抢"**。
       //
@@ -1653,7 +1699,7 @@ class McEngine {
       // 而它根本不经过队列（走 100ms 专用循环）。
       preemptible,
       kind,
-      meta: { bid },
+      meta: { bid, reflexKey: key },
     });
     this._bidLog = this._bidLog || [];
     this._bidLog.push({ at: Date.now(), name, bid, priority, preempted: null });
@@ -1662,7 +1708,7 @@ class McEngine {
     if (task && (hooks.onDone || hooks.onFailed)) {
       try {
         task.promise
-          .then(() => hooks.onDone && hooks.onDone())
+          .then((result) => !(result && result.skipped) && hooks.onDone && hooks.onDone())
           .catch((err) => {
             // **被取消 ≠ 失败**（P4）。
             //
@@ -2054,6 +2100,7 @@ class McEngine {
     return {
       connected: !!(bot && bot.entity),
       ready: !!(bot && bot.entity),
+      emergency_stopped: this._safetyStopped,
       username: bot ? bot.username : null,
       version: bot ? bot.version : null,
       config: {
@@ -2108,6 +2155,7 @@ class McEngine {
 
   /** 把技能提交成任务，立刻返回 task_id */
   submitSkill({ skill, params = {}, name = null, priority = PRIORITY.SKILL }) {
+    this.assertCanAct();
     this.requireBot();
     const registry = require('./skills');
     const def = registry.get(skill);
@@ -2177,6 +2225,7 @@ class McEngine {
 
   /** 直接提交一个动作任务（供 RPC 的 *_async 方法使用） */
   submitAction({ name, run, priority = PRIORITY.USER, meta = {} }) {
+    this.assertCanAct();
     return this.queue.submit({ name, run, priority, kind: 'action', meta, preemptible: true });
   }
 
@@ -2186,22 +2235,49 @@ class McEngine {
 
   cancelAll(reason = '急停') {
     const ids = this.queue.cancelAll({ reason });
-    // 顺带停掉脚下的移动控制，避免"取消了但身体还在走"
-    try {
-      if (this.bot) {
-        this.bot.clearControlStates();
-        if (this.nav) this.nav.stop();
-      }
-    } catch {
-      /* ignore */
-    }
+    this._ambientController.abort();
+    this._ambientController = new AbortController();
+    this._stopBody();
     return { ok: true, cancelled: ids };
+  }
+
+  _stopBody() {
+    executionContext.exit(() => {
+      if (this.actions) this.actions.stopCurrent();
+      else if (this.bot) {
+        try { this.bot.clearControlStates(); } catch { /* disconnected */ }
+        try { if (this.bot.stopDigging) this.bot.stopDigging(); } catch { /* disconnected */ }
+        try { if (this.bot.deactivateItem) this.bot.deactivateItem(); } catch { /* disconnected */ }
+        try { if (this.nav) this.nav.stop(); } catch { /* disconnected */ }
+      }
+    });
+  }
+
+  assertCanAct() {
+    if (this._safetyStopped) throw new GameError('引擎已急停，请先执行恢复操作（safety.resume）');
+    const ctx = executionContext.getStore();
+    if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('动作已取消');
+  }
+
+  safetyStop() {
+    this._safetyStopped = true;
+    this.queue.setPaused(true);
+    const result = this.cancelAll('急停');
+    if (this.actions) this.actions.setStopped(true);
+    return { ...result, stopped: true, note: '已急停：动作与自主反射均已暂停，恢复后才能行动' };
+  }
+
+  safetyResume() {
+    this._safetyStopped = false;
+    if (this.actions) this.actions.setStopped(false);
+    this.queue.setPaused(false);
+    return { ok: true, stopped: false, note: '已恢复动作与生存反射' };
   }
 
   shutdown() {
     log.info('引擎正在关闭');
     this._stopLoops();
-    this.queue.cancelAll({ reason: '引擎关闭' });
+    this.cancelAll('引擎关闭');
     if (this.bot) {
       try {
         this.bot.quit('引擎关闭');

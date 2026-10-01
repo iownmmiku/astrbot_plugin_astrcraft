@@ -40,6 +40,21 @@ from astrbot.core.agent.message import (
     ToolCallMessageSegment,
 )
 from astrbot.core.agent.tool import ToolSet
+from .perception_agent import PERCEPTION_TOOLS
+
+# 查询与笔记不占用身体；其余工具提交动作前必须重新检查控制状态。
+NON_BODY_TOOLS = set(PERCEPTION_TOOLS) | {
+    "mc_whats_she_doing", "mc_her_persona", "mc_persona_list", "mc_her_wish",
+    "mc_knowledge_search", "mc_knowledge_add", "mc_knowledge_note",
+    "mc_inspect_block", "mc_scan_entities", "mc_check_danger", "mc_world_info",
+    "mc_task_status", "mc_say",
+}
+
+
+def tool_changes_body(name: str, args: dict) -> bool:
+    return name not in NON_BODY_TOOLS and not (
+        name == "mc_chest" and args.get("action") in ("list", "inspect")
+    )
 
 # 给 LLM 的额外行为约束：游戏内对话要能"动手"
 GAME_ACTION_PROMPT = """玩家在游戏里跟你说话时：
@@ -141,6 +156,8 @@ class GameChatAgent:
 
     def __init__(self, plugin):
         self.plugin = plugin
+        self.last_request_had_action = False
+        self._accepted_player_plan = False
 
     # ------------------------------------------------------------ 工具集
 
@@ -172,6 +189,13 @@ class GameChatAgent:
 
     async def _execute_tool(self, name: str, args: dict, event: GameEventShim) -> str:
         """执行一个工具调用，返回给模型的结果文本。"""
+        if not name.startswith("mc_") or name in GAME_ONLY_EXCLUDE:
+            return f"error: 当前游戏对话不允许调用工具 {name}"
+        physical = tool_changes_body(name, args or {})
+        if physical and getattr(self.plugin, "_emergency_stopped", False):
+            return "error: 机器人已急停，请先由主人恢复行动"
+        if physical and not getattr(self.plugin, "connected", True):
+            return "error: 机器人未进服"
         manager = self._manager()
         if manager is None:
             return f"error: 工具管理器不可用"
@@ -189,6 +213,19 @@ class GameChatAgent:
         # 所以这里补上绑定：把 self 换成插件实例。
         handler = _bind_if_needed(handler, self.plugin)
 
+        life = getattr(self.plugin, "life", None)
+        if physical and name != "mc_plan_do" and callable(getattr(life, "clear_plan", None)):
+            life.clear_plan("玩家重新安排了动作")
+        newly_paused = bool(physical and name != "mc_plan_do" and life and not life.paused)
+        if newly_paused:
+            self._on_player_requested_action()
+
+        physical_action = bool(physical and name != "mc_plan_do")
+        if physical_action:
+            self.last_request_had_action = True
+            self.plugin._player_action_inflight = getattr(self.plugin, "_player_action_inflight", 0) + 1
+        pending_before = getattr(life, "_pending_plan", None)
+
         try:
             result = handler(event, **(args or {}))
 
@@ -202,13 +239,35 @@ class GameChatAgent:
                 last = result
 
             if last is not None and hasattr(last, "get_plain_text"):
-                return str(last.get_plain_text())
-            if last is None:
-                return "ok（工具执行完成，无文本结果）"
-            return str(last)
+                text = str(last.get_plain_text())
+            elif last is None:
+                text = "ok（工具执行完成，无文本结果）"
+            else:
+                text = str(last)
+            pending_after = getattr(life, "_pending_plan", None)
+            if name == "mc_plan_do" and pending_after and pending_after is not pending_before:
+                # 玩家更新安排时立即替换旧自主计划；只有工具确实接受后才清旧计划。
+                life.clear_plan("玩家给出了新的连续计划")
+                life._pending_plan = pending_after
+                self._accepted_player_plan = True
+                self.last_request_had_action = True
+                life.wake("玩家交代了连续计划")
+            return text
         except Exception as exc:  # noqa: BLE001
             logger.warning("游戏内执行工具 %s 失败：%s", name, exc)
             return f"error: {type(exc).__name__}: {exc}"
+        finally:
+            if physical_action:
+                self.plugin._player_action_inflight = max(0, self.plugin._player_action_inflight - 1)
+                goals = getattr(self.plugin, "goals", None)
+                owns_pause = newly_paused or getattr(life, "_pause_reason", "") == "玩家动作"
+                busy = getattr(life, "_engine_busy", None)
+                if (owns_pause and callable(busy)
+                        and not getattr(self.plugin, "_emergency_stopped", False)
+                        and not (goals and goals.active) and not await busy()):
+                    # task.finished 可能先于 RPC 应答到达，按真实队列归还自主权。
+                    life.resume()
+                    life.wake("玩家动作已完成或未产生任务")
 
     def _manager(self):
         context = getattr(self.plugin, "context", None)
@@ -223,6 +282,8 @@ class GameChatAgent:
         @return 要在游戏里回的话；None 表示"没有可说的"（比如 LLM 不可用）
         """
         plugin = self.plugin
+        self.last_request_had_action = False
+        self._accepted_player_plan = False
 
         provider = await plugin.context.get_using_provider_async()
         if provider is None:
@@ -266,6 +327,8 @@ class GameChatAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("游戏内 LLM 调用失败：%s", exc)
+                if self.last_request_had_action:
+                    return "动作已经交代下去了，后续回复暂时没跟上。"
                 return None
 
             # 记一次用量（W6）——和 action_agent 记进同一个台账，
@@ -292,9 +355,7 @@ class GameChatAgent:
                         len(executed_ok),
                         text[:40],
                     )
-                    if executed_ok:
-                        self._on_player_requested_action()
-                    else:
+                    if not executed_ok:
                         # 工具全部失败（比如引擎没起来）→ 不要暂停她的自主行动，
                         # 否则没有任务产生、也就永远等不到恢复事件，她会彻底停滞。
                         logger.warning(
@@ -341,6 +402,9 @@ class GameChatAgent:
                         content=result_text,
                     )
                 )
+                life = getattr(plugin, "life", None)
+                if name == "mc_plan_do" and self._accepted_player_plan:
+                    return "安排好了，这就按顺序做。"
 
         logger.warning("游戏内对话的工具循环超过 %s 步，中止", self.MAX_STEPS)
         return "（脑子里转了好几个弯，先这样吧）"
@@ -358,5 +422,8 @@ class GameChatAgent:
         """
         life = getattr(self.plugin, "life", None)
         if life and not life.paused:
-            life.pause()
+            if hasattr(life, "_pause_reason"):
+                life.pause(reason="玩家动作")
+            else:
+                life.pause()
             logger.debug("玩家指派了动作，过日子循环已暂停（任务结束后恢复）")

@@ -13,6 +13,7 @@ python dev-tools/run_all.py -v         # 看完整输出
 
 它**自己知道**哪些脚本需要服务器（扫内容判定，不写死清单 —— 所以新增脚本不用改它），
 并且会**明确打出"跳过了什么"**和**"哪些是已知偶发红"**。
+失败、超时和启动错误都会使检查返回非零；偶发记录只提供背景，不把失败当成通过。
 
 下面那些分类说明是给"想知道细节"的人看的；**日常只要跑上面这一条**。
 
@@ -67,6 +68,42 @@ node dev-tools/test_blueprint.js        # 蓝图图纸校验：23 项
 node dev-tools/test_stations.js         # 工作站记忆：10 项
 node dev-tools/regress_real.js 25565    # 在真实服务器上跑（只读不写）
 ```
+
+### 自主行动与控制恢复回归
+
+```bash
+python dev-tools/test_life_recovery.py    # 模型重试、计划衔接、旧会话回复失效
+python dev-tools/test_plugin_control.py   # 急停、退服、目标所有权、状态缓存和死亡
+python dev-tools/test_tool_contracts.py    # AstrBot 工具注册与 JSON 多步计划参数
+node dev-tools/test_engine_control.js     # 真队列与动作层：取消、反射、合成和移动
+node dev-tools/test_window_cancel.js      # 实际 mineflayer 窗口取消后不污染新窗口
+node dev-tools/test_building_completion.js # 完整结构验收、缺料、取材和换建材
+```
+
+真实游戏测试使用项目 `.testserver` 的 Paper 1.20.1，Minecraft 端口 `25566`、RCON `25576`。
+以下脚本会准备测试地形并操作测试机器人，请在专用测试服运行：
+
+```bash
+python dev-tools/test_autonomy_live.py          # 固定 JSON 决策，真实自主执行链
+python dev-tools/test_autonomy_live.py --agent  # 实际 ActionAgent + mc_plan_do 工具计划
+python dev-tools/test_autonomy_live.py --agent --survival --supplies # 饱食度 0 自动补给后续做原计划；生鱼烹饪与存箱保留必需品
+node dev-tools/test_survival_chain.js           # 采矿→石制工具→庇护所，验收 82 格结构
+node dev-tools/test_survival_chain.js --step 3  # 独立建房，保留相同结构断言
+node dev-tools/test_pit_escape.js               # 浅坑/零装备/深井共 6 项真实验收
+node dev-tools/test_pit_escape.js --step 4      # 10 格深井爬升 + 独立无镐深井垫高
+node dev-tools/crafttest.js --port 25566 --rcon-port 25576 --rcon-dir .testserver
+```
+
+自主测试的模型回复固定，验证一次规划后的执行、实物产出、衔接与急停恢复；
+不代表实际模型已通过开放世界长期游玩测试。Python 脚本应使用安装 AstrBot 的解释器，
+必要时将 `ASTRBOT_APP` 与 `PYTHONPATH` 指向 AstrBot 的应用目录。
+
+脱困测试要求任务真实结束且实际站到井口；每个场景清空背包，独立准备地形。
+设置 `MC_ENGINE_LOG_LEVEL=info`、`MC_TEST_VERBOSE=1` 可以在长测试期间连续输出引擎日志。
+
+`test_integration.py` 默认验证插件加载、引擎通道和卸载；设置 `MC_TEST_CONNECT=1`、
+`MC_TEST_PORT=25566` 启用真实进服。再设置 `MC_TEST_DEATH=1` 可在项目测试服杀死测试机器人，
+验证重生解除死亡停牌、急停保持；插件数据使用临时目录隔离。
 
 > 这些脚本需要 `engine/node_modules`（在 `engine/` 里执行过 `npm install`）。
 > 没装依赖时凡是 `require('mineflayer')` 的脚本都会报 `Cannot find module`——

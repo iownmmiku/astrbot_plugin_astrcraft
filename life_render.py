@@ -54,6 +54,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
 import time
@@ -119,6 +120,9 @@ class PromptRenderMixin:
         entry = self.inbox.push("owner", text)
         if entry is not None:
             logger.info("主人的话入队：%s", text[:60])
+            wake = getattr(self, "_wake", None)
+            if wake is not None:
+                wake.set()
 
     def note_world_event(self, kind: str, text: str, *, urgent: bool = False) -> None:
         """世界事件入队（受伤/工具坏/箱子满/任务完成…）。由 main.py 在引擎事件时调用。"""
@@ -140,8 +144,24 @@ class PromptRenderMixin:
 
     def state_note(self, text: str) -> None:
         """往状态简报里写一句（给 LLM 和 /mc状态 看）。"""
+        self._last_state_note = text
+        callback = getattr(self, "_on_activity", None)
+        if callback is None:
+            return
         try:
-            self._on_activity(text)
+            if inspect.iscoroutinefunction(callback):
+                # 主插件回调接收 LifeDecision 且为异步；不可直接调用后丢掉协程。
+                decision = LifeDecision(activity=text, drive=None, reason="当前状态")
+
+                async def notify() -> None:
+                    try:
+                        await callback(decision)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.info("写状态简报失败：%s", exc)
+
+                asyncio.create_task(notify(), name="mc-life-state-note")
+            else:
+                callback(text)
         except Exception as exc:  # noqa: BLE001
             logger.info("写状态简报失败：%s", exc)
 
@@ -329,7 +349,9 @@ class PromptRenderMixin:
         rel = HOLD_RELEASE.get(h) or "（没写谁来解开——这是个 bug）"
         detail = ""
         if h is Hold.BLOCKED and self._blocked_reason:
-            detail = f"（{self._blocked_reason}）"
+            seconds = max(0, int(getattr(self, "_decision_retry_at", 0) - time.time()))
+            detail = f"（{self._blocked_reason}；{seconds} 秒后自动探测）"
+            rel = "模型调用成功后自动恢复，也可立即发起恢复探测"
         elif h is Hold.PAUSED_BY_OWNER and self._pause_reason:
             detail = f"（{self._pause_reason}）"
         return f"{why}{detail}；解开条件：{rel}"
@@ -602,6 +624,9 @@ class PromptRenderMixin:
 
     def describe(self) -> str:
         lines = []
+        state_note = getattr(self, "_last_state_note", "")
+        if state_note and self._idle_rounds:
+            lines.append(state_note)
         if self._paused:
             lines.append("（自主行动已暂停——你正在指派任务）")
         elif not self.running:

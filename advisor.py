@@ -46,7 +46,8 @@ FOODS = (
     "bread", "apple", "cooked_beef", "cooked_porkchop", "cooked_chicken",
     "cooked_mutton", "cooked_rabbit", "cooked_cod", "cooked_salmon",
     "baked_potato", "golden_apple", "carrot", "melon_slice", "sweet_berries",
-    "beef", "porkchop", "chicken", "mutton", "rabbit", "cod", "salmon", "potato",
+    "golden_carrot", "enchanted_golden_apple", "rabbit_stew", "mushroom_stew",
+    "beetroot_soup", "pumpkin_pie", "cookie", "glow_berries", "dried_kelp", "beetroot",
 )
 
 # **生食**：有生食才谈得上"做饭"；一块生食都没有时该去**打猎**。
@@ -57,7 +58,7 @@ FOODS = (
 # 从来不会想到去打一只牛。
 RAW_FOODS = (
     "beef", "porkchop", "chicken", "mutton", "rabbit", "cod", "salmon",
-    "tropical_fish", "potato", "kelp",
+    "potato", "kelp",
 )
 
 # 能猎到肉的动物（按"好打又肉多"排序）
@@ -71,7 +72,8 @@ BUILD_BLOCKS = (
     "sandstone", "oak_log", "birch_log", "spruce_log",
 )
 
-TOOL_TIERS = ("wooden", "stone", "iron", "golden", "diamond", "netherite")
+# 按采矿能力排序；金镐不能采铁矿，不能把它当成铁镐的升级。
+TOOL_TIERS = ("golden", "wooden", "stone", "iron", "diamond", "netherite")
 
 
 @dataclass
@@ -87,6 +89,8 @@ class Advice:
     warnings: list[str] = field(default_factory=list)
     # 该建议的"强硬程度"：hard=True 表示前置条件缺失，不该去做别的事
     hard: bool = False
+    # survival 可以在连续计划的步骤边界插入；progress 交给模型安排。
+    priority: str = "progress"
 
     def render(self) -> str:
         """渲染成给 LLM 看的一小段文字。"""
@@ -96,6 +100,8 @@ class Advice:
         if self.skill:
             ps = ", ".join(f"{k}={v}" for k, v in (self.params or {}).items())
             lines.append(f"- 建议下一步：{self.skill}({ps})（{self.why}）")
+        if self.priority == "survival":
+            lines.append("- 当前先处理生存需求，恢复后再继续原来的目标")
         for w in self.warnings[:3]:
             lines.append(f"- 注意：{w}")
         return "\n".join(lines)
@@ -133,7 +139,7 @@ def _stage_of(inv: dict, has_shelter: bool) -> tuple[str, str]:
         return "settled", "定居期（铁器 + 有住处）"
     if pick in ("stone", "iron", "diamond", "netherite"):
         return ("stone_age", "石器时代（有石镐）") if not has_shelter else ("stone_age", "石器时代（有石镐 + 住处）")
-    if pick == "wooden":
+    if pick in ("wooden", "golden"):
         return "wooden_age", "木器时代（只有木镐，该换石头了）"
     if wood >= 3:
         return "have_wood", "有木头但还没工具"
@@ -149,6 +155,7 @@ def advise(
     recent_failures: dict | None = None,
     is_night: bool = False,
     inventory_slots_used: int = 0,
+    nearby_entities: list | None = None,
 ) -> Advice:
     """核心入口：给出现状评估与下一步建议。
 
@@ -186,9 +193,16 @@ def advise(
     # 早期一律建议 cook_food，可手上连一块生肉都没有时做饭必然失败，
     # 于是她卡在"想做吃的 → 做不了"的循环里，从来不会去打猎。
     def _food_advice() -> tuple[str, dict, str]:
+        if inv.get("wheat", 0) >= 3:
+            return "cook_food", {"count": min(4, inv["wheat"] // 3)}, "已有小麦，补齐工作台后做面包，不必外出打猎"
         if raw_food > 0:
-            return "cook_food", {}, "有生食，先烤熟再吃"
-        return "hunt", {"mob": HUNTABLE[0], "count": 2}, "什么吃的都没有，去打两只动物弄点肉"
+            return "cook_food", {"count": min(4, raw_food)}, "已有生食，先利用现成食材"
+        animals = [e for e in (nearby_entities or []) if isinstance(e, dict)
+                   and e.get("name") in HUNTABLE and not e.get("hostile")]
+        if animals:
+            animal = min(animals, key=lambda e: float(e.get("distance", 999)))
+            return "hunt", {"mob": animal["name"], "count": 1}, "先猎取附近可见的动物，避免盲找牛"
+        return "cook_food", {"count": 2}, "没有食物，先查找可用食材与动物，再补充两份食物"
 
     # ---- 按阶段给建议
     if adv.stage == "bare":
@@ -201,8 +215,8 @@ def advise(
     elif adv.stage == "have_wood" and not (pick and axe):
         adv.missing.append("工具")
         adv.skill = "make_tools"
-        adv.params = {"tier": "wooden"}
-        adv.why = "有木头了，先做一套木工具，才有办法挖石头"
+        adv.params = {"tier": "wooden", "kinds": ["pickaxe"]}
+        adv.why = "先做木镐进入石器阶段，避免把木材耗在即将淘汰的整套木工具上"
         adv.hard = True
 
     elif adv.stage == "wooden_age":
@@ -216,8 +230,8 @@ def advise(
         else:
             adv.missing.append("石制工具")
             adv.skill = "make_tools"
-            adv.params = {"tier": "stone"}
-            adv.why = "有圆石了，做一套石制工具"
+            adv.params = {"tier": "stone", "kinds": ["pickaxe"]}
+            adv.why = "先升级石镐，其他工具按实际需要补齐"
             adv.hard = True
 
     elif adv.stage == "stone_age":
@@ -276,11 +290,39 @@ def advise(
                 adv.skill = "craft"
                 adv.params = {"item": "torch", "count": 8}
                 adv.why = "屋里还没有火把，先做几个"
-        bed = count_any(inv, ("white_bed", "red_bed", "blue_bed", "black_bed", "bed"))
-        if bed == 0:
-            adv.warnings.append("屋里还没有床——晚上能睡过去就安全多了（3 个羊毛 + 3 块木板）")
-        if inv.get("chest", 0) == 0 and inv.get("trapped_chest", 0) == 0:
-            adv.warnings.append("屋里还没有箱子，东西多了容易丢")
+        # 放置后的家具不在背包里，不能据此断言屋里没有床或箱子。
+
+    # 已拿到矿物就推进加工/升级，别反复挖同一种矿却一直不用。
+    if adv.skill == "mine_ores" and adv.params.get("ore") == "iron":
+        if pick not in ("iron", "diamond", "netherite") and inv.get("iron_ingot", 0) >= 3:
+            adv.skill, adv.params = "make_tools", {"tier": "iron", "kinds": ["pickaxe"]}
+            adv.why = "已有铁锭，先做铁镐再继续探索"
+        elif inv.get("raw_iron", 0) > 0:
+            adv.skill, adv.params = "smelt", {"item": "raw_iron", "count": min(8, inv["raw_iron"])}
+            adv.why = "已有铁矿，先炼成可用的铁锭"
+
+    # 生存优先级覆盖成长阶段；仅提醒不能阻止她饿着继续挖矿。
+    needs_food = food <= 10 or (health <= 12 and food < 18)
+    if needs_food:
+        adv.priority, adv.hard = "survival", True
+        adv.missing.insert(0, "恢复饱食度")
+        if food_items > 0:
+            adv.skill, adv.params = "eat", {"target_food": 20 if health <= 12 else 18}
+            adv.why = "先吃饱，保证恢复生命和下一段行动的体力"
+        elif food <= 4 and count_any(inv, ("beef", "porkchop", "mutton", "rabbit", "cod", "salmon", "tropical_fish", "carrot", "potato")):
+            edible = next(n for n in ("beef", "porkchop", "mutton", "rabbit", "salmon", "cod", "tropical_fish", "potato") if inv.get(n, 0))
+            adv.skill, adv.params = "eat", {"item": edible, "target_food": 12}
+            adv.why = "已经接近挨饿，先吃不会附带中毒风险的现有生食，再准备熟食"
+        else:
+            adv.skill, adv.params, adv.why = _food_advice()
+    elif health <= 8 and food >= 18:
+        adv.priority, adv.hard = "survival", True
+        adv.skill, adv.params = "recover", {"target_health": 12, "timeout_seconds": 20}
+        adv.why = "已吃饱但血量危险，先在没有近身威胁的地方恢复，再继续工作"
+    elif inventory_slots_used >= 32:
+        adv.priority = "maintenance"
+        adv.skill, adv.params = "store_items", {}
+        adv.why = "先腾出背包空间，保留工具与食物，再继续采集"
 
     # ---- 失败记忆：把"刚失败过"的事摆到明面上，并避免死循环
     if adv.skill and fails.get(adv.skill, 0) >= 2:

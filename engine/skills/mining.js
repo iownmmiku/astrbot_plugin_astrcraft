@@ -85,7 +85,7 @@ const TIER_INDEX = { wooden: 0, stone: 1, iron: 2, diamond: 3, netherite: 4 };
  * **只在她确实在地下时才爬**；爬不上去**不算任务失败**（矿已经挖到了），
  * 但要**如实写进结果**，这样她自己和玩家都知道"我还在下面"。
  */
-async function returnToSurface({ actions, nav, ctx, steps = [] }) {
+async function returnToSurface({ actions, nav, ctx, steps = [], reserveItems = {} }) {
   try {
     if (!isUnderground(actions.bot)) return { climbed: false, note: '' };
 
@@ -111,7 +111,7 @@ async function returnToSurface({ actions, nav, ctx, steps = [] }) {
     }
 
     ctx.progress('挖完了，爬回地面');
-    const res = await climbToSurface({ actions, nav, ctx, maxSteps: 40 });
+    const res = await climbToSurface({ actions, nav, ctx, maxSteps: 40, reserveItems });
     const n = (res && res.steps) || 0;
     if (res && res.ok) {
       return { climbed: true, note: `（已经爬回地面，挖了/垫了 ${n} 格）` };
@@ -254,6 +254,8 @@ async function mineOre({ actions, nav, state, ctx, ore = 'iron', want = 10, radi
  *   第二阶段才接受其它石质方块（它们是不错的建材，只是做不了石制工具）
  */
 async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, maxAttempts = 40 }) {
+  // 脱困只能用额外材料，不能把本次所需的产物全部垫回井里。
+  const reserveItems = { cobblestone: actions.countItem('cobblestone') + want };
   const strict = await wood.mineSpecific({
     actions,
     nav,
@@ -271,7 +273,7 @@ async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, max
   // 我第一版只改了 `mineOre`，实测"挖到 20 个圆石、任务 done、人还在 y=-59
   // （平台在 -49，低了 10 格）"，就是因为这条路径没被改到。
   if (strict.ok) {
-    const back = await returnToSurface({ actions, nav, ctx });
+    const back = await returnToSurface({ actions, nav, ctx, reserveItems });
     return back.note ? { ...strict, note: `${strict.note || ''}${back.note}` } : strict;
   }
 
@@ -292,7 +294,8 @@ async function mineStone({ actions, nav, state, ctx, want = 20, radius = 32, max
 
   // 两阶段合并报告：只要任一段有产出就算部分成功
   if (loose.ok || gainedStrict > 0) {
-    const back2 = await returnToSurface({ actions, nav, ctx });
+    for (const item of STONE_VARIANT_DROPS) reserveItems[item] = actions.countItem(item);
+    const back2 = await returnToSurface({ actions, nav, ctx, reserveItems });
     return {
       ...loose,
       note: `${loose.note || ''}${back2.note || ''}`,

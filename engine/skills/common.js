@@ -462,7 +462,7 @@ function isUnderground(bot) {
   // 爬升提前结束。实测症状："爬到 -52 就停了，而平台在 -49"。
   //
   // 现在采三圈（±6 / ±12 / ±20），这样**宽洞外面那圈没被动过的地面**也能采到；
-  // 判据改成"**附近最高的一处地面**比她高 2 格以上 → 她还在下面"。
+  // 附近地表比脚高一格也还在坑里，必须站上井口才算出来。
   // 语义上也更对：只要附近还有比她高的地面，她就还没回到地表。
   let sampled = 0;
   let maxSurf = null;
@@ -480,7 +480,7 @@ function isUnderground(bot) {
     }
   }
   if (sampled === 0 || maxSurf === null) return false;
-  return maxSurf >= by + 2;
+  return maxSurf >= by + 1;
 }
 
 /**
@@ -542,7 +542,7 @@ function surfaceHeightAt(bot, x, z, fromY) {
 //     调用方的 by 过期 → 往头顶放 → 服务端 "the block is still there"）
 //   · 判据还不统一（dig 绝对层 / stair 相对高度）—— 同一个 bug 修两遍
 // **从此只有一份，改这里三个策略同时生效。**
-const STEP_UP_RANGE = 1.5; // 到达判据：0.6/1.2 会把「停在 1.58 格」判成没走到（实测）
+const STEP_UP_RANGE = 0.6; // 一级台阶必须走上目标格，不能把斜下方也算到达。
 // **3000（从 6000 砍的）**：竖井/台阶都是 1~2 格的挪动 —— pathfinder 要么很快找到路，
 // 要么走不到；走不到时每条烧满超时 × 方向数 = 一轮几十秒（实测 f9：24~51 秒/attempt，
 // 2 分钟只升 2 格，测试预算内爬不出去）。快速失败、快速换方向/换策略。
@@ -599,8 +599,7 @@ async function settleFloorY(bot, ctx, maxMs = 1500) {
  * 共享的「走到目标层并验证」—— **range / 超时 / 验证标准只写这一份**。
  *
  * 三条教训（每条都真踩过，两处实现各踩一次）：
- * ① `range` 必须 1.5：站上 1×1 台阶很难停在格子中心（0.7 常态、1.58 出现过），
- *    range 小了 goTo 会**抛异常**，直接把调用方打到 continue、走不到验证；
+ * ① 使用小范围且关闭分段兜底，避免原地「到达」或沿远处地形绕行后掉回井底；
  * ② **goTo 抛异常也要验高度**：她可能已经上去了，只是 goTo 觉得没到位；
  * ③ 判据是**绝对层 `afterY >= by + 1`**，不是「比刚才高」：
  *    上一个方向可能已经把她送上去，相对判据会把「已经到了」判成「没动」，
@@ -612,7 +611,7 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   let goToFailed = null;
   let goResult = null;
   try {
-    goResult = await nav.goTo({ x: nx, y: by + 1, z: nz, range: STEP_UP_RANGE, signal: ctx.signal, timeoutMs: STEP_UP_TIMEOUT_MS });
+    goResult = await nav.goTo({ x: nx, y: by + 1, z: nz, range: STEP_UP_RANGE, signal: ctx.signal, timeoutMs: STEP_UP_TIMEOUT_MS, segmented: false });
   } catch (err) {
     if (err instanceof CancelledError) throw err;
     goToFailed = String(err.message).slice(0, 70);
@@ -648,7 +647,7 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
     // 和手动 forward/jump 打架（f6 现场：人在台阶旁、arrived=true 距离 0.707，
     // 手动 900ms 纹丝没上去的嫌疑之一）。
     try {
-      bot.pathfinder.stop();
+      bot.pathfinder.setGoal(null);
     } catch {
       /* 没有活动目标也无所谓 */
     }
@@ -698,7 +697,7 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   return false;
 }
 
-async function digStepUpImpl({ actions, nav, ctx, bx, by, bz }) {
+async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} }) {
   const bot = actions.bot;
   log.info(`挖台阶：开始试（我在 ${bx}, ${by}, ${bz}）`);
   // 共享前置：等落地 + 刷新坐标（原来 dig 没有这步 —— 抄丢了 pillar 的教训）
@@ -748,7 +747,7 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz }) {
     let support = blockAt(bot, nx, by, nz);
     if (!support || support.boundingBox !== 'block') {
       const filler = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand'].find(
-        (n) => actions.countItem(n) > 0,
+        (n) => actions.countItem(n) > (reserveItems[n] || 0),
       );
       if (!filler) {
         log.info(`挖台阶：(${nx}, ${nz}) 落脚点没支撑，而且背包里没有方块可以垫`);
@@ -781,7 +780,8 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz }) {
       const b = blockAt(bot, nx, y, nz);
       if (!b || b.boundingBox !== 'block') continue;
       try {
-        await actions.dig({ x: nx, y, z: nz, signal: ctx.signal, collect: true });
+        // 开台阶时保持站位；追逐掉落物会走离支撑块并掉回井底。
+        await actions.dig({ x: nx, y, z: nz, signal: ctx.signal, collect: false });
       } catch (err) {
         if (err instanceof CancelledError) throw err;
         log.info(`挖台阶 (${nx}, ${y}, ${nz}) 失败：${err.message}`);
@@ -845,10 +845,10 @@ function isOpenSky(bot, need = 3) {
  *
  * @returns true = 真的升上去了（**验证高度**，不信 goTo 的返回值）
  */
-async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz }) {
+async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} }) {
   const bot = actions.bot;
   const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
-  const filler = CANDIDATES.find((n) => actions.countItem(n) > 0);
+  const filler = CANDIDATES.find((n) => actions.countItem(n) > (reserveItems[n] || 0));
   if (!filler) return false;
 
   // 共享前置：等落地 + 刷新坐标（等落地 / 过期坐标两个坑都在 stepUpOnePrelude 里）
@@ -903,7 +903,7 @@ async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz }) {
   return false;
 }
 
-async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
+async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems = {} }) {
   const bot = actions.bot;
   if (!isUnderground(bot)) return { ok: true, steps: 0, already: true };
 
@@ -996,6 +996,21 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
     const bz = Math.floor(p.z);
     let advanced = false;
 
+    // 通天的窄井有现成支撑，优先原地垫高，避免连续向同一侧挖到崖外。
+    const openAbove = [2, 3].every((dy) => {
+      const b = blockAt(bot, bx, by + dy, bz);
+      return b && b.boundingBox === 'empty' && !isDangerousBlock(b.name);
+    });
+    const narrowShaft = dirs.every(([dx, dz]) => {
+      const b = blockAt(bot, bx + dx, by, bz + dz);
+      return b && b.boundingBox === 'block';
+    });
+    if (openAbove && narrowShaft && await pillarUpOne({ actions, ctx, bx, by, bz, reserveItems })) {
+      climbed += 1;
+      ctx.progress(`原地垫高（第 ${climbed} 格）`);
+      continue;
+    }
+
     // （inlineFutile 时 dirs 传空数组 = 本轮跳过内联尝试，直接落到 digStepUp）
     for (const [dx, dz] of (inlineFutile ? [] : dirs)) {
       const tx = bx + dx;
@@ -1008,10 +1023,10 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
       try {
         ctx.progress(`向上挖阶梯（第 ${climbed + 1} 格）`);
         if (feet.boundingBox === 'block') {
-          await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: true });
+          await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: false });
         }
         if (head.boundingBox === 'block') {
-          await actions.dig({ x: tx, y: by + 2, z: tz, signal: ctx.signal, collect: true });
+          await actions.dig({ x: tx, y: by + 2, z: tz, signal: ctx.signal, collect: false });
         }
         // 走进去：pathfinder 会自动跳上这 1 格台阶
         //
@@ -1028,7 +1043,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
         // 剩 ~200 秒 ÷ 35 秒/轮 = 只够 6 轮 —— h15 实测「共爬 6 格」后超时。
         // 真走得通的路径（1~2 格）都在 1 秒内出结果；1.5 秒走不到 = 这条几何走不到，
         // 快速让位给下面的 digStepUp（带垫支撑 + 手动补位，实测那条才是活路）。
-        await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 1500 });
+        await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.6, signal: ctx.signal, timeoutMs: 1500, segmented: false });
         // **用位置验证"真的升高了"，不信 goTo 的返回值。**
         // 它可能因为"附近有可站立点"之类的判断原地成功返回——
         // 实测那样会 24 级台阶一级都没踩上，而 climbed 却在涨。
@@ -1062,7 +1077,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
       const up1 = blockAt(bot, bx, by + 2, bz);
       if (up1 && up1.boundingBox === 'block' && up1.diggable && !isDangerousBlock(up1.name)) {
         try {
-          await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: true });
+          await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: false });
         } catch (err) {
           if (err instanceof CancelledError) throw err;
         }
@@ -1075,7 +1090,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
       //     我在这上面来回好几轮了，服务端一直回 "the block is still there"
       //   · **真人下矿回来挖的就是阶梯** —— 能原路走回来，不需要方块
       // 所以：先试不依赖时序的，再试快的但脆的。
-      if (await digStepUp({ actions, nav, ctx, bx, by, bz })) {
+      if (await digStepUp({ actions, nav, ctx, bx, by, bz, reserveItems })) {
         climbed += 1;
         continue;
       }
@@ -1084,12 +1099,12 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
       // 为什么排在"垫脚上升"前面：用户实测"跳起来往脚下放"做不到，
       // **而"往旁边放"是可靠的** —— 螺旋阶梯只用到"往旁边放"，
       // 所以它没有那个几十毫秒的跳跃窗口。
-      if (await stairUpOne({ actions, nav, ctx, bx, by, bz })) {
+      if (await stairUpOne({ actions, nav, ctx, bx, by, bz, reserveItems })) {
         climbed += 1;
         continue;
       }
       // 垫脚上升降级成备选：它有时能用（比如四周都被挡住、没地方放旁边）
-      if (await pillarUpOne({ actions, ctx, bx, by, bz })) {
+      if (await pillarUpOne({ actions, ctx, bx, by, bz, reserveItems })) {
         climbed += 1;
         continue;
       }
@@ -1133,10 +1148,10 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24 }) {
  *   2. 必须**趁跳起来的时候**放——站在地上放，那格是她自己占着的，服务端会拒
  *   3. 放完要等一下让她落在那块上
  */
-async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
+async function pillarUpOneImpl({ actions, ctx, bx, by, bz, reserveItems = {} }) {
   const bot = actions.bot;
   const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
-  const block = CANDIDATES.find((n) => actions.countItem(n) > 0);
+  const block = CANDIDATES.find((n) => actions.countItem(n) > (reserveItems[n] || 0));
   if (!block) return false;
 
   // 共享前置：等落地 + 刷新坐标 —— 上面那段「过期坐标」的教训
@@ -1146,6 +1161,8 @@ async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
   ({ bx, by, bz } = fresh0);
 
   try {
+    // 装备等待必须在起跳前完成，空中再换手会错过约半秒的放置窗口。
+    await actions.holdItem({ item: block, signal: ctx.signal });
     // **跳起来，然后等"她真的离地了"再放。**
     //
     // 踩过：只 `jump` 130ms 就放，那时她还在原地 —— 服务端直接拒
@@ -1171,8 +1188,8 @@ async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
     for (let i = 0; i < 12; i += 1) {
       await delay(50, { signal: ctx.signal });
       const p = bot.entity.position;
-      // 离地 0.7 格以上，那一格就空出来了
-      if (!bot.entity.onGround && p.y - by >= 0.7) {
+      // 身体完全离开目标格后再放，不能在脚仍与方块相交时发包。
+      if (!bot.entity.onGround && p.y - by >= 1) {
         airborne = true;
         break;
       }
@@ -1188,7 +1205,7 @@ async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
     let placeErr = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await actions.place({ x: bx, y: by, z: bz, item: block, signal: ctx.signal, reach: false });
+        await actions.place({ x: bx, y: by, z: bz, item: block, signal: ctx.signal, reach: false, fast: true });
         placeErr = null;
         break;
       } catch (err) {
@@ -1199,9 +1216,13 @@ async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
     }
     if (placeErr) throw placeErr;
     await delay(260, { signal: ctx.signal });
-    // 验证真的站上去了：脚下那块应该是她刚放的那块
+    const actualY = await settleFloorY(bot, ctx, 1500);
+    // 方块出现不等于人已站上去，落地后同时验证高度与支撑。
     const below = blockAt(bot, bx, by, bz);
-    if (below && below.name === block) return true;
+    const position = bot.entity.position;
+    if (bot.entity.onGround && actualY >= by + 1 &&
+        Math.hypot(position.x - (bx + 0.5), position.z - (bz + 0.5)) <= 0.8 &&
+        below && below.name === block) return true;
     log.info(`垫脚上升没成（脚下是 ${below ? below.name : '读不到'}，放的是 ${block}）`);
     return false;
   } catch (err) {
@@ -1224,10 +1245,10 @@ async function pillarUpOneImpl({ actions, ctx, bx, by, bz }) {
  * 抽在这里的原因：**三个平行实现 = 同一个坑要踩三遍**（已实测两次）。
  * 调用点/导出名保持不变（`digStepUp` / `stairUpOne` / `pillarUpOne` 是下面的薄壳）。
  */
-async function stepUpOne({ strategy, actions, nav, ctx, bx, by, bz }) {
-  if (strategy === 'dig') return digStepUpImpl({ actions, nav, ctx, bx, by, bz });
-  if (strategy === 'stair') return stairUpOneImpl({ actions, nav, ctx, bx, by, bz });
-  if (strategy === 'pillar') return pillarUpOneImpl({ actions, ctx, bx, by, bz });
+async function stepUpOne({ strategy, actions, nav, ctx, bx, by, bz, reserveItems = {} }) {
+  if (strategy === 'dig') return digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems });
+  if (strategy === 'stair') return stairUpOneImpl({ actions, nav, ctx, bx, by, bz, reserveItems });
+  if (strategy === 'pillar') return pillarUpOneImpl({ actions, ctx, bx, by, bz, reserveItems });
   throw new Error(`未知的 stepUpOne 策略：${String(strategy)}`);
 }
 
@@ -1266,12 +1287,12 @@ async function widenShaft({ actions, nav, ctx, bx, by, bz }) {
     if (!wall || wall.boundingBox !== 'block' || !wall.diggable || isDangerousBlock(wall.name)) continue;
     if (!floor || floor.boundingBox !== 'block') continue;
     try {
-      await actions.dig({ x: tx, y: by, z: tz, signal: ctx.signal, collect: true });
+      await actions.dig({ x: tx, y: by, z: tz, signal: ctx.signal, collect: false });
       if (wallHead && wallHead.boundingBox === 'block' && wallHead.diggable && !isDangerousBlock(wallHead.name)) {
-        await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: true });
+        await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: false });
       }
       // 站过去（同样要带高度，否则"已到达"就返回了，人没动）
-      await nav.goTo({ x: tx, y: by, z: tz, range: 0.9, signal: ctx.signal, timeoutMs: 8000 });
+      await nav.goTo({ x: tx, y: by, z: tz, range: 0.6, signal: ctx.signal, timeoutMs: 8000, segmented: false });
       // 同样验证真的挪过去了
       const np = bot.entity.position;
       if (Math.abs(np.x - (tx + 0.5)) > 1.6 || Math.abs(np.z - (tz + 0.5)) > 1.6) {

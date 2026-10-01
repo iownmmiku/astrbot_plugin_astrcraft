@@ -80,6 +80,7 @@ const engineLog = [];
 child.stderr.on('data', (c) => {
   for (const l of c.split('\n')) {
     if (!l.trim()) continue;
+    if (process.env.MC_TEST_VERBOSE === '1') console.log('  ' + l);
     engineLog.push(l);
     if (engineLog.length > 300) engineLog.shift();
   }
@@ -117,6 +118,8 @@ const bad = (m, d) => {
 /** 造一个 depth 格深的坑，把她放进去 */
 async function makePit(rcon, user, X, depth) {
   const Z = 0;
+  // 每个场景独立背包，避免上一次的镐在准备地形时触发挖掘自救。
+  await rcon.command(`clear ${user}`);
 
   // **世界最低高度是 -64，不能往下挖穿它。**
   //
@@ -162,6 +165,9 @@ async function makePit(rcon, user, X, depth) {
   // （**同一个错误我在 test_mine_return 犯过并写过注释，这次又犯**：
   //  断言的『观察者』必须先到场，顺序本身就是判据的一部分）。
   await assertBlockAt(call, X, standY, Z, 'air');
+  await assertBlockAt(call, X, FLOOR, Z, 'stone');
+  await assertBlockAt(call, X + 1, SURFACE, Z, 'stone');
+  for (let y = standY; y <= SURFACE; y += 1) await assertBlockAt(call, X, y, Z, 'air');
   return { X, Z, standY, surfaceY: SURFACE };
 }
 
@@ -192,6 +198,7 @@ async function runSkill(skill, params, sec = 300) {
     if (f) return { status: f.status, result: f.result || {}, error: f.error };
     await sleep(500);
   }
+  await call('task.cancel', { task_id: taskId }).catch(() => {});
   return { status: 'no-finish' };
 }
 
@@ -219,13 +226,14 @@ async function runSkill(skill, params, sec = 300) {
     await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
     await sleep(2000);
     const before = await call('state.get', { detail: 'brief' });
-    console.log(`    起点 y=${before.position.y.toFixed(1)}（地面 y=-60，坑深 3）`);
+    console.log(`    起点 y=${before.position.y.toFixed(1)}（地面站立高度 y=${p.surfaceY + 1}，坑深 3）`);
     const r = await runSkill('pave', { direction: 'up', count: 4 });
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
     console.log(`    pave up → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 80)}`);
-    if (up >= 2) ok('垫出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
+    if (r.status === 'done' && after.position.y >= p.surfaceY + 0.5) ok('垫出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
     else bad('没能垫出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
+  }
   }
 
   // ---------- 情况 2：有镐（应该能挖出来）----------
@@ -243,7 +251,7 @@ async function runSkill(skill, params, sec = 300) {
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
     console.log(`    climb_out → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 80)}`);
-    if (up >= 2) ok('挖出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
+    if (r.status === 'done' && after.position.y >= p.surfaceY + 0.5) ok('挖出来了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
     else bad('没能挖出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}`);
   }
 
@@ -265,14 +273,15 @@ async function runSkill(skill, params, sec = 300) {
     const note = String((r.result && r.result.note) || r.error || '');
     console.log(`    pave up → ${r.status} ｜ ${note.slice(0, 90)}`);
     const saidNo = /没有能垫的方块|没有方块|垫高失败/.test(note);
-    if (saidNo) ok('如实说了"没有方块可垫"（不是假装成功）', note.slice(0, 60));
+    if (r.status === 'failed' && saidNo) ok('如实说了"没有方块可垫"（不是假装成功）', note.slice(0, 60));
     else bad('没有明确说清"出不去"的原因', note.slice(0, 80));
     // 再看 climb_out 在没镐时怎么说
     const r2 = await runSkill('climb_out', { max_steps: 16 }, 60);
     const note2 = String((r2.result && r2.result.note) || r2.error || '');
     console.log(`    climb_out → ${r2.status} ｜ ${note2.slice(0, 90)}`);
-    const up2 = after.position.y - before.position.y;
-    if (up2 < 1) ok('确实出不去（符合物理：没工具没方块）', `y 没变`);
+    const after2 = await call('state.get', { detail: 'brief' });
+    const up2 = after2.position.y - before.position.y;
+    if (r2.status === 'failed' && up2 < 1) ok('确实出不去（符合物理：没工具没方块）', `y 没变`);
     else bad('竟然出来了？那说明有别的路径，要重新理解', `升了 ${up2.toFixed(0)} 格`);
   }
 
@@ -284,7 +293,6 @@ async function runSkill(skill, params, sec = 300) {
   }
 
   // 前面那三条都太浅（3 格），盖不到这个情况。
-  }
 
   if (wantStep(4)) {
   console.log('\n[4] 真实场景：10 格深的 1x1 竖井 + 有镐 + 有圆石（挖矿回来的样子）');
@@ -296,24 +304,32 @@ async function runSkill(skill, params, sec = 300) {
     await rcon.command(`tp ${USER} ${p.X + 0.5} ${p.standY} ${p.Z + 0.5}`);
     await sleep(2000);
     const before = await call('state.get', { detail: 'brief' });
-    console.log(`    起点 y=${before.position.y.toFixed(1)}（地面 y=-60，井深 10）`);
+    const targetY = p.surfaceY + 1;
+    if (Math.abs(before.position.y - p.standY) > 0.5 || targetY - before.position.y < 9.5) throw new Error('10 格深井的初始位置不符合测试条件');
+    console.log(`    起点 y=${before.position.y.toFixed(1)}（地面站立高度 y=${targetY}，井深 10）`);
     // 先试 climb_out（她应该会用它）
     const r = await runSkill('climb_out', { max_steps: 40 }, 240);
     const after = await call('state.get', { detail: 'brief' });
     const up = after.position.y - before.position.y;
     console.log(`    climb_out → ${r.status} ｜ ${String((r.result && r.result.note) || r.error || '').slice(0, 90)}`);
-    if (after.position.y >= -60.5) {
+    if (r.status === 'done' && after.position.y >= targetY - 0.5) {
       ok('从 10 格深的竖井里爬回地面了', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（升了 ${up.toFixed(0)} 格）`);
     } else {
       bad('没能从 10 格深的竖井里出来', `y ${before.position.y.toFixed(0)} → ${after.position.y.toFixed(0)}（只升了 ${up.toFixed(0)} 格）`);
     }
-    // 再试 pave up（另一条路）
-    if (after.position.y < -60.5) {
-      const r2 = await runSkill('pave', { direction: 'up', count: 12 }, 240);
+    // 独立新井验证垫高，不能借用 climb_out 已经挖好的台阶。
+    {
+      const p2 = await makePit(rcon, USER, BASE + 240, 10);
+      await rcon.command(`clear ${USER}`);
+      await rcon.command(`give ${USER} cobblestone 32`);
+      await sleep(1500);
+      const before2 = await call('state.get', { detail: 'brief' });
+      if (Math.abs(before2.position.y - p2.standY) > 0.5) throw new Error('独立垫高深井的初始位置不符合测试条件');
+      const r2 = await runSkill('pave', { direction: 'up', count: 10 }, 240);
       const after2 = await call('state.get', { detail: 'brief' });
       console.log(`    pave up → ${r2.status} ｜ ${String((r2.result && r2.result.note) || r2.error || '').slice(0, 90)}`);
-      if (after2.position.y >= -60.5) {
-        ok('pave up 能从深井里垫上来', `y ${after.position.y.toFixed(0)} → ${after2.position.y.toFixed(0)}`);
+      if (r2.status === 'done' && after2.position.y >= p2.surfaceY + 0.5 && r2.result.paved >= 10) {
+        ok('没有镐也能从独立 10 格深井里垫上来', `y ${before2.position.y.toFixed(0)} → ${after2.position.y.toFixed(0)}`);
       } else {
         bad('pave up 也出不来', `y ${after2.position.y.toFixed(0)}`);
       }

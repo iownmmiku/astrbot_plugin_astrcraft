@@ -7,7 +7,7 @@
  *   1. 目标坐标必须是"方块中心"（+0.5），否则 pathfinder 会判定"差一点到不了"而反复抖动
  *   2. 目标如果不可站立（比如是石头内部），要用 GoalNear 而不是 GoalBlock
  *   3. 监听 goal_reached 必须配套 removeListener，否则任务多了会内存泄漏 + 重复 resolve
- *   4. 停止寻路要同时 bot.pathfinder.stop() 和清掉自制监听，只做一半会导致"取消了但还在走"
+ *   4. 停止寻路用 setGoal(null) 立即清除目标，并清理监听；stop() 的延迟停止会误取消下一条路径
  */
 
 const { goals } = require('mineflayer-pathfinder');
@@ -179,6 +179,21 @@ class Navigator {
     this._gaze = new WalkGaze(bot);
     this._gait = new Gait();
     this._gazePitchValue = 0;
+    const { executionContext } = require('./goals');
+    const indexes = { follow: 1, toPlayer: 1, look: 2, lookAtPoint: 3 };
+    for (const name of Object.getOwnPropertyNames(Navigator.prototype)) {
+      const method = Object.getOwnPropertyDescriptor(Navigator.prototype, name).value;
+      if (name.startsWith('_') || !method || method.constructor.name !== 'AsyncFunction') continue;
+      this[name] = (...args) => {
+        const index = indexes[name] || 0;
+        const opts = args[index] || {};
+        const inherited = executionContext.getStore();
+        const signal = opts.signal || (inherited && inherited.signal) || null;
+        if (signal && signal.aborted) return Promise.reject(new CancelledError('移动被取消'));
+        args[index] = { ...opts, signal };
+        return executionContext.run({ ...inherited, signal }, () => method.apply(this, args));
+      };
+    }
   }
 
   /**
@@ -204,7 +219,9 @@ class Navigator {
     const targetY = y === null || y === undefined ? null : y;
 
     try {
-      return await this._goToOnce({ x, y: targetY, z, range, signal, timeoutMs, onTick, xzOnly });
+      const result = await this._goToOnce({ x, y: targetY, z, range, signal, timeoutMs, onTick, xzOnly });
+      if (!result.arrived) throw new PathError(`寻路停止但未到目标，水平仍差 ${result.distance_to_target} 格`);
+      return result;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
       if (!segmented || (signal && signal.aborted)) throw err;
@@ -552,6 +569,8 @@ class Navigator {
   async _runPath(goal, { x, y, z, range = ARRIVE_RADIUS, timeout, signal, t0, onTick }) {
     const bot = this._bot;
     const pathfinder = bot.pathfinder;
+    // Mineflayer 事件在发射事件的上下文执行，需显式传递当前操作的地形限制。
+    const allowTerrainDig = require('./goals').executionContext.getStore()?.allowTerrainDig !== false;
 
     await new Promise((resolve, reject) => {
       let settled = false;
@@ -560,14 +579,22 @@ class Navigator {
       let lastPos = bot.entity.position.clone ? bot.entity.position.clone() : { ...bot.entity.position };
       let stuckRounds = 0;
       let dugOutTried = false;
+      let recovering = false;
+      const recoveryController = new AbortController();
 
       const cleanup = () => {
         if (settled) return;
         settled = true;
+        recoveryController.abort();
+        if (recovering) {
+          try { bot.clearControlStates(); }
+          catch { /* 当前路径退出时尽力停止自救留下的方向键 */ }
+        }
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (stuckTimer) clearInterval(stuckTimer);
         bot.removeListener('goal_reached', onReached);
         bot.removeListener('path_update', onPathUpdate);
+        bot.removeListener('physicsTick', onPosition);
         if (signal) signal.removeEventListener('abort', onAbort);
         this._activeResolve = null;
       };
@@ -580,6 +607,13 @@ class Navigator {
       };
 
       const onReached = () => finish(null, buildResult(true, '已到达'));
+      const onPosition = () => {
+        if (settled || recovering) return;
+        const p = bot.entity.position;
+        if (distanceXZ(p, { x, z }) > range || (y !== null && y !== undefined && Math.abs(p.y - y) > 0.75)) return;
+        try { pathfinder.setGoal(null); } catch { /* 已到位时尽力清掉路径 */ }
+        finish(null, buildResult(true, '已在请求的目标范围内'));
+      };
       // 注意：**不能**把 goal_updated 当成"到达"。
       // setGoal() 之后 goal 会被内部立刻更新一次，若在这里 resolve，
       // 任务会在出发前就报"成功"——这是最危险的一类 bug（假成功），
@@ -592,7 +626,7 @@ class Navigator {
           const near = distanceXZ(bot.entity.position, { x, z }) <= 8;
           if (near && !dugOutTried) {
             dugOutTried = true;
-            this._digOut({ signal })
+            this._digOut({ signal: recoveryController.signal, allowTerrainDig })
               .then((dug) => {
                 if (settled) return;
                 if (dug) {
@@ -616,7 +650,7 @@ class Navigator {
       };
       const onAbort = () => {
         try {
-          pathfinder.stop();
+          pathfinder.setGoal(null);
         } catch {
           /* ignore */
         }
@@ -636,6 +670,7 @@ class Navigator {
 
       bot.on('goal_reached', onReached);
       bot.on('path_update', onPathUpdate);
+      bot.on('physicsTick', onPosition);
       if (signal) {
         if (signal.aborted) return onAbort();
         signal.addEventListener('abort', onAbort, { once: true });
@@ -643,7 +678,7 @@ class Navigator {
 
       timeoutTimer = setTimeout(() => {
         try {
-          pathfinder.stop();
+          pathfinder.setGoal(null);
         } catch {
           /* ignore */
         }
@@ -657,13 +692,15 @@ class Navigator {
 
       // 卡住检测：2.5 秒位置几乎没变就计数，连续两次认为是真卡住
       stuckTimer = setInterval(() => {
+        if (settled || recovering) return;
         const pos = bot.entity.position;
         const moved = distanceXZ(pos, lastPos);
         if (moved < 0.5) {
           stuckRounds += 1;
           if (stuckRounds >= 2) {
+            recovering = true;
             try {
-              pathfinder.stop();
+              pathfinder.setGoal(null);
             } catch {
               /* ignore */
             }
@@ -672,7 +709,7 @@ class Navigator {
             // 几乎没有前进"，连 0.4 格外的目标都到不了，挖出来的掉落物也捡不到，
             // 整轮挖矿 240 秒只拿到 1 个圆石。真人卡住会先跳一下再挪。
             // 这里在 finish 之前给她一次机会，成功就继续走完这条路径。
-            this._escapeStuck({ signal })
+            this._escapeStuck({ signal: recoveryController.signal, allowTerrainDig })
               .then((escaped) => {
                 if (settled) return;
                 if (escaped) {
@@ -680,6 +717,8 @@ class Navigator {
                   lastPos = bot.entity.position.clone
                     ? bot.entity.position.clone()
                     : { ...bot.entity.position };
+                  // stop() 撤销了旧路径；脱困后必须重新规划原目标。
+                  pathfinder.setGoal(goal);
                   return; // 脱困成功：让 pathfinder 继续
                 }
                 finish(
@@ -692,7 +731,8 @@ class Navigator {
                 if (!settled) {
                   finish(new PathError(`移动卡住：${fmtVec(pos)} 附近无法前进`));
                 }
-              });
+              })
+              .finally(() => { recovering = false; });
           }
         } else {
           stuckRounds = 0;
@@ -757,6 +797,34 @@ class Navigator {
    *   - 一直平滑地看着对方的头部（不是脚）
    *   - 只有"卡住了走不过去"时才临时交给 pathfinder 绕一小段，绕过去继续直接走
    */
+  async toPlayer(target, { distance: dist = 3, signal = null, timeoutMs = 60000, onTick = null } = {}) {
+    const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 60000);
+    const range = Math.max(1.2, Number(dist) || 3);
+    while (Date.now() < deadline) {
+      if (signal && signal.aborted) throw new CancelledError('前往玩家被取消');
+      const entity = this._resolveEntity(target);
+      if (!entity || !entity.position) throw new PathError(`附近找不到玩家 ${target}，可能已离开视野或下线`);
+      const d = distance(this._bot.entity.position, entity.position);
+      const destination = { ...entity.position };
+      if (onTick) onTick({ distance: d });
+      if (d <= range) {
+        this.stop();
+        return { ok: true, arrived: true, player: String(target), distance_to_target: Number(d.toFixed(1)) };
+      }
+      try {
+        await this.goTo({ ...destination, range, signal,
+          timeoutMs: Math.min(6000, deadline - Date.now()), segmented: false });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        // A moving player invalidates an old route; refresh their position.
+        const updated = this._resolveEntity(target);
+        if (!updated || distance(updated.position, destination) < 1) throw err;
+      }
+      await delay(100, { signal });
+    }
+    throw new PathError(`前往 ${target} 超时，请先确认对方在可到达的地方`);
+  }
+
   async follow(target, { distance: dist = 3, signal = null, onTick = null } = {}) {
     const bot = this._bot;
     const entity = this._resolveEntity(target);
@@ -924,7 +992,7 @@ class Navigator {
   stop() {
     try {
       this._bot.pathfinder.setGoal(null);
-      this._bot.pathfinder.stop();
+      this._bot.clearControlStates();
     } catch (err) {
       log.debug(`停止寻路时出错（可忽略）：${err.message}`);
     }
@@ -1078,7 +1146,7 @@ class Navigator {
    *      这时只有"朝岩壁挖进去"才能出去（实测：她在这种地形上
    *      连 0.1 格都动不了，整个任务原地失败，日志只有"移动 0.0 格"）
    */
-  async _escapeStuck({ signal = null, rounds = 4 } = {}) {
+  async _escapeStuck({ signal = null, rounds = 4, allowTerrainDig = true } = {}) {
     const bot = this._bot;
     if (!bot || !bot.entity) return false;
 
@@ -1137,7 +1205,7 @@ class Navigator {
       }
 
       // 3) 跳和挪都没用 → 挖开挡路的方块（岩壁脱困）
-      const dug = await this._digOut({ signal });
+      const dug = await this._digOut({ signal, allowTerrainDig });
       if (dug) {
         log.info(`卡住自救：挖开了挡路的方块（第 ${i + 1} 次尝试）`);
         // 挖开后立刻试着走进去
@@ -1169,7 +1237,8 @@ class Navigator {
    * 于是任何寻路都失败（日志里她连着一小时喊"路被堵死了走不过去"），
    * 而她原来的脱困逻辑只看四个水平方向，压根没想过要挖头顶。
    */
-  async _digOut({ signal = null } = {}) {
+  async _digOut({ signal = null, allowTerrainDig = true } = {}) {
+    if (!allowTerrainDig || require('./goals').executionContext.getStore()?.allowTerrainDig === false) return false;
     const actions = this._actions;
     const bot = this._bot;
     if (!actions || !bot || !bot.entity) return false;
@@ -1230,13 +1299,13 @@ class Navigator {
   }
 
   /** 小跳一下：用于脱离 1 格台阶卡住、或作为动作的一部分让行为更像玩家 */
-  async jump() {
+  async jump({ signal = null } = {}) {
     const bot = this._bot;
     if (!bot || !bot.entity) return;
     if (bot.entity.onGround) {
       bot.setControlState('jump', true);
-      await delay(180);
-      bot.setControlState('jump', false);
+      try { await delay(180, { signal }); }
+      finally { bot.setControlState('jump', false); }
     }
   }
 

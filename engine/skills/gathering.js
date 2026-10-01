@@ -10,7 +10,7 @@
  */
 
 const log = require('../log');
-const { delay, CancelledError, describeFailure } = require('../util');
+const { delay, CancelledError, describeFailure, vec3 } = require('../util');
 const { skillResult, positiveOnly } = require('./common');
 const wood = require('./wood');
 const mining = require('./mining');
@@ -383,7 +383,7 @@ function findAnimal(actions, mob) {
 /**
  * 把东西存起来：找最近的箱子，没有就做一个放下来。
  */
-async function storeItems({ actions, nav, state, ctx, items = null, keep = ['torch', 'crafting_table'] }) {
+async function storeItems({ actions, nav, state, ctx, items = null, keep = null }) {
   const steps = [];
   const bot = actions.bot;
   let chest = bot.findBlock({ matching: (b) => b && (b.name === 'chest' || b.name === 'barrel' || b.name === 'trapped_chest'), maxDistance: 32 });
@@ -411,7 +411,7 @@ async function storeItems({ actions, nav, state, ctx, items = null, keep = ['tor
     try {
       await actions.place({ x: pos.x, y: pos.y, z: pos.z, item: 'chest', signal: ctx.signal, reach: true });
       steps.push('放置箱子');
-      chest = bot.blockAt(pos);
+      chest = bot.blockAt(vec3(pos.x, pos.y, pos.z));
     } catch (err) {
       return skillResult(false, { steps, reason: `放置箱子失败：${describeFailure(err)}` });
     }
@@ -419,20 +419,25 @@ async function storeItems({ actions, nav, state, ctx, items = null, keep = ['tor
   if (!chest) return skillResult(false, { steps, reason: '找不到也做不出箱子' });
 
   try {
+    const supplies = keep !== null ? keep : items !== null ? [] : Object.keys(actions.inventoryMap()).filter((name) =>
+      /_(pickaxe|axe|shovel|sword|hoe|helmet|chestplate|leggings|boots)$/.test(name) ||
+      ['bow', 'crossbow', 'arrow', 'shield', 'bucket', 'water_bucket', 'torch', 'crafting_table', 'furnace'].includes(name) ||
+      READY_FOOD.includes(name) || Object.hasOwn(COOKABLE, name));
     const r = await actions.deposit({
       x: chest.position.x,
       y: chest.position.y,
       z: chest.position.z,
       items,
-      keep: [...(keep || []), 'crafting_table', 'furnace', 'oak_door'],
+      keep: [...supplies, 'crafting_table', 'furnace', 'oak_door'],
       signal: ctx.signal,
       reach: true,
     });
     steps.push(`存入 ${Object.keys(r.stored).length} 种物品`);
-    return skillResult(true, {
+    return skillResult(r.total > 0, {
       steps,
       consumed: r.stored,
       note: `已把 ${r.total} 个物品存进箱子 (${chest.position.x}, ${chest.position.y}, ${chest.position.z})：${Object.entries(r.stored).map(([k, v]) => `${k}×${v}`).join('、') || '无'}`,
+      reason: r.total > 0 ? null : '没有存入任何物品，检查箱子空间或保留清单',
       extra: { chest: { x: chest.position.x, y: chest.position.y, z: chest.position.z } },
     });
   } catch (err) {
@@ -440,58 +445,84 @@ async function storeItems({ actions, nav, state, ctx, items = null, keep = ['tor
   }
 }
 
+const READY_FOOD = [
+  'cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton', 'cooked_rabbit', 'cooked_cod', 'cooked_salmon',
+  'bread', 'apple', 'carrot', 'baked_potato', 'golden_carrot', 'golden_apple', 'enchanted_golden_apple',
+  'rabbit_stew', 'mushroom_stew', 'beetroot_soup', 'pumpkin_pie', 'cookie', 'melon_slice', 'sweet_berries',
+  'glow_berries', 'dried_kelp', 'beetroot',
+];
+const COOKABLE = { beef: 'cooked_beef', porkchop: 'cooked_porkchop', chicken: 'cooked_chicken',
+  mutton: 'cooked_mutton', rabbit: 'cooked_rabbit', cod: 'cooked_cod', salmon: 'cooked_salmon',
+  potato: 'baked_potato', kelp: 'dried_kelp' };
+
 /**
- * 弄点吃的：优先打猎 + 烤熟，退而求其次找苹果/小麦。
+ * 弄点吃的：先利用现有小麦与生食，再逐只猎取附近可见动物。
  */
 async function cookFood({ actions, nav, state, ctx, count = 4 }) {
   const steps = [];
   const before = actions.inventoryMap();
 
-  // 已经有熟食就直接返回
-  const cookedHave = ['cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton', 'bread', 'baked_potato'].reduce(
-    (s, n) => s + actions.countItem(n),
-    0,
-  );
+  const haveFood = () => READY_FOOD.reduce((n, name) => n + actions.countItem(name), 0);
+  const cookedHave = haveFood();
   if (cookedHave >= count) {
     return skillResult(true, { steps, note: `已经有 ${cookedHave} 份熟食，够吃了` });
   }
 
-  // 打猎获取生肉
-  for (const mob of ['cow', 'pig', 'chicken', 'sheep']) {
-    if (ctx.aborted) throw new CancelledError('已取消');
-    if (actions.countItem('cooked_beef') + actions.countItem('cooked_porkchop') + actions.countItem('cooked_chicken') + actions.countItem('cooked_mutton') >= count) break;
-    const rawName = { cow: 'beef', pig: 'porkchop', chicken: 'chicken', sheep: 'mutton' }[mob];
-    const need = count - actions.countItem(`cooked_${rawName}`);
-    const r = await huntAnimal({ actions, nav, state, ctx, mob, want: Math.max(1, need) });
-    steps.push(...r.steps);
-    // 顺手熔炼刚打到的生肉
-    if (actions.countItem(rawName) > 0) {
-      const sm = await mining.smeltOres({ actions, nav, state, ctx, item: rawName, count: actions.countItem(rawName) });
-      steps.push(...sm.steps);
-    }
-  }
-
-  // 不够就用面包补
-  if (actions.countItem('bread') < count && actions.countItem('wheat') >= 3) {
+  // 先用背包里已有的原料：小麦比重新打猎和生炉子便宜。
+  if (actions.countItem('wheat') >= 3) {
     try {
-      const breadR = await actions.craft({ item: 'bread', count: Math.floor(actions.countItem('wheat') / 3), signal: ctx.signal })
+      if (!actions.bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 })) {
+        if (!actions.countItem('crafting_table') && wood.countPlanks(actions) < 4 && wood.totalLogs(actions) === 0) {
+          ctx.progress('做面包缺工作台，先就近取一根木头');
+          const logs = await wood.chopTree({ actions, nav, state, ctx, want: 1, radius: 24, maxAttempts: 4 });
+          steps.push(...logs.steps);
+          if (!logs.ok) throw new Error(logs.reason || '没有做工作台的木材');
+        }
+        const table = await wood.ensureCraftingTable({ actions, ctx, steps });
+        if (!table.ok) throw new Error(table.reason || '工作台没准备好');
+      }
+      const breadR = await actions.craft({ item: 'bread', count: Math.min(count - haveFood(), Math.floor(actions.countItem('wheat') / 3)), signal: ctx.signal });
       if (breadR.ok) { steps.push('烤面包'); } else { log.info('烤面包没做出来（craft 返回 ok=false）'); }
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
       log.info(`做面包失败：${err.message}`);
     }
   }
 
+  const cookExisting = async () => {
+    for (const raw of Object.keys(COOKABLE)) {
+      ctx.checkAborted();
+      const needed = count - haveFood();
+      if (needed <= 0) break;
+      if (actions.countItem(raw) <= 0) continue;
+      const sm = await mining.smeltOres({ actions, nav, state, ctx, item: raw, count: Math.min(needed, actions.countItem(raw)) });
+      steps.push(...sm.steps);
+      if (!sm.ok) steps.push(sm.reason || `无法烹饪 ${raw}`);
+    }
+  };
+  await cookExisting();
+
+  // 只追踪当前看得见的动物，逐只补齐；别为不存在的牛、猪各绕一整圈。
+  for (let i = 0; i < count && haveFood() < count; i += 1) {
+    ctx.checkAborted();
+    const candidates = ['cow', 'pig', 'sheep', 'chicken', 'rabbit'].map((mob) => ({ mob, entity: findAnimal(actions, mob) }))
+      .filter((t) => t.entity).sort((a, b) => a.entity.position.distanceTo(actions.bot.entity.position) - b.entity.position.distanceTo(actions.bot.entity.position));
+    if (!candidates.length || actions.bot.health <= 8) break;
+    const r = await huntAnimal({ actions, nav, state, ctx, mob: candidates[0].mob, want: 1 });
+    steps.push(...r.steps);
+    if (!r.ok) break;
+    await cookExisting();
+  }
+
   const after = actions.inventoryMap();
   const produced = positiveOnly(wood.diffOf(before, after));
-  const foodNow = ['cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton', 'bread', 'apple', 'carrot', 'baked_potato'].reduce(
-    (s, n) => s + actions.countItem(n),
-    0,
-  );
-  return skillResult(foodNow > 0, {
+  const foodNow = haveFood();
+  const ok = foodNow >= count || READY_FOOD.some((n) => produced[n] > 0);
+  return skillResult(ok, {
     steps,
     produced,
     note: `现在有 ${foodNow} 份食物`,
-    reason: foodNow > 0 ? null : '附近没有动物也没有农作物，可以换个地方或先种地',
+    reason: ok ? null : '没有补充到可吃的食物；先检查熔炉/燃料，或寻找动物和农作物，避免原地重复做饭',
   });
 }
 

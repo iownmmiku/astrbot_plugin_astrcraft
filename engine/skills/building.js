@@ -20,8 +20,28 @@ const mining = require('./mining');
 /** 优先使用的建材，从差到好；缺什么就现挖什么 */
 const BUILD_MATERIALS = [
   'cobblestone', 'cobbled_deepslate', 'stone', 'dirt', 'oak_planks', 'birch_planks', 'spruce_planks',
+  'jungle_planks', 'acacia_planks', 'dark_oak_planks', 'mangrove_planks', 'cherry_planks',
+  'pale_oak_planks', 'crimson_planks', 'warped_planks',
   'andesite', 'granite', 'diorite', 'tuff', 'sandstone', 'netherrack', 'blackstone', 'deepslate',
 ];
+const DOOR_NAMES = BUILD_MATERIALS.filter((n) => n.endsWith('_planks')).map((n) => n.replace('_planks', '_door'));
+
+function checkBudget(ctx) {
+  if (typeof ctx.checkAborted === 'function') ctx.checkAborted();
+  else if (ctx.aborted) throw new CancelledError('建造被取消');
+}
+
+function solidSafe(block) {
+  return !!block && block.boundingBox === 'block' && !['lava', 'water', 'magma_block', 'cactus', 'fire', 'powder_snow'].includes(block.name);
+}
+
+function nextMaterial(actions, material) {
+  return (material.names || [matName(material)]).find((n) => actions.countItem(n) > 0) || null;
+}
+
+function recordPlacement(material, name) {
+  if (material.consumed) material.consumed[name] = (material.consumed[name] || 0) + 1;
+}
 
 /**
  * 建庇护所。
@@ -34,6 +54,10 @@ const BUILD_MATERIALS = [
 async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, door = true, torch = true }) {
   const bot = actions.bot;
   const steps = [];
+  const inner = Math.max(2, Math.min(6, Math.floor(Number(size) || 3)));
+  const outer = inner + 2;
+  const wallHeight = 2;
+  checkBudget(ctx);
 
   // ---- 0. 先回到地表。
   // 挖完矿她可能在洞里，而洞里既没有平地也没有放方块的余地——
@@ -45,7 +69,7 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
   }
 
   // ---- 1. 选点：以当前位置为中心的平地
-  let origin = await pickFlatSpot({ actions, ctx, size });
+  let origin = await pickFlatSpot({ actions, ctx, size: inner });
   if (!origin) {
     // 实在没有像样的平地：就地整平（clearFootprint 会挖掉高出的部分、fillFloor 会补洞）。
     // 真人在山坡上盖房也是先刨出一块平台，而不是换个地方再试。
@@ -55,6 +79,8 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
     steps.push('附近没有平地，就地整平');
   }
   ctx.progress(`选好建造位置 (${origin.x}, ${origin.y}, ${origin.z})`);
+  log.info(`建造选址 (${origin.x},${origin.y},${origin.z})，当前位置 (${bot.entity.position.x.toFixed(1)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(1)})`);
+  checkBudget(ctx);
 
   // ---- 1.5 先走到建造点。
   // 这一步以前没有，实测后果很典型：她刚挖完矿待在洞里（y=56），
@@ -74,31 +100,30 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
     }
   }
 
-  // ---- 2. 备料
-  const inner = Math.max(2, Math.min(6, Number(size) || 3));
-  const outer = inner + 2; // 外框边长
-  // 墙高 2 就够站人（加上屋顶正好 3 格净空），用料比 3 省三分之一。
-  // 真人的第一间过夜小屋也是两层高。
-  const wallHeight = 2;
-  const needed = estimateMaterials({ inner, wallHeight, roof, door, torch });
-  const material = await ensureMaterials({ actions, nav, state, ctx, steps, needed });
-  if (!material) {
-    return skillResult(false, { steps, reason: '材料凑不齐（需要圆石/泥土/木板之类的方块，还要火把和门）' });
-  }
-  ctx.progress(`建材准备完毕：${material.name}（约 ${actions.countItem(material.name)} 个）`);
-
-  // ---- 3. 清空场地（把内部与墙体位置的杂物挖掉）
+  checkBudget(ctx);
+  // 清场后按真实缺格备料；地板本来完整时无需另挖地板预留量。
   await clearFootprint({ actions, ctx, origin, outer, wallHeight, steps });
+  const doorPos = door ? pickDoorPosition({ origin, outer }) : null;
+  const inspect = () => inspectShelter({ actions, origin, outer, wallHeight, roof, doorPos });
+  const needed = { door: door ? 1 : 0, torch: torch ? 2 : 0, blocks: () => inspect().missing_blocks.length };
+  const material = await ensureMaterials({ actions, nav, state, ctx, steps, needed, origin, outer });
+  if (!material) {
+    return skillResult(false, {
+      steps, reason: '材料凑不齐，停止建造以免留下无法过夜的半栋屋子',
+      extra: { shelter: shelterReport({ origin, inner, outer, wallHeight, material: null, doorPos, inspection: inspect() }) },
+    });
+  }
+  ctx.progress(`建材准备完毕：共 ${material.names.reduce((n, name) => n + actions.countItem(name), 0)} 个可用方块`);
+  checkBudget(ctx);
 
+  // 取材可能把人带回矿坑。先回到有地板的施工位置，再围墙，避免把自己封在外面。
+  await moveToBuildPosition({ actions, nav, ctx, origin, outer });
   // ---- 4. 打地基：把脚下垫平（有洞就填）
-  await fillFloor({ actions, ctx, origin, outer, material, steps });
+  await fillFloor({ actions, nav, ctx, origin, outer, material, steps });
+  await moveToBuildPosition({ actions, nav, ctx, origin, outer });
 
   // ---- 5. 砌墙（从外圈开始，从下往上；门的位置留空）
-  const doorPos = door ? pickDoorPosition({ origin, outer }) : null;
-  const placed = await buildWalls({ actions, nav, ctx, origin, outer, wallHeight, material, doorPos, steps });
-  if (placed === 0) {
-    return skillResult(false, { steps, reason: '一块墙都没放上去，可能没站在合适的依附位置上' });
-  }
+  await buildWalls({ actions, nav, ctx, origin, outer, wallHeight, material, doorPos, steps });
 
   // ---- 6. 屋顶
   if (roof) {
@@ -107,7 +132,7 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
 
   // ---- 7. 门
   if (door && doorPos) {
-    await installDoor({ actions, ctx, doorPos, material, steps });
+    await installDoor({ actions, nav, ctx, doorPos, material, steps });
   }
 
   // ---- 8. 火把
@@ -115,57 +140,68 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
     await placeTorches({ actions, ctx, origin, inner, steps });
   }
 
-  // ---- 9. 进屋验收
-  const inside = checkInside({ actions, origin, inner });
-  if (!inside) {
-    ctx.progress('走到屋里确认');
-    try {
-      await nav.goTo({ x: origin.x + 0.5 + Math.floor(outer / 2), y: null, z: origin.z + 0.5 + Math.floor(outer / 2), range: 1, signal: ctx.signal, timeoutMs: 15000 });
-    } catch (err) {
-      if (!(err instanceof CancelledError)) log.debug(`进屋失败：${err.message}`);
+  // 任务成功必须来自世界验收，不能把 roof/door 请求参数当作建成结果。
+  checkBudget(ctx);
+  let inspection = inspect();
+  if (!inspection.complete) {
+    return skillResult(false, {
+      steps, consumed: material.consumed,
+      reason: `庇护所未完成：地板缺 ${inspection.missing_floor.length} 格、墙缺 ${inspection.missing_walls.length} 格、屋顶缺 ${inspection.missing_roof.length} 格${doorPos && !inspection.has_door ? '、门未装好' : ''}`,
+      extra: { shelter: shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }) },
+    });
+  }
+
+  // 房屋已成形，后续进屋和家具操作不能通过自动挖墙寻路破坏它。
+  const { executionContext } = require('../goals');
+  return executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false }, async () => {
+    // ---- 9. 进屋验收
+    const inside = checkInside({ actions, origin, inner });
+    if (!inside) {
+      ctx.progress('走到屋里确认');
+      try {
+        await nav.goTo({ x: origin.x + 0.5 + Math.floor(outer / 2), y: origin.y, z: origin.z + 0.5 + Math.floor(outer / 2), range: 0.7, signal: ctx.signal, timeoutMs: 15000, segmented: false });
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        checkBudget(ctx);
+        log.info(`进屋失败：${err.message}`);
+      }
     }
-  }
 
-  // ---- 10. 布置家具：箱子、床
-  //
-  // 用户的要求："建完自己的房间后，她会放置箱子、床等工具"。
-  // 早期房子盖完就结束了，里面空空的——不像"家"，东西也还是散在背包里。
-  // 这一步做三件事（每件都能失败，失败只记下来不中断）：
-  //   1) 有木板就做个箱子放屋里，然后把背包里的杂物存进去
-  //   2) 有床就放屋里（晚上能睡过去）
-  //   3) 有羊毛+木板就做张床再放
-  const furnished = { chest: false, bed: false, stored: false, skipped: [] };
-  try {
-    await furnish({ actions, nav, state, ctx, origin, inner, steps, out: furnished });
-  } catch (err) {
-    if (err instanceof CancelledError) throw err;
-    log.debug(`布置家具失败（不影响房子本身）：${err.message}`);
-  }
+    // ---- 10. 布置家具：箱子、床
+    //
+    // 用户的要求："建完自己的房间后，她会放置箱子、床等工具"。
+    // 早期房子盖完就结束了，里面空空的——不像"家"，东西也还是散在背包里。
+    // 这一步做三件事（每件都能失败，失败只记下来不中断）：
+    //   1) 有木板就做个箱子放屋里，然后把背包里的杂物存进去
+    //   2) 有床就放屋里（晚上能睡过去）
+    //   3) 有羊毛+木板就做张床再放
+    const furnished = { chest: false, bed: false, stored: false, skipped: [] };
+    checkBudget(ctx);
+    try {
+      await furnish({ actions, nav, state, ctx, origin, inner, steps, out: furnished });
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      log.debug(`布置家具失败（不影响房子本身）：${err.message}`);
+    }
 
-  const shelter = {
-    origin,
-    size: outer,
-    inner,
-    wall_height: wallHeight,
-    material: material.name,
-    has_roof: roof,
-    has_door: !!(door && doorPos),
-    door_position: doorPos,
-    furnished,
-  };
+    checkBudget(ctx);
+    inspection = inspect();
+    const shelter = { ...shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }), furnished };
 
-  const extras = [
-    roof ? '有屋顶' : '',
-    door && doorPos ? '有门' : '',
-    furnished.chest ? '有箱子' : '',
-    furnished.bed ? '有床' : '',
-  ].filter(Boolean);
+    const extras = [
+      shelter.has_roof ? '有屋顶' : '',
+      shelter.has_door ? '有门' : '',
+      furnished.chest ? '有箱子' : '',
+      furnished.bed ? '有床' : '',
+    ].filter(Boolean);
 
-  return skillResult(true, {
-    steps,
-    consumed: { [material.name]: placed },
-    note: `庇护所建好了：外框 ${outer}×${outer}、墙高 ${wallHeight}${extras.length ? '、' + extras.join('、') : ''}，位置 (${origin.x}, ${origin.y}, ${origin.z})`,
-    extra: { shelter },
+    return skillResult(inspection.complete, {
+      steps,
+      consumed: material.consumed,
+      note: `${inspection.complete ? '庇护所建好了' : '庇护所尚未完整'}：外框 ${outer}×${outer}、墙高 ${wallHeight}${extras.length ? '、' + extras.join('、') : ''}，位置 (${origin.x}, ${origin.y}, ${origin.z})`,
+      extra: { shelter },
+      reason: inspection.complete ? null : '验收时结构已发生变化，庇护所尚未完整',
+    });
   });
 }
 
@@ -175,6 +211,7 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
  * 每一项都是"能就做、不能就跳过"——不因为缺羊毛就让整栋房子算失败。
  */
 async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) {
+  checkBudget(ctx);
   const bot = actions.bot;
   // 屋内的两个位置：一侧放箱子，另一侧放床
   const cx = origin.x + 1;
@@ -193,6 +230,8 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
         chestCount = actions.countItem('chest');
         steps.push({ action: 'craft_chest', ok: chestCount > 0 });
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        checkBudget(ctx);
         log.info(`做箱子失败：${err.message}`);
         out.skipped.push('箱子（木板不够或合成失败）');
       }
@@ -205,9 +244,11 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
     try {
       const floorY = origin.y;
       await actions.place({ x: cx, y: floorY, z: cz, item: 'chest', signal: ctx.signal });
-      out.chest = true;
-      steps.push({ action: 'place_chest', ok: true });
+      out.chest = blockAt(bot, cx, floorY, cz)?.name === 'chest';
+      steps.push({ action: 'place_chest', ok: out.chest });
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.info(`放箱子失败：${err.message}`);
       out.skipped.push('放箱子');
     }
@@ -231,6 +272,8 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
         bed = BEDS.find((n) => actions.countItem(n) > 0) || null;
         steps.push({ action: 'craft_bed', ok: !!bed });
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        checkBudget(ctx);
         log.info(`做床失败：${err.message}`);
       }
     } else {
@@ -241,9 +284,11 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
     ctx.progress('把床放进屋里');
     try {
       await actions.place({ x: cx + 1, y: origin.y, z: cz, item: bed, signal: ctx.signal });
-      out.bed = true;
-      steps.push({ action: 'place_bed', ok: true });
+      out.bed = blockAt(bot, cx + 1, origin.y, cz)?.name === bed;
+      steps.push({ action: 'place_bed', ok: out.bed });
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.info(`放床失败：${err.message}`);
       out.skipped.push('放床');
     }
@@ -288,6 +333,7 @@ async function pickFlatSpot({ actions, ctx, size }) {
   // 先算出每个候选点的地面高度，再按与当前高度的接近程度排序。
   const scored = [];
   for (const c of cands) {
+    checkBudget(ctx);
     const y = groundAt(c.x, c.z);
     if (y === null) continue;
     scored.push({ x: c.x, y, z: c.z, dy: Math.abs(y - Math.floor(p.y)) });
@@ -303,11 +349,12 @@ async function pickFlatSpot({ actions, ctx, size }) {
   }
   scored.sort((a, b) => a.dy - b.dy);
 
-  // 两轮筛选：先找真正平的（≤2），再放宽到 ≤3。
+  // 先选没有高差的地面。附近有完整平台时，不把刚挖过的矿坑当作首选地基。
   // 放宽是有道理的——clearFootprint 会把高出的部分挖掉（墙高 3），
   // 等于她自己动手整平；严格只认"天然完美平地"会在山地/丛林里直接放弃。
-  for (const tolerance of [2, 3]) {
+  for (const tolerance of [0, 1, 2, 3]) {
     for (const c of scored) {
+      checkBudget(ctx);
       await new Promise((r) => setImmediate(r));
       // 先粗查 3×3：绝大多数候选点在这里就被否掉，省掉整片区域的读取
       if (!isFlatEnough(bot, c.x, c.y, c.z, 2, tolerance, groundAt)) continue;
@@ -369,6 +416,13 @@ function isFlatEnough(bot, x, y, z, outer, tolerance = 2, groundAt = null) {
       // 地面上方不能是水
       const feet = blockAt(bot, gx, g, gz);
       if (feet && (feet.name === 'water' || feet.name === 'flowing_water' || feet.name === 'lava')) return false;
+      // 已放置的工作站和灯具另选位置避开，避免清场被白名单拦截后仍在占用格上砌墙。
+      for (const dy of [0, 1]) {
+        const name = blockAt(bot, gx, y + dy, gz)?.name || '';
+        if (['crafting_table', 'furnace', 'blast_furnace', 'smoker', 'chest', 'trapped_chest',
+          'barrel', 'ender_chest', 'torch', 'wall_torch', 'lantern', 'soul_torch', 'soul_wall_torch', 'soul_lantern'].includes(name) ||
+          name.endsWith('_door') || name.endsWith('_bed') || name.endsWith('_shulker_box')) return false;
+      }
       minY = Math.min(minY, g);
       maxY = Math.max(maxY, g);
       // 提前退出：已经超出容差就不用继续读了
@@ -378,86 +432,108 @@ function isFlatEnough(bot, x, y, z, outer, tolerance = 2, groundAt = null) {
   return maxY - minY <= tolerance;
 }
 
-function estimateMaterials({ inner, wallHeight, roof, door, torch }) {
-  const outer = inner + 2;
-  const wallBlocks = outer * outer - inner * inner; // 一圈墙的每层方块数
-  const walls = wallBlocks * wallHeight;
-  const roofBlocks = roof ? outer * outer : 0;
-  // 地板补洞与损耗的预留。**不要给太大**：
-  // 早期是 floorMiss=6 + 8，size=3 时合计要 87 块圆石——
-  // 实测她为了凑料挖了 200 秒石头，还没盖房就超时了。
-  // 真人的第一间小屋也就三四十块料。
-  const floorMiss = 4;
-  const buffer = 4;
+function inspectShelter({ actions, origin, outer, wallHeight, roof, doorPos }) {
+  const bot = actions.bot;
+  const missing_floor = [], missing_walls = [], missing_roof = [];
+  for (let dx = 0; dx < outer; dx += 1) {
+    for (let dz = 0; dz < outer; dz += 1) {
+      const x = origin.x + dx, z = origin.z + dz;
+      const floor = { x, y: origin.y - 1, z };
+      if (!solidSafe(blockAt(bot, x, floor.y, z))) missing_floor.push(floor);
+      if (dx === 0 || dz === 0 || dx === outer - 1 || dz === outer - 1) {
+        if (!doorPos || x !== doorPos.x || z !== doorPos.z) {
+          for (let dy = 0; dy < wallHeight; dy += 1) {
+            const cell = { x, y: origin.y + dy, z };
+            if (!solidSafe(blockAt(bot, x, cell.y, z))) missing_walls.push(cell);
+          }
+        }
+      }
+      if (roof) {
+        const cell = { x, y: origin.y + wallHeight, z };
+        if (!solidSafe(blockAt(bot, x, cell.y, z))) missing_roof.push(cell);
+      }
+    }
+  }
+  let has_door = false;
+  if (doorPos) {
+    const lower = blockAt(bot, doorPos.x, doorPos.y, doorPos.z);
+    const upper = blockAt(bot, doorPos.x, doorPos.y + 1, doorPos.z);
+    const half = (b) => typeof b?.getProperties === 'function' ? b.getProperties().half : null;
+    has_door = !!lower && !!upper && lower.name.endsWith('_door') && lower.name === upper.name &&
+      (!half(lower) || half(lower) === 'lower') && (!half(upper) || half(upper) === 'upper');
+  }
   return {
-    blocks: walls + roofBlocks + floorMiss + buffer,
-    door: door ? 1 : 0,
-    torch: torch ? 2 : 0,
+    missing_floor, missing_walls, missing_roof,
+    missing_blocks: [...missing_floor, ...missing_walls, ...missing_roof],
+    has_roof: !!roof && missing_roof.length === 0, has_door,
+    complete: missing_floor.length === 0 && missing_walls.length === 0 && missing_roof.length === 0 && (!doorPos || has_door),
+  };
+}
+
+function shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }) {
+  return {
+    origin, size: outer, inner, wall_height: wallHeight,
+    material: material?.name || null, materials: material?.names || [],
+    has_roof: inspection.has_roof, has_door: inspection.has_door,
+    door_position: doorPos, complete: inspection.complete,
+    missing_floor: inspection.missing_floor, missing_walls: inspection.missing_walls, missing_roof: inspection.missing_roof,
   };
 }
 
 /** 保证有足够的建材、门、火把；不够就去弄 */
-async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
-  // **用料是估算，别为了差一两块去挖几分钟矿。**
-  // 实测：她有 64 块圆石、配方算出来要 65 块，就卡在"再挖 1 块"上耗了 300 秒直到任务超时。
-  // 真玩家也会拿手头的东西先盖起来——少一两块顶多屋顶缺个角。
-  const minNeeded = Math.max(12, Math.floor(needed.blocks * 0.85));
-
-  // 先看现有方块够不够
-  let material = BUILD_MATERIALS.find((n) => actions.countItem(n) >= minNeeded);
-  if (!material) {
-    // 挑一种手头最多的
-    const map = actions.inventoryMap();
-    const best = BUILD_MATERIALS.map((n) => ({ n, c: map[n] || 0 })).sort((a, b) => b.c - a.c)[0];
-    material = best && best.c > 0 ? best.n : null;
-  }
-
-  // 不够就挖石头（最多补 24 块，不无限追）
-  if (!material || actions.countItem(material) < minNeeded) {
-    const lacking = Math.min(24, Math.max(4, minNeeded - (material ? actions.countItem(material) : 0)));
-    ctx.progress(`建材不足，去挖 ${lacking} 个圆石`);
-    const r = await mining.mineStone({ actions, nav, state, ctx, want: lacking });
-    steps.push(...r.steps);
-    material = BUILD_MATERIALS.find((n) => actions.countItem(n) >= 8) || material || 'cobblestone';
-    if (actions.countItem(material) < 8) {
-      // 石头都挖不到，退而求其次用泥土
-      const dirt = actions.countItem('dirt');
-      if (dirt >= 8) material = 'dirt';
-      else return null;
-    }
-  }
-
-  // 门
-  if (needed.door && actions.countItem('oak_door') === 0) {
-    for (const doorName of ['oak_door', 'birch_door', 'spruce_door', 'jungle_door', 'acacia_door', 'dark_oak_door']) {
-      if (actions.countItem(doorName) > 0) break;
-      try {
-        // 门需要 6 个木板 → 3 个木板（每种门 3 个木板做 3 扇门，材料够就做）
-        if (wood.countPlanks(actions) < 3) {
-          const pk = await wood.makePlanks({ actions, ctx, want: 3 });
-          steps.push(...pk.steps);
-        }
-        if (wood.countPlanks(actions) >= 3) {
-          const doorR = await actions.craft({ item: doorName, count: 1, signal: ctx.signal });
-          if (doorR.ok) {
-
-            steps.push(`合成 ${doorName}`);
-
-          } else {
-
-            log.info(`做门没产出（craft 返回 ok=false）：${doorName}`);
-
-            steps.push(`做门没产出：${doorName}`);
-
-          }
-          break;
-        }
-      } catch (err) {
-        log.info(`做门失败：${err.message}`);
-        break;
+async function ensureMaterials({ actions, nav, state, ctx, steps, needed, origin, outer }) {
+  checkBudget(ctx);
+  // 门先备好，避免把门所需木板当墙料用掉；配方需要同种木板六块。
+  if (needed.door && !DOOR_NAMES.some((n) => actions.countItem(n) > 0)) {
+    try {
+      const tableExists = actions.countItem('crafting_table') > 0 ||
+        actions.bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 });
+      const candidates = () => wood.LOG_NAMES.map((logName) => {
+        const planks = wood.planksOf(logName);
+        const otherPlanks = wood.countPlanks(actions) - actions.countItem(planks);
+        const wanted = 6 + (tableExists ? 0 : Math.max(0, 4 - otherPlanks));
+        return { logName, planks, wanted, have: actions.countItem(planks) + actions.countItem(logName) * 4 };
+      }).sort((a, b) => b.have - a.have);
+      // 现有一根原木也可能不够；按门和缺失工作台的实际用量补齐。
+      // 每轮重新选同种材料，避免混合六种木板却误以为能合成门。
+      for (let attempt = 0; attempt < 3 && !candidates().some((c) => c.have >= c.wanted); attempt += 1) {
+        checkBudget(ctx);
+        const best = candidates()[0];
+        const before = wood.totalLogs(actions);
+        const want = Math.max(1, Math.ceil((best.wanted - best.have) / 4));
+        ctx.progress(`装门还缺材料，取 ${want} 根原木`);
+        const r = await wood.chopTree({ actions, nav, state, ctx, want, maxAttempts: 4 });
+        steps.push(...(r.steps || []));
+        checkBudget(ctx);
+        if (wood.totalLogs(actions) <= before) break;
       }
+      const candidate = candidates().find((c) => c.have >= c.wanted);
+      const planks = candidate?.planks;
+      if (candidate) {
+        const deficit = Math.max(0, candidate.wanted - actions.countItem(planks));
+        if (deficit) {
+          const plankResult = await actions.craft({ item: planks, count: Math.ceil(deficit / 4) * 4, signal: ctx.signal });
+          checkBudget(ctx);
+          if (!plankResult.ok) steps.push(`做门木板没有产出：${planks}`);
+        }
+      }
+      if (planks && actions.countItem(planks) >= 6) {
+        const table = await wood.ensureCraftingTable({ actions, ctx, steps });
+        checkBudget(ctx);
+        if (!table.ok) { steps.push(`工作台准备失败：${table.reason || table.note || '没有可用工作台'}`); return null; }
+        const doorName = planks.replace('_planks', '_door');
+        const doorResult = await actions.craft({ item: doorName, count: 1, signal: ctx.signal });
+        checkBudget(ctx);
+        if (actions.countItem(doorName) > 0) steps.push(`合成 ${doorName}`);
+        else steps.push(`做门没有产出：${doorName}（ok=${!!doorResult.ok}）`);
+      } else steps.push('门材料不足：需要六块同种木板');
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
+      steps.push(`做门失败：${describeFailure(err)}`);
     }
   }
+  if (needed.door && !DOOR_NAMES.some((n) => actions.countItem(n) > 0)) return null;
 
   // 火把
   if (needed.torch && actions.countItem('torch') < needed.torch) {
@@ -469,6 +545,8 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
             await actions.smelt({ item: wood.LOG_NAMES.find((n) => actions.countItem(n) > 0), count: 1, signal: ctx.signal });
             steps.push('烧木炭');
           } catch (err) {
+            if (err instanceof CancelledError) throw err;
+            checkBudget(ctx);
             log.info(`烧木炭失败：${err.message}`);
           }
         }
@@ -478,11 +556,75 @@ async function ensureMaterials({ actions, nav, state, ctx, steps, needed }) {
         if (torchR4.ok) { steps.push('合成火把'); } else { log.info('火把没做出来（craft 返回 ok=false，不致命）'); }
       }
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.debug(`做火把失败（不致命）：${err.message}`);
     }
   }
-
-  return { name: material };
+  // 只补实际缺量，合并圆石/泥土/各类木板；采矿改变地基后重新读世界。
+  const available = () => BUILD_MATERIALS.reduce((n, name) => n + actions.countItem(name), 0);
+  // 背包原木也是现成建材，不应留着原木却下矿补墙料。
+  for (const logName of wood.LOG_NAMES) {
+    checkBudget(ctx);
+    const deficit = needed.blocks() - available();
+    if (deficit <= 0) break;
+    const planks = wood.planksOf(logName);
+    if (!BUILD_MATERIALS.includes(planks)) continue;
+    const logs = Math.min(actions.countItem(logName), Math.ceil(deficit / 4));
+    if (!logs) continue;
+    const result = await actions.craft({ item: planks, count: logs * 4, signal: ctx.signal });
+    checkBudget(ctx);
+    if (result.ok) steps.push(`把现有 ${logName} 转成 ${result.produced} 块木板作建材`);
+  }
+  while (available() < needed.blocks()) {
+    checkBudget(ctx);
+    const before = available();
+    const lacking = needed.blocks() - before;
+    ctx.progress(`建材不足，补 ${lacking} 个方块`);
+    // 在预定地基外取材；挖地板得到一块建材，却新增一格待补地板，永远补不齐。
+    const p = actions.bot.entity.position;
+    if (p.x >= origin.x - 3 && p.x <= origin.x + outer + 3 &&
+        p.z >= origin.z - 3 && p.z <= origin.z + outer + 3) {
+      const midX = origin.x + outer / 2, midZ = origin.z + outer / 2;
+      const sites = [
+        { x: origin.x - 8 + 0.5, y: origin.y, z: midZ },
+        { x: origin.x + outer + 7.5, y: origin.y, z: midZ },
+        { x: midX, y: origin.y, z: origin.z - 8 + 0.5 },
+        { x: midX, y: origin.y, z: origin.z + outer + 7.5 },
+      ].filter((point) => {
+        const cx = Math.floor(point.x), cz = Math.floor(point.z);
+        if (!solidSafe(blockAt(actions.bot, cx, origin.y - 1, cz)) ||
+            ![0, 1].every((dy) => blockAt(actions.bot, cx, origin.y + dy, cz)?.boundingBox === 'empty')) return false;
+        let ground = 0;
+        for (const dx of [-1, 0, 1]) for (const dz of [-1, 0, 1]) {
+          if (solidSafe(blockAt(actions.bot, cx + dx, origin.y - 1, cz + dz))) ground += 1;
+        }
+        return ground >= 7;
+      }).sort((a, b) => distance(p, a) - distance(p, b));
+      let moved = false, lastError = null;
+      for (const site of sites.slice(0, 3)) {
+        checkBudget(ctx);
+        try {
+          await nav.goTo({ ...site, range: 1, signal: ctx.signal, timeoutMs: 10000, segmented: false, xzOnly: true });
+          if (Math.abs(actions.bot.entity.position.y - site.y) > 1.2) throw new Error('取材点仍有高度差，未走到安全地面');
+          moved = true;
+          break;
+        } catch (err) {
+          if (err instanceof CancelledError) throw err;
+          checkBudget(ctx);
+          lastError = err;
+        }
+      }
+      if (!moved) throw lastError || new Error('地基外没有安全取材点');
+      checkBudget(ctx);
+    }
+    const r = await mining.mineStone({ actions, nav, state, ctx, want: lacking });
+    steps.push(...(r.steps || []));
+    checkBudget(ctx);
+    if (available() <= before) return null;
+  }
+  const names = BUILD_MATERIALS.filter((n) => actions.countItem(n) > 0);
+  return { name: names[0] || null, names, consumed: {} };
 }
 
 /** 挖掉占位方块（内部与墙线），并压平地面 */
@@ -521,12 +663,13 @@ async function clearFootprint({ actions, ctx, origin, outer, wallHeight, steps }
 
   let cleared = 0;
   for (const t of toClear) {
-    if (ctx.aborted) throw new CancelledError('建造被取消');
+    checkBudget(ctx);
     try {
       await actions.dig({ x: t.x, y: t.y, z: t.z, signal: ctx.signal, collect: true, reach: true });
       cleared += 1;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.info(`清理 (${t.x},${t.y},${t.z}) 失败：${err.message}`);
     }
   }
@@ -534,31 +677,78 @@ async function clearFootprint({ actions, ctx, origin, outer, wallHeight, steps }
 }
 
 /** 把地板上的洞填上，保证内部是实心平面 */
-async function fillFloor({ actions, ctx, origin, outer, material, steps }) {
+async function fillFloor({ actions, nav, ctx, origin, outer, material, steps }) {
   const bot = actions.bot;
   const holes = [];
-  for (let dx = -1; dx <= outer; dx += 1) {
-    for (let dz = -1; dz <= outer; dz += 1) {
+  for (let dx = 0; dx < outer; dx += 1) {
+    for (let dz = 0; dz < outer; dz += 1) {
       const x = origin.x + dx;
       const z = origin.z + dz;
       const floor = blockAt(bot, x, origin.y - 1, z);
-      if (!floor || floor.boundingBox !== 'block') holes.push({ x, y: origin.y - 1, z });
+      if (!solidSafe(floor)) holes.push({ x, y: origin.y - 1, z });
     }
   }
   if (!holes.length) return;
   ctx.progress(`补地板（${holes.length} 处）`);
   let filled = 0;
-  for (const h of holes) {
-    if (ctx.aborted) throw new CancelledError('建造被取消');
-    if (actions.countItem(material.name) <= 0) break;
+  // 先补有依附面的边缘，再向空洞中央延伸。
+  const supported = (h) => [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+    .some(([dx, dy, dz]) => solidSafe(blockAt(bot, h.x + dx, h.y + dy, h.z + dz)));
+  while (holes.length) {
+    const index = holes.findIndex(supported);
+    if (index < 0) break;
+    const [h] = holes.splice(index, 1);
+    checkBudget(ctx);
+    const item = nextMaterial(actions, material);
+    if (!item) break;
     try {
-      await actions.place({ x: h.x, y: h.y, z: h.z, item: material.name, signal: ctx.signal, reach: true });
-      filled += 1;
+      if (distance(bot.entity.position, { x: h.x + 0.5, y: h.y + 0.5, z: h.z + 0.5 }) > 4) {
+        await moveToBuildPosition({ actions, nav, ctx, origin, outer, near: h });
+      }
+      await actions.place({ x: h.x, y: h.y, z: h.z, item, signal: ctx.signal, reach: false });
+      if (solidSafe(blockAt(bot, h.x, h.y, h.z))) { filled += 1; recordPlacement(material, item); }
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.info(`补地板 (${h.x},${h.y},${h.z}) 失败：${err.message}`);
     }
   }
   if (filled) steps.push(`补地板 ${filled} 格`);
+}
+
+/** 在完整地板上施工；小屋中心可以直接够到所有墙和屋顶，不必追着墙格寻路。 */
+async function moveToBuildPosition({ actions, nav, ctx, origin, outer, near = null }) {
+  checkBudget(ctx);
+  const bot = actions.bot;
+  const center = { x: origin.x + outer / 2, y: origin.y, z: origin.z + outer / 2 };
+  const candidates = [];
+  for (let dx = -1; dx <= outer; dx += 1) {
+    for (let dz = -1; dz <= outer; dz += 1) {
+      const x = origin.x + dx, z = origin.z + dz;
+      if (!solidSafe(blockAt(bot, x, origin.y - 1, z))) continue;
+      if ([0, 1].some((dy) => blockAt(bot, x, origin.y + dy, z)?.boundingBox !== 'empty')) continue;
+      const point = { x: x + 0.5, y: origin.y, z: z + 0.5 };
+      if (near && distance(point, { x: near.x + 0.5, y: near.y + 0.5, z: near.z + 0.5 }) > 3.8) continue;
+      candidates.push(point);
+    }
+  }
+  candidates.sort((a, b) => distance(a, near || center) - distance(b, near || center));
+  let lastError = null;
+  for (const point of candidates.slice(0, 3)) {
+    checkBudget(ctx);
+    if (distance(bot.entity.position, point) < 0.8) return;
+    try {
+      await nav.goTo({ ...point, range: 0.7, signal: ctx.signal, timeoutMs: 15000, segmented: false, xzOnly: true });
+      checkBudget(ctx);
+      if (distance(bot.entity.position, point) > 1.2) throw new Error('仍未站到施工位置，停止远距离放置');
+      return;
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('建造位置没有可站立的完整地板，无法安全施工');
 }
 
 /** 选门的位置：南墙中间 */
@@ -577,7 +767,6 @@ async function buildWalls({ actions, nav, ctx, origin, outer, wallHeight, materi
   // 早期这里写成 actions.countItem(material) / actions.place({item: material})，
   // 传的是对象 → countItem 永远返回 0 → 第一块就 break，
   // 表现就是"一块墙都没放上去，可能没站在合适的依附位置上"（实测就是这个原因）。
-  const matName = material && material.name ? material.name : String(material || '');
   for (let dy = 0; dy < wallHeight; dy += 1) {
     ctx.progress(`砌墙第 ${dy + 1}/${wallHeight} 层`);
     // 外圈坐标，按"从外向内、从下往上"的顺序保证每次都有依附面
@@ -591,17 +780,18 @@ async function buildWalls({ actions, nav, ctx, origin, outer, wallHeight, materi
     }
     // 门的两个格子：跳过（不放墙）
     for (const cell of ring) {
-      if (ctx.aborted) throw new CancelledError('建造被取消');
+      checkBudget(ctx);
       if (doorPos && cell.x === doorPos.x && cell.z === doorPos.z && dy <= 1) continue;
       // 已经有墙了就跳过
       const existing = blockAt(actions.bot, cell.x, cell.y, cell.z);
       if (existing && existing.boundingBox === 'block' && !existing.name.includes('grass') && !existing.name.includes('flower')) {
         continue;
       }
-      if (actions.countItem(matName) <= 0) break;
+      const item = nextMaterial(actions, material);
+      if (!item) break;
       // 墙的每一格都要有依附面：先确保自己在外面/里面够得到
-      const ok = await placeWithApproach({ actions, nav, ctx, cell, material: matName });
-      if (ok) placed += 1;
+      const used = await placeWithApproach({ actions, nav, ctx, cell, material: item, materials: material, origin, outer });
+      if (used) { placed += 1; recordPlacement(material, used); }
     }
   }
   if (placed) steps.push(`砌墙 ${placed} 块`);
@@ -609,10 +799,22 @@ async function buildWalls({ actions, nav, ctx, origin, outer, wallHeight, materi
 }
 
 /** 放一块方块，够不到就先走近 */
-async function placeWithApproach({ actions, nav, ctx, cell, material, attempts = 3 }) {
+async function placeWithApproach({ actions, nav, ctx, cell, material, materials, origin, outer, attempts = 3 }) {
   const bot = actions.bot;
+  let lastError = null;
   for (let i = 0; i < attempts; i += 1) {
-    if (ctx.aborted) return false;
+    checkBudget(ctx);
+    // 最后一块物品的背包更新可能晚于世界更新；重试时重新选实际仍在背包里的建材。
+    const item = materials ? nextMaterial(actions, materials) : material;
+    if (!item) break;
+    if (i > 0 && origin) {
+      try { await moveToBuildPosition({ actions, nav, ctx, origin, outer, near: cell }); }
+      catch (err) {
+        if (err instanceof CancelledError) throw err;
+        checkBudget(ctx);
+        lastError = err;
+      }
+    }
     const d = distance(bot.entity.position, { x: cell.x + 0.5, y: cell.y + 0.5, z: cell.z + 0.5 });
     if (d > 4.0) {
       try {
@@ -623,26 +825,33 @@ async function placeWithApproach({ actions, nav, ctx, cell, material, attempts =
         await nav.approach({ x: cell.x, y: cell.y, z: cell.z, range: 2, signal: ctx.signal, timeoutMs: 10000 });
       } catch (err) {
         if (err instanceof CancelledError) throw err;
+        checkBudget(ctx);
       }
     }
+    checkBudget(ctx);
     try {
-      const r = await actions.place({ x: cell.x, y: cell.y, z: cell.z, item: material, signal: ctx.signal, reach: false });
-      if (r.ok) return true;
+      const r = await actions.place({ x: cell.x, y: cell.y, z: cell.z, item, signal: ctx.signal, reach: false });
+      checkBudget(ctx);
+      if (r.ok && solidSafe(blockAt(bot, cell.x, cell.y, cell.z))) return item;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       // 自己站在目标格上 → 让开
+      lastError = err;
       const cur = bot.entity.position;
       if (Math.floor(cur.x) === cell.x && Math.floor(cur.z) === cell.z && (Math.floor(cur.y) === cell.y || Math.floor(cur.y) + 1 === cell.y)) {
         try {
           await nav.goTo({ x: cell.x + 2.5, y: null, z: cell.z + 2.5, range: 1, signal: ctx.signal, timeoutMs: 8000 });
-        } catch {
-          /* ignore */
+        } catch (moveErr) {
+          if (moveErr instanceof CancelledError) throw moveErr;
+          checkBudget(ctx);
         }
       } else {
         await delay(250, { signal: ctx.signal });
       }
     }
   }
+  log.info(`建造放置 (${cell.x},${cell.y},${cell.z}) 未确认：${lastError?.message || '服务器返回后目标格仍未建成'}`);
   return false;
 }
 
@@ -677,12 +886,13 @@ async function buildRoof({ actions, nav, ctx, origin, outer, wallHeight, materia
       }
     }
     for (const cell of ring) {
-      if (ctx.aborted) throw new CancelledError('建造被取消');
+      checkBudget(ctx);
       const existing = blockAt(actions.bot, cell.x, cell.y, cell.z);
       if (existing && existing.boundingBox === 'block') continue;
-      if (actions.countItem(matName(material)) <= 0) break;
-      const ok = await placeWithApproach({ actions, nav, ctx, cell, material: matName(material) });
-      if (ok) placed += 1;
+      const item = nextMaterial(actions, material);
+      if (!item) break;
+      const used = await placeWithApproach({ actions, nav, ctx, cell, material: item, materials: material, origin, outer });
+      if (used) { placed += 1; recordPlacement(material, used); }
     }
     ctx.progress(`盖屋顶（第 ${inset + 1} 圈）`);
   }
@@ -691,9 +901,10 @@ async function buildRoof({ actions, nav, ctx, origin, outer, wallHeight, materia
 }
 
 /** 装门：需要站在门内侧或外侧，把门放到门框里 */
-async function installDoor({ actions, ctx, doorPos, material, steps }) {
+async function installDoor({ actions, nav, ctx, doorPos, material, steps }) {
+  checkBudget(ctx);
   const bot = actions.bot;
-  const doorItem = ['oak_door', 'birch_door', 'spruce_door', 'jungle_door', 'acacia_door', 'dark_oak_door', 'crimson_door', 'warped_door'].find(
+  const doorItem = DOOR_NAMES.find(
     (n) => actions.countItem(n) > 0,
   );
   if (!doorItem) {
@@ -705,13 +916,22 @@ async function installDoor({ actions, ctx, doorPos, material, steps }) {
   try {
     const below = blockAt(bot, base.x, base.y - 1, base.z);
     if (!below || below.boundingBox !== 'block') {
-      await actions.place({ x: base.x, y: base.y - 1, z: base.z, item: matName(material), signal: ctx.signal, reach: true }).catch(() => {});
+      const item = nextMaterial(actions, material);
+      if (!item) return false;
+      await actions.place({ x: base.x, y: base.y - 1, z: base.z, item, signal: ctx.signal, reach: true });
     }
+    if (distance(bot.entity.position, base) > 4) {
+      await nav.approach({ ...base, range: 2, signal: ctx.signal, timeoutMs: 10000 });
+    }
+    checkBudget(ctx);
     await actions.lookAtPoint(base.x + 0.5, base.y + 0.5, base.z + 0.5);
+    checkBudget(ctx);
     const r = await actions.place({ x: base.x, y: base.y, z: base.z, item: doorItem, signal: ctx.signal, reach: false });
     if (r.ok) steps.push('装门');
     return r.ok;
   } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    checkBudget(ctx);
     log.debug(`装门失败（不致命）：${err.message}`);
     return false;
   }
@@ -738,7 +958,7 @@ async function placeTorches({ actions, ctx, origin, inner, steps }) {
     }
   }
   for (const s of spots) {
-    if (ctx.aborted) return placed;
+    checkBudget(ctx);
     if (placed >= 2) break; // 两个就够照亮了
     if (actions.countItem('torch') <= 0) break;
     const b = blockAt(bot, s.x, s.y, s.z);
@@ -747,6 +967,8 @@ async function placeTorches({ actions, ctx, origin, inner, steps }) {
       const r = await actions.place({ x: s.x, y: s.y, z: s.z, item: 'torch', signal: ctx.signal, reach: true });
       if (r.ok) placed += 1;
     } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      checkBudget(ctx);
       log.info(`插火把 (${s.x},${s.y},${s.z}) 失败：${err.message}`);
     }
   }

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import json
+
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 
 from .bridge_client import EngineError
@@ -207,20 +209,51 @@ class McLifeTools:
         **什么时候别用**：你也不确定下一步该干嘛时（那就先看一眼情况再说）。
 
         Args:
-            steps(string): 步骤列表，每步一个技能名，用逗号或换行分开。
-                比如 `chop_tree, make_tools` 或 `mine_stone, smelt`。
-                能用的技能名用 mc_skills 查。
+            steps(string): 步骤列表。需要指定数量、工具层级等参数时，传 JSON 数组字符串，
+                例如 `[{"skill":"chop_tree","params":{"count":4}},
+                {"skill":"make_tools","params":{"tier":"stone","kinds":["pickaxe"]}}]`。
+                每步的 params 是该技能的参数对象，可省略；能用的技能及参数用 mc_skills 查。
+                也兼容逗号或换行分隔的技能名，例如 `chop_tree, make_tools`（使用默认参数）。
+                JSON 结构或 params 类型无效时，会保留之前的计划并返回错误。
             why(string): 一句话说明为什么这么排（可选，给她自己看的）
         """
         if not self.life:
             yield event.plain_result("过日子系统没启用")
             return
-        raw = [s.strip() for s in str(steps or "").replace("\n", ",").split(",")]
-        names = [s for s in raw if s]
-        if not names:
+        text = str(steps or "").strip()
+        if text.startswith(("[", "{", '"')):
+            try:
+                planned_steps = json.loads(text)
+            except json.JSONDecodeError as exc:
+                yield event.plain_result(
+                    f"计划 JSON 无效（第 {exc.lineno} 行第 {exc.colno} 列）：{exc.msg}。之前的计划已保留。"
+                )
+                return
+            if not isinstance(planned_steps, list):
+                yield event.plain_result("计划 JSON 必须是步骤数组，例如 [{\"skill\":\"chop_tree\",\"params\":{\"count\":4}}]。之前的计划已保留。")
+                return
+            for index, item in enumerate(planned_steps, start=1):
+                if isinstance(item, str) and item.strip():
+                    continue
+                if not isinstance(item, dict):
+                    yield event.plain_result(f"计划 JSON 第 {index} 步无效：需要包含 skill 的对象。之前的计划已保留。")
+                    return
+                skill = item.get("skill") or item.get("name")
+                if not isinstance(skill, str) or not skill.strip():
+                    yield event.plain_result(f"计划 JSON 第 {index} 步无效：skill 必须是非空技能名。之前的计划已保留。")
+                    return
+                if "params" in item and not isinstance(item["params"], dict):
+                    yield event.plain_result(f"计划 JSON 第 {index} 步无效：params 必须是参数对象。之前的计划已保留。")
+                    return
+        else:
+            planned_steps = [
+                {"skill": name.strip()}
+                for name in text.replace("\n", ",").split(",") if name.strip()
+            ]
+        if not planned_steps:
             yield event.plain_result("没给步骤。写法：mc_plan_do(steps=\"chop_tree, make_tools\")")
             return
-        result = self.life.note_plan_from_agent([{"skill": n} for n in names], why=why)
+        result = self.life.note_plan_from_agent(planned_steps, why=why)
         if not result.get("ok"):
             yield event.plain_result(
                 f"没记下：{result.get('reason')}。"
@@ -307,21 +340,24 @@ class McLifeTools:
             name(string): 攻略名：building（盖房）/ tools（从零到石制工具）/
                 food（吃饱肚子）/ mining（安全挖矿）。留空则列出全部。
         """
-        from pathlib import Path
+        from .knowledge import KnowledgeBase
 
-        root = Path(__file__).resolve().parent / "skills_docs"
-        want = str(name or "").strip().lower().replace(".md", "")
+        kb = getattr(self, "knowledge", None)
+        if kb is None:
+            kb = KnowledgeBase()
+        want = str(name or "").strip().lower().removesuffix(".md")
+        available = "、".join(kb.docs())
         if not want:
-            yield event.plain_result("可以读的攻略：" + "、".join(sorted(p.stem for p in root.glob("*.md"))))
+            yield event.plain_result("可以读的攻略：" + available)
             return
-        path = root / f"{want}.md"
-        if not path.exists():
+        content = kb.read_doc(name)
+        if content is None:
             yield event.plain_result(
-                f"没有「{want}」这篇。有的是：" + "、".join(sorted(p.stem for p in root.glob("*.md")))
+                f"没有「{want}」这篇。有的是：" + available
             )
             return
         await self._notify_subscribers(f"📖 她读了攻略：{want}")
-        yield event.plain_result(path.read_text(encoding="utf-8"))
+        yield event.plain_result(content)
 
     # ============================================================ 知识库（她会自己长大）
 

@@ -160,6 +160,8 @@ class PerceptionAgent:
         return toolset if count else None
 
     async def _execute(self, name: str, args: dict, event) -> str:
+        if name not in PERCEPTION_TOOLS:
+            return f"error: 感知阶段不允许调用工具 {name}"
         manager = self._manager()
         if manager is None:
             return "error: 工具管理器不可用"

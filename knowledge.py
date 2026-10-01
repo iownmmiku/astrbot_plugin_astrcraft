@@ -49,6 +49,20 @@ RECALL_LIMIT = 5
 # 中文里没有空格，所以关键词要按"字/词"切；英文按单词切。
 # 这是刻意不做向量检索的：不引依赖、不联网、结果可解释（能说清"为什么想起这条"）。
 _WORD_RE = re.compile(r"[a-zA-Z_]{3,}|[\u4e00-\u9fff]{2,}")
+# 相似的句式可以表达不同的生存规则；这些具体事实不能被模糊去重吞掉。
+_FACT_RE = re.compile(
+    r"[a-zA-Z][a-zA-Z0-9_:]*|\d+(?:\.\d+)?|"
+    r"(?:下界合金|钻石|木|石|铁|金)(?:镐|斧|铲|锄|剑)|"
+    r"(?:下界石英|下界金|钻石|青金石|绿宝石|红石|铁|金|铜|煤)矿(?:石)?|"
+    r"远古残骸|黑曜石|圆石|石头|工作台|熔炉|火把|床|箱子|面包|"
+    r"不能|不要|不应|必须|只能|不必|无需|禁止|至少|至多|不超过|不低于|超过|不足|高于|低于"
+)
+
+
+def _lesson_facts(text: str) -> tuple[str, ...]:
+    """保留矿石、工具等级、物品、数量和约束等区分教训的事实。"""
+    # 顺序也保留：「石镐可用，木镐不可用」与反过来的规则不能合并。
+    return tuple(_FACT_RE.findall(str(text or "").lower()))
 
 
 def _keywords(text: str) -> set[str]:
@@ -132,14 +146,24 @@ class KnowledgeBase:
     def docs(self) -> list[str]:
         if not self._docs_dir.exists():
             return []
-        return sorted(p.stem for p in self._docs_dir.glob("*.md"))
+        root = self._docs_dir.resolve()
+        # 只登记目录内的普通 Markdown；指向目录外的符号链接也不能作为攻略。
+        return sorted(
+            p.stem for p in self._docs_dir.glob("*.md")
+            if p.is_file() and p.resolve().parent == root
+        )
 
     def read_doc(self, name: str) -> str | None:
-        want = str(name or "").strip().lower().replace(".md", "")
-        path = self._docs_dir / f"{want}.md"
-        if not path.exists():
+        want = str(name or "").strip().lower().removesuffix(".md")
+        if not want or any(c in want for c in ("/", "\\", ":")):
+            return None
+        registered = {n.lower(): n for n in self.docs()}
+        if want not in registered:
             return None
         try:
+            path = (self._docs_dir / f"{registered[want]}.md").resolve()
+            if path.parent != self._docs_dir.resolve():
+                return None
             return path.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.info("读攻略 %s 失败：%s", want, exc)
@@ -154,11 +178,11 @@ class KnowledgeBase:
             return "教训太短了，写清楚「什么情况下该怎么做」才有用"
         if len(body) > MAX_LESSON_CHARS:
             body = body[:MAX_LESSON_CHARS] + "…"
-        # 去重：和已有教训太像就不再记（否则同一个坑会记十条）。
-        # 阈值 0.35 是实测出来的分界：
-        #   不同主题 0.00 ｜ 同一个坑换了说法 0.38 ｜ 明显同义 0.71
+        # 句式相近且具体事实一致才去重：铁矿/石镐和钻石矿/铁镐必须各自留下。
+        facts = _lesson_facts(body)
         for old in self._lessons:
-            if _similar(old.get("text", ""), body) >= 0.35:
+            old_text = old.get("text", "")
+            if _lesson_facts(old_text) == facts and _similar(old_text, body) >= 0.35:
                 old["used_at"] = time.time()
                 self._save()
                 return f"这条和已有的很像，就不重复记了：{old['text'][:40]}…"

@@ -47,10 +47,8 @@ from .llm_tools_skills import McSkillTools
 from .llm_tools_life import McLifeTools
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
-# 1.0.0 → 1.1.0：这一批的可见标记（UI 里一看就知道更新成功了）——
-# 攀爬六根因+时钟/forceload/task_id、感知往返 4→3、真实感两维审计、
-# 看门狗预算按实测放宽；配置默认 skill_timeout 480 / life_decide_interval 10。
-PLUGIN_VERSION = "1.1.0"
+# 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
+PLUGIN_VERSION = "1.2.0"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
@@ -113,11 +111,17 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         self.engine: EngineClient | None = None
         self.goals: GoalManager | None = None
         self.connected = False
+        self._manual_disconnect_requested = False
+        self._emergency_stopped = False
+        self._background_tasks: set[asyncio.Task] = set()
+        self._terminating = False
+        self._player_action_inflight = 0
         self._engine_task: asyncio.Task | None = None
         self._subscribers: set[str] = set()
         self._event_buffer: list[dict] = []
         self._last_brief = ""
         self._last_brief_at = 0.0
+        self._brief_revision = 0
         self._connect_lock = asyncio.Lock()
         # 上次尝试进服的时间（监管循环用它做冷却，防止连服抖动）
         self._last_connect_attempt = 0.0
@@ -213,10 +217,12 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             engine_dir=self._engine_dir(),
             node_path=str(self._cfg("node_path", "")),
             log_level=str(self._cfg("engine_log_level", "info")),
+            extra_env={"MC_DATA_DIR": str(self._data_dir)},
         )
         self.engine = EngineClient(cfg)
         self.engine.on_disconnected = self._on_engine_disconnected
         self.engine.on("bot.spawn", self._on_bot_spawn)
+        self.engine.on("bot.respawn", self._on_bot_respawn)
         self.engine.on("bot.death", self._on_bot_death)
         self.engine.on("bot.kicked", self._on_bot_kicked)
         self.engine.on("bot.disconnect", self._on_bot_disconnect)
@@ -315,22 +321,49 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return
         if self.life:
             self.life.note_engine_up(True)
+        if self._emergency_stopped:
+            await self.engine.safety_stop()
 
         if self._cfg("auto_connect", False):
-            asyncio.create_task(self._auto_connect(), name="mc-auto-connect")
+            self._spawn_background(self._auto_connect(), name="mc-auto-connect")
         # 引擎监管：崩了自动拉起（引擎进程是长期依赖，不能等用户手动重启）
         self._supervise_task = asyncio.create_task(self._supervise_loop(), name="mc-engine-supervise")
 
         # 兜底：即使 on_astrbot_loaded 钩子没触发（某些版本/加载路径下可能不触发），
         # 也要在稍后把工具绑定补上——initialize 执行时工具往往还没注册完。
         for delay in (5, 15, 40):
-            asyncio.create_task(self._bind_tools_later(delay), name=f"mc-bind-init-{delay}")
+            self._spawn_background(self._bind_tools_later(delay), name=f"mc-bind-init-{delay}")
+
+    def _spawn_background(self, coroutine, *, name: str) -> asyncio.Task | None:
+        """记录延迟回调，避免卸载后旧实例继续回复、连服或绑定工具。"""
+        if getattr(self, "_terminating", False):
+            coroutine.close()
+            return None
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_tasks.add(task)
+
+        def finished(completed):
+            self._background_tasks.discard(completed)
+            if not completed.cancelled():
+                error = completed.exception()
+                if error:
+                    logger.warning("后台任务 %s 失败：%s", name, error)
+
+        task.add_done_callback(finished)
+        return task
 
     async def terminate(self):
         """插件卸载：停目标与过日子、落盘、断游戏、关引擎。"""
         logger.info("Minecraft 插件正在卸载")
+        self._terminating = True
         if self._supervise_task and not self._supervise_task.done():
             self._supervise_task.cancel()
+            await asyncio.gather(self._supervise_task, return_exceptions=True)
+        background = list(self._background_tasks)
+        for task in background:
+            task.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
         if self.goals:
             await self.goals.stop()
         if self.life:
@@ -406,7 +439,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             # False。早期这里只看这个标记，于是在连接进行中又触发一次 _auto_connect，
             # 新连接会把正在建立的连接踢掉 → 实测日志里出现连续 5 次"已进服"和
             # 成对的"主动断开"（连服抖动）。现在同时要求"距上次尝试超过 25 秒"。
-            if self._cfg("auto_connect", False) and not self.connected:
+            if (self._cfg("auto_connect", False) and not self.connected
+                    and not getattr(self, "_manual_disconnect_requested", False)):
                 now = time.time()
                 if now - self._last_connect_attempt >= 25:
                     try:
@@ -482,7 +516,10 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 await self.engine.start()
                 if self.life:
                     self.life.note_engine_up(True)
-                if self._cfg("auto_connect", False):
+                if getattr(self, "_emergency_stopped", False):
+                    await self.engine.safety_stop()
+                if (self._cfg("auto_connect", False)
+                        and not getattr(self, "_manual_disconnect_requested", False)):
                     await self._auto_connect(reason="引擎重启后恢复")
             except Exception as exc:  # noqa: BLE001
                 logger.error("重新拉起引擎失败：%s", exc)
@@ -491,7 +528,53 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """给 GoalManager 用的调用入口（引擎不可用时抛 EngineUnavailable）。"""
         if not self.engine:
             raise EngineUnavailable("引擎未初始化")
+        if self._emergency_stopped and method == "skill.run":
+            raise EngineError("机器人处于急停状态，请先用 /mc继续 恢复")
         return await self.engine.call(method, params, timeout=timeout)
+
+    async def _emergency_stop(self) -> dict:
+        """命令与工具共享急停状态，先收回自主权，再取消引擎动作。"""
+        self._emergency_stopped = True
+        if self.life:
+            self.life.pause(reason="急停", max_seconds=0)
+        running = bool(self.engine and self.engine.running)
+        try:
+            result = await self.engine.safety_stop() if running else {"cancelled": []}
+        finally:
+            if self.goals:
+                await self.goals.pause()
+        return {**(result or {}), "engine_running": running}
+
+    async def _start_player_goal(self, goal: str) -> str:
+        """保护目标建立期间的暂停，旧任务的完成事件不能提前归还自主权。"""
+        if self._emergency_stopped:
+            raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
+        self._player_action_inflight = getattr(self, "_player_action_inflight", 0) + 1
+        try:
+            if self.life:
+                self.life.pause(reason="长期目标", max_seconds=0)
+                clear_plan = getattr(self.life, "clear_plan", None)
+                if callable(clear_plan):
+                    clear_plan("玩家指定了长期目标")
+                try:
+                    await self._engine_call("task.cancel", {})
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("准备新目标时未能取消旧动作，将继续建立目标：%s", exc)
+            if self._emergency_stopped:
+                raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
+            message = await self.goals.start(goal)
+            # 目标规划可能等待模型；期间收到急停时，新目标仍需保持暂停。
+            if self._emergency_stopped:
+                await self.goals.pause()
+                raise EngineError("目标准备期间收到急停，先用 /mc继续 恢复")
+            return message
+        finally:
+            self._player_action_inflight = max(0, self._player_action_inflight - 1)
+            if (self.life and not self._emergency_stopped
+                    and not self._player_action_inflight
+                    and not (self.goals and self.goals.active)):
+                self.life.resume()
+                self.life.wake(reason="目标未建立，恢复自主游玩")
 
     async def _ensure_engine(self) -> bool:
         if not self.engine:
@@ -500,6 +583,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return True
         try:
             await self.engine.start()
+            if self._emergency_stopped:
+                await self.engine.safety_stop()
             return True
         except Exception as exc:  # noqa: BLE001
             logger.error("启动引擎失败：%s", exc)
@@ -524,7 +609,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 再延迟补几次：不同 AstrBot 版本的注册顺序可能有差异，
         # 多试几次成本极低（绑定是幂等的），但能避免"工具静默不可用"这种最坑的故障。
         for delay in (5, 15, 40):
-            asyncio.create_task(self._bind_tools_later(delay), name=f"mc-bind-{delay}")
+            self._spawn_background(self._bind_tools_later(delay), name=f"mc-bind-{delay}")
 
     async def _bind_tools_later(self, delay: float) -> None:
         await asyncio.sleep(delay)
@@ -721,7 +806,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     async def _auto_connect(self, reason: str = "自动连接"):
         async with self._connect_lock:
-            if self.connected:
+            if self.connected or getattr(self, "_manual_disconnect_requested", False):
                 return
             # 记下尝试时间：监管循环靠它做冷却，避免"连接还没完成又发起一次"
             # 把正在建立的连接踢掉（实测会连服抖动：连续 5 次"已进服"+成对"主动断开"）。
@@ -768,14 +853,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 logger.error("进服异常：%s", exc)
 
     async def _do_disconnect(self) -> str:
-        self.connected = False
-        if not self.engine or not self.engine.running:
-            return "引擎未运行"
-        try:
-            await self.engine.call("disconnect", {}, timeout=10.0)
-            return "已断开游戏连接"
-        except Exception as exc:  # noqa: BLE001
-            return f"断线时出错（可能已经断开）：{exc}"
+        self._manual_disconnect_requested = True
+        async with self._connect_lock:
+            self.connected = False
+            if not self.engine or not self.engine.running:
+                return "引擎未运行"
+            try:
+                await self.engine.call("disconnect", {}, timeout=10.0)
+                return "已断开游戏连接"
+            except Exception as exc:  # noqa: BLE001
+                return f"断线时出错（可能已经断开）：{exc}"
 
     # ================================================================ 事件
 
@@ -790,10 +877,14 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     async def _on_engine_disconnected(self, reason: str) -> None:
         self.connected = False
+        self._invalidate_brief()
         logger.warning("引擎通道断开：%s", reason)
 
     async def _on_bot_spawn(self, data: dict) -> None:
+        if self._manual_disconnect_requested:
+            return
         self.connected = True
+        self._invalidate_brief()
         pos = data.get("position") or {}
         logger.info("机器人已进服：%s @ %s", data.get("username"), data.get("version"))
 
@@ -822,6 +913,10 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # ---- 进服后装配"她的世界"
         # 0) 先把插件配置里"引擎侧才生效"的项下发（安全白/黑名单、技能超时等）
         await self._push_engine_settings()
+        if self._emergency_stopped:
+            await self.engine.safety_stop()
+            if self.life:
+                self.life.pause(reason="急停", max_seconds=0)
 
         # 1) 把历史见闻灌回引擎，这样"第一次见到熊猫"的语义跨重启仍然成立
         if self.engine and self.memory:
@@ -856,12 +951,23 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             else:
                 logger.info("过日子循环已在配置中关闭（enable_life_loop=false）")
 
+    async def _on_bot_respawn(self, data: dict) -> None:
+        """身体真正恢复生命后解除死亡停牌，保留死亡恢复清单和主人暂停。"""
+        self._invalidate_brief()
+        if self._manual_disconnect_requested:
+            return
+        self.connected = True
+        if self.life:
+            self.life.note_dead(False)
+            self.life.wake(reason="已重生，重新观察并恢复物资")
+
     async def _on_bot_hurt(self, data: dict) -> None:
         """她受伤了 → 入队（W4）。
 
         **受伤是急件**：反射层会立刻处理（后撤/反击），但决策层得知道
         "我现在在被谁打"——否则她可能刚被打完就继续安排长任务。
         """
+        self._invalidate_brief()
         if not self.life:
             return
         try:
@@ -947,6 +1053,15 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     async def _on_bot_death(self, data: dict) -> None:
         pos = data.get("position") or {}
         place = f"({pos.get('x')}, {pos.get('y')}, {pos.get('z')})"
+        self._invalidate_brief()
+        # 通知和写记忆可能等待网络；死亡状态必须先改变，避免重生后晚到的
+        # 通知再次进入 DEAD，并丢掉重生后新排的计划。
+        if self.life:
+            try:
+                self.life.note_dead(True)
+                self.life.note_death(pos)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("记录死亡地点失败：%s", exc)
         await self._notify_subscribers(f"💀 机器人死了（位置 {place}），会自动重生")
 
         # 死亡是最难忘的经历之一：记下来，并用她的语气说一句
@@ -959,26 +1074,19 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 dedupe_window=30,
             )
         if self.life:
-            # 让决策层知道"我刚死在哪儿、东西掉在那儿了"——
-            # 真人死后第一反应是回去捡，而 MC 里掉落物大约 5 分钟就消失。
-            try:
-                self.life.note_death(pos)
-                # **同时进入 DEAD 停牌**（W2）：死着的时候她不该继续决策——
-                # 之前没有这个状态，死了之后决策层照样在跑，只是每件事都失败。
-                self.life.note_dead(True)
-            except Exception as exc:  # noqa: BLE001
-                logger.info("记录死亡地点失败：%s", exc)
-            asyncio.create_task(
+            self._spawn_background(
                 self.life.share_event(kind="death", text=f"我在 {place} 死了", force=True),
                 name="mc-share-death",
             )
 
     async def _on_bot_kicked(self, data: dict) -> None:
         self.connected = False
+        self._invalidate_brief()
         await self._notify_subscribers(f"🚫 机器人被服务器踢出：{data.get('reason')}")
 
     async def _on_bot_disconnect(self, data: dict) -> None:
         self.connected = False
+        self._invalidate_brief()
         if data.get("manual"):
             return
         await self._notify_subscribers(f"🔌 机器人断线：{data.get('reason')}")
@@ -1029,6 +1137,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return out
         out["health"] = st.get("health", 20)
         out["food"] = st.get("food", 20)
+        out["nearby_entities"] = st.get("nearby_entities") or []
         # 白天/黑夜：Minecraft 一天 24000 tick，13000-23000 是夜晚
         tod = st.get("time_of_day")
         if isinstance(tod, (int, float)):
@@ -1056,8 +1165,15 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
         只播报技能任务（kind=skill）：反射层的吃口饭、后退两步不值得说。
         """
+        self._invalidate_brief()
+        # 吃饭、后撤等反射不拥有玩家暂停，也不是当前计划步骤的执行结果。
+        if data.get("kind") == "reflex":
+            return
         # 玩家指派的活干完了 → 她可以继续过自己的日子
-        if self.life and self.life.paused:
+        if (self.life and self.life.paused
+                and not getattr(self, "_emergency_stopped", False)
+                and not getattr(self, "_player_action_inflight", 0)
+                and not (self.goals and self.goals.active)):
             self.life.resume()
             logger.debug("任务结束，过日子循环已恢复")
 
@@ -1105,7 +1221,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 task_name = str(data.get("name") or "")
                 ok = data.get("status") == "done"
                 # 把"砍 2 根木头""挖石头"这类中文任务名映射回技能名
-                skill_name = self._skill_name_from_task(task_name)
+                meta = data.get("meta") or {}
+                skill_name = meta.get("skill") if isinstance(meta, dict) else None
+                skill_name = skill_name or self._skill_name_from_task(task_name)
                 self.life.note_task_result(skill_name or task_name, ok, str(data.get("error") or ""))
             except Exception as exc:  # noqa: BLE001
                 logger.info("记录任务结果失败：%s", exc)
@@ -1184,6 +1302,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return
 
         await self._notify_subscribers(f"💬 [{sender}] {message}")
+        will_reply = bool(self._cfg("reply_in_game", True) and self._should_reply(message))
 
         # **主人说的话入队**（W4）：不管她当时在干嘛，这句话都**不会丢**。
         #
@@ -1192,7 +1311,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 现在话会躺在队列里，等她到安全注入点（下次组装提示词）就会看到。
         # **注意：这里不做"要不要回复"的判断**——入队是"让她知道"，
         # 回不回复是另一回事（下面的 `_should_reply`）。
-        if self.life:
+        # 被点名的消息由聊天代理持有，避免生活循环再执行一遍同一条指令。
+        if self.life and not will_reply:
             try:
                 self.life.note_owner_said(f"{sender} 说：{message}")
             except Exception as exc:  # noqa: BLE001
@@ -1203,11 +1323,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             await self._maybe_remember("social", f"{sender} 跟我说：{message}", tags=[sender], weight=3, dedupe_window=120)
 
         # 游戏内聊天是否触发 LLM 回复
-        if not self._cfg("reply_in_game", True):
+        if not will_reply:
             return
-        if not self._should_reply(message):
-            return
-        asyncio.create_task(self._reply_in_game(sender, message), name="mc-reply")
+        self._spawn_background(self._reply_in_game(sender, message), name="mc-reply")
 
     def _should_reply(self, message: str) -> bool:
         text = (message or "").strip()
@@ -1230,11 +1348,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
            LLM 根本拿不到工具，所以她"只会说不会做"。
         2. 纯文字回复（兜底）：LLM/工具管理器不可用时，退化为只回话不动手。
         """
-        # 一次只处理一条。正在回上一条时新消息直接丢弃（记日志）——
-        # 排队反而更糟：玩家连说三句，她隔十秒一句句回，像机器人而不是人。
-        if self._game_reply_lock.locked():
-            logger.debug("正在回复上一条，丢弃 %s 的消息：%s", sender, message[:30])
-            return
+        # 锁按到达顺序等待，不能因为正在回复就丢掉后来的动作或取消指令。
         async with self._game_reply_lock:
             try:
                 reply: str | None = None
@@ -1252,7 +1366,15 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                         logger.error("游戏内动作代理失败，退回纯文字：%s", exc)
                         reply = None
 
+                if (reply is None and self.game_agent
+                        and getattr(self.game_agent, "last_request_had_action", False)):
+                    # 工具可能已产生副作用，超时不能把整条指令交给另一代理重放。
+                    reply = "已经尝试执行，回复暂时没能完成；先保留当前进度。"
+
                 if reply is None:
+                    if self._cfg("in_game_actions", True) and self.life:
+                        self.life.note_owner_said(f"{sender} 说：{message}")
+                        self.life.wake(reason="游戏内代理不可用，交给自主循环处理")
                     # 兜底：纯文字聊天
                     brief = await self._get_brief()
                     system = await self._system_prompt_for_mc()
@@ -1456,7 +1578,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
         # 值得说的就说出来（她自己的语气，受冷却限制）
         if share and self.life:
-            asyncio.create_task(self.life.share_event(kind=kind, text=text), name="mc-share")
+            self._spawn_background(self.life.share_event(kind=kind, text=text), name="mc-share")
 
     async def _on_goal_event(self, event: str, data: dict) -> None:
         """目标推进过程中给订阅者报进度（只报关键节点，避免刷屏）。"""
@@ -1469,13 +1591,17 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         elif event == "goal.done":
             await self._notify_subscribers(f"🏁 目标完成「{data.get('goal')}」")
             # 指派的任务做完了 → 她回去过自己的日子
-            if self.life:
+            if (self.life and not getattr(self, "_emergency_stopped", False)
+                    and not getattr(self, "_player_action_inflight", 0)
+                    and not (self.goals and self.goals.active)):
                 self.life.resume()
         elif event == "goal.failed":
             await self._notify_subscribers(
                 f"⚠️ 目标受阻「{data.get('goal')}」\n卡在：{data.get('step')}\n原因：{data.get('reason')}"
             )
-            if self.life:
+            if (self.life and not getattr(self, "_emergency_stopped", False)
+                    and not getattr(self, "_player_action_inflight", 0)
+                    and not (self.goals and self.goals.active)):
                 self.life.resume()
 
     # ================================================================ 会话推送
@@ -1492,19 +1618,34 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     # ================================================================ 状态读取（带缓存）
 
+    def _invalidate_brief(self) -> None:
+        self._last_brief = ""
+        self._last_brief_at = 0.0
+        self._brief_revision = getattr(self, "_brief_revision", 0) + 1
+
     async def _get_brief(self, *, max_age: float = 8.0) -> str:
         """带缓存的简报：LLM 工具可能在一次对话里连续调用，避免每次都去问引擎。"""
         now = time.time()
-        if self._last_brief and now - self._last_brief_at < max_age:
-            return self._last_brief
         if not self.engine or not self.engine.running:
             return "【引擎未运行】"
+        if self._last_brief and now - self._last_brief_at < max_age:
+            return self._last_brief
         try:
-            goal = self.goals.progress_brief() if self.goals else None
-            text = await self.engine.state_brief(goal)
-            self._last_brief = text
-            self._last_brief_at = now
-            return text
+            # 至多重读一次；RPC 等待期间发生重生、重连或任务完成时，旧快照
+            # 不能重新装进缓存，也不能用于现在的决策。
+            for _ in range(2):
+                engine = self.engine
+                if not engine or not engine.running:
+                    return "【引擎未运行】"
+                revision = getattr(self, "_brief_revision", 0)
+                goal = self.goals.progress_brief() if self.goals else None
+                text = await engine.state_brief(goal)
+                if engine is not self.engine or revision != getattr(self, "_brief_revision", 0):
+                    continue
+                self._last_brief = text
+                self._last_brief_at = time.time()
+                return text
+            return "【状态正在变化，请重新观察】"
         except EngineError as exc:
             return f"【读取状态失败：{exc}】"
 
@@ -1867,6 +2008,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc进服", alias={"mcconnect"})
     async def cmd_connect(self, event: AstrMessageEvent):
         """让机器人进服"""
+        self._manual_disconnect_requested = False
         if not await self._ensure_engine():
             yield event.plain_result("❌ 引擎未启动，请先检查配置")
             return
@@ -1885,15 +2027,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc急停", alias={"mcstop"})
     async def cmd_stop(self, event: AstrMessageEvent):
         """立刻停止所有动作"""
-        if not self.engine or not self.engine.running:
-            yield event.plain_result("引擎未运行")
-            return
         try:
-            r = await self.engine.safety_stop()
-            if self.goals:
-                await self.goals.pause()
+            r = await self._emergency_stop()
+            if not r["engine_running"]:
+                yield event.plain_result("🛑 已暂停自主行动；引擎未运行。/mc继续 可恢复")
+                return
             cancelled = r.get("cancelled") or []
-            yield event.plain_result(f"🛑 已急停，取消了 {len(cancelled)} 个任务。自主目标也已暂停（/mc继续 可恢复）")
+            yield event.plain_result(f"🛑 已急停，取消了 {len(cancelled)} 个任务。自主行动与目标均已暂停（/mc继续 可恢复）")
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"急停失败：{exc}")
 
@@ -1911,16 +2051,11 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if not self.connected:
             yield event.plain_result("机器人还没进服，先用 /mc进服")
             return
-        # 你派活了 → 先让她停下自己正在做的事，避免"你让她挖矿、她还在那边发呆"
-        if self.life:
-            self.life.pause()
-            try:
-                await self._engine_call("task.cancel", {})
-            # 清理路径：取消时抛什么都不重要，这里就是要吞掉
-            except Exception:  # noqa: BLE001
-                pass
+        if self._emergency_stopped:
+            yield event.plain_result("机器人处于急停状态，先用 /mc继续 恢复")
+            return
         try:
-            msg = await self.goals.start(arg)
+            msg = await self._start_player_goal(arg)
             yield event.plain_result(f"🎯 {msg}")
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"❌ {exc}")
@@ -1952,8 +2087,28 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc继续", alias={"mcresume"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_resume(self, event: AstrMessageEvent):
-        """继续当前目标"""
-        yield event.plain_result(await self.goals.resume() if self.goals else "目标系统未初始化")
+        """恢复急停或继续当前目标；无目标时恢复自主生活。"""
+        try:
+            if self.engine and self.engine.running:
+                await self.engine.call("safety.resume", {}, timeout=10.0)
+            self._emergency_stopped = False
+            msg = await self.goals.resume() if self.goals else ""
+            if self.life and not (self.goals and self.goals.active):
+                self.life.resume()
+                self.life.retry_decision_now()
+                self.life.wake(reason="用户继续自主游玩")
+                msg = "已恢复自主游玩"
+            yield event.plain_result(msg or "已解除急停")
+        except Exception as exc:  # noqa: BLE001
+            self._emergency_stopped = True
+            if self.life:
+                self.life.pause(reason="恢复失败", max_seconds=0)
+            if self.engine and self.engine.running:
+                try:
+                    await self.engine.safety_stop()
+                except Exception:
+                    logger.warning("恢复失败后重新急停引擎失败")
+            yield event.plain_result(f"恢复失败，仍保持暂停：{exc}")
 
     @filter.command("mc放弃", alias={"mcabandon"})
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1961,7 +2116,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """放弃当前目标"""
         msg = await self.goals.abandon() if self.goals else "目标系统未初始化"
         # 任务结束了 → 让她继续过自己的日子
-        if self.life:
+        if self.life and not self._emergency_stopped:
             self.life.resume()
         yield event.plain_result(msg)
 

@@ -14,6 +14,7 @@
 可选环境变量：
   MC_TEST_PORT=25566   连哪个服务器（默认不连，只测引擎通道）
   MC_TEST_CONNECT=1    是否真的进服
+  MC_TEST_DEATH=1      在项目测试服验证死亡/重生与急停（会杀死测试机器人）
   MC_ENGINE_DIR=...    指定引擎目录（默认用仓库里的 engine/）
 """
 
@@ -23,9 +24,11 @@ import asyncio
 import io
 import os
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -94,7 +97,7 @@ class FakeContext:
         self.sent.append((umo, text))
 
 
-async def main() -> int:
+async def _main() -> int:
     print("=== 插件 ↔ 引擎 集成测试 ===")
     print(f"引擎目录：{ENGINE_DIR}\n")
 
@@ -193,6 +196,8 @@ async def main() -> int:
                 st = await plugin.engine.status()
                 note(f"位置：{st.get('position')}，生命 {st.get('health')}")
                 brief = await plugin._get_brief()
+                if "未进服" in brief:
+                    bad("进服后状态简报仍使用断线缓存")
                 note("状态简报：")
                 for line in brief.strip().splitlines():
                     print(f"       {line}")
@@ -206,6 +211,29 @@ async def main() -> int:
                 ts = await plugin.engine.task_status(r.get("task_id"))
                 ok(f"任务可查询：{ts.get('name')} / {ts.get('status')}")
                 await plugin.engine.cancel_task(r.get("task_id"))
+                if os.environ.get("MC_TEST_DEATH") == "1":
+                    from lib.rcon import Rcon
+
+                    await plugin._emergency_stop()
+                    before_death = time.time()
+                    rcon = Rcon.from_dir(_paths.REPO / ".testserver", int(os.environ.get("MC_RCON_PORT", "25576")))
+                    try:
+                        await asyncio.to_thread(rcon.command, f"kill {config['bot_username']}")
+                    finally:
+                        rcon.close()
+                    for _ in range(100):
+                        events = {item["event"] for item in plugin._event_buffer if item["at"] >= before_death}
+                        if {"bot.death", "bot.respawn"} <= events and not plugin.life._dead:
+                            break
+                        await asyncio.sleep(0.1)
+                    else:
+                        raise AssertionError("死亡后未收到真实重生通知，或 DEAD 停牌未解除")
+                    if not plugin.life.paused or not plugin._emergency_stopped:
+                        raise AssertionError("重生意外解除了主人急停")
+                    state = await plugin.engine.status()
+                    if state.get("health", 0) <= 0 or not state.get("emergency_stopped"):
+                        raise AssertionError(f"重生身体状态错误：{state}")
+                    ok("真实死亡→重生解除 DEAD，Python 与引擎仍保持主人急停")
             else:
                 bad("进服未成功（plugin.connected 仍为 False）")
         except Exception as exc:  # noqa: BLE001
@@ -249,6 +277,15 @@ async def main() -> int:
         return 1
     print("✅ 插件与引擎的集成通道工作正常")
     return 0
+
+
+async def main() -> int:
+    _paths.require_astrbot("test_integration")
+    main_mod = _paths.plugin_module("main")
+    # 跑完整生命周期，但测试记忆与工作站不能写进实际插件的数据目录。
+    with tempfile.TemporaryDirectory(prefix="astrcraft-integration-") as scratch:
+        with patch.object(main_mod, "resolve_data_dir", return_value=Path(scratch)):
+            return await _main()
 
 
 if __name__ == "__main__":

@@ -329,7 +329,7 @@ class McPerceptionTools:
         item: str,
         count: int = 1,
     ) -> MessageEventResult:
-        """从附近的箱子里取东西（先走到箱子旁边，或者箱子就在手边）。
+        """自动寻找附近的箱子，走到能打开的位置后取东西。
 
         需要材料但存在箱子里时用它——别重新去挖一遍。
 
@@ -340,17 +340,23 @@ class McPerceptionTools:
         if not await self._ensure_engine():
             yield event.plain_result("引擎未运行")
             return
+        requested = max(1, int(count))
         try:
             r = await self.engine.call(
                 "container.withdraw",
-                {"item": item, "count": max(1, int(count))},
+                {"item": item, "count": requested},
                 timeout=60.0,
             )
         except EngineError as exc:
             yield event.plain_result(f"取东西失败：{exc}")
             return
         if r.get("ok"):
-            yield event.plain_result(f"从箱子里取了 {item}×{r.get('taken') or count}")
+            taken = r.get("taken", requested)
+            if isinstance(taken, dict):
+                summary = "、".join(f"{name}×{amount}" for name, amount in taken.items())
+            else:
+                summary = f"{item}×{taken}"
+            yield event.plain_result(f"从箱子里取了 {summary or '0 个物品'}")
         else:
             yield event.plain_result(f"没取到：{r.get('reason') or '附近可能没有箱子，或者箱子里没有这个'}")
 
@@ -387,7 +393,9 @@ class McPerceptionTools:
         try:
             target_p = player.strip() or getattr(event, "_sender", "")
             if target_p and (x == 0 and z == 0):
-                r = await self.engine.call("move.follow", {"target": target_p}, timeout=FAST_TIMEOUT)
+                r = await self.engine.call(
+                    "move.to_player", {"target": target_p, "timeout_ms": 60000}, timeout=FAST_TIMEOUT
+                )
             else:
                 r = await self.engine.call(
                     "move.to", {"x": float(x), "z": float(z), "timeout_ms": 60000}, timeout=FAST_TIMEOUT

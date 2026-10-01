@@ -79,7 +79,7 @@ class Hold(Enum):
 # **谁来解开**——照 numen 的 releasedBy 表。缺了这张表，停牌就会变成"永久停滞"。
 HOLD_RELEASE: dict["Hold", str] = {
     Hold.NONE: "",
-    Hold.DEAD: "复活（收到 bot.spawn）",
+    Hold.DEAD: "恢复生命（收到进服或重生通知）",
     Hold.DISCONNECTED: "重新进服",
     Hold.PAUSED_BY_OWNER: "主人恢复，或暂停超时自动恢复",
     Hold.BLOCKED: "模型端点恢复（配好 provider 后自己解开）",

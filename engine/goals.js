@@ -11,6 +11,11 @@
 
 const log = require('./log');
 const { CancelledError, delay } = require('./util');
+const { AsyncLocalStorage } = require('node:async_hooks');
+
+// Carries the identity of an execution through nested calls and bare awaits.
+// A cancelled execution must not acquire the body again after its grace period.
+const executionContext = new AsyncLocalStorage();
 
 /** 优先级：数值越小越先执行 */
 const PRIORITY = {
@@ -167,7 +172,7 @@ class Task {
 }
 
 class TaskQueue {
-  constructor({ onTaskFinished = null, onTaskStarted = null } = {}) {
+  constructor({ onTaskFinished = null, onTaskStarted = null, onTaskAborted = null } = {}) {
     /** @type {Task[]} */
     this._queue = [];
     /** @type {Task|null} */
@@ -175,6 +180,8 @@ class TaskQueue {
     this._history = [];
     this._onTaskFinished = onTaskFinished;
     this._onTaskStarted = onTaskStarted;
+    this._onTaskAborted = onTaskAborted;
+    this.cancelGraceMs = 100;
     this._pumpScheduled = false;
     this._paused = false;
     this._stats = { submitted: 0, completed: 0, failed: 0, cancelled: 0, preempted: 0 };
@@ -203,6 +210,10 @@ class TaskQueue {
     return { ...this._stats };
   }
 
+  hasTask(predicate) {
+    return !!((this._current && predicate(this._current)) || this._queue.some(predicate));
+  }
+
   /**
    * **防抖动三件套**（身体层设计 S4，见 docs/BODY_LAYER.md）。
    *
@@ -220,6 +231,8 @@ class TaskQueue {
    *      这一条用的是 S3 加的 preemptCount。
    */
   _thrashGuard(task) {
+    // Life-threatening reactions cannot wait for the occupancy/cooldown guard.
+    if (task.priority < PRIORITY.REFLEX) return false;
     const now = Date.now();
     const cur = this._current;
     if (!cur) return false;
@@ -266,6 +279,7 @@ class TaskQueue {
    */
   submit(spec) {
     const task = spec instanceof Task ? spec : new Task(spec);
+    if (task.status !== 'pending' || this._queue.includes(task) || this._current === task) return task;
     this._stats.submitted += 1;
 
     // 判断是否需要抢占当前任务。
@@ -277,16 +291,14 @@ class TaskQueue {
     const isReflexLevel = newPriority >= PRIORITY.REFLEX && newPriority < PRIORITY.SURVIVAL;
     const currentIsProtected = this._current && this._current.priority >= PROTECTED_FROM_REFLEX;
 
-    if (this._current && newPriority < curPriority && this._current.preemptible) {
+    if (this._current && this._current.status === 'running' && newPriority < curPriority &&
+        (this._current.preemptible || newPriority < PRIORITY.REFLEX)) {
       if (isReflexLevel && currentIsProtected) {
         // 普通反射遇上用户指令：不抢占，排到后面去做
         log.debug(`反射任务 ${task.name} 让位于正在执行的用户任务 ${this._current.name}`);
       } else if (this._thrashGuard(task)) {
         // **防抖动（身体层设计 S4）拦下了这次抢占**，新任务排队等
         // （_thrashGuard 里已经打了日志说明原因）
-        this._queue.push(task);
-        this._sortQueue();
-        this._schedule();
       } else {
         log.info(`任务 ${task.name}(${task.id}) 抢占 ${this._current.name}(${this._current.id})`);
         this._stats.preempted += 1;
@@ -333,7 +345,7 @@ class TaskQueue {
         // requeue 只 abort、不改 status；显式写清楚意图
         victim.status = 'pending';
         victim.error = null;
-        this._current = null;
+        // Keep the body occupied until the aborted execution has stopped.
       }
     }
 
@@ -361,7 +373,7 @@ class TaskQueue {
     if (this._current || this._paused) return;
     const task = this._queue.shift();
     if (!task) return;
-    if (task.status === 'cancelled') {
+    if (task.status !== 'pending') {
       this._schedule();
       return;
     }
@@ -378,6 +390,7 @@ class TaskQueue {
     // 是"我没事"，于是替重跑那次把 promise 结算了。
     task._runToken = (task._runToken || 0) + 1;
     const myToken = task._runToken;
+    const runSignal = task.signal;
     if (this._onTaskStarted) {
       try {
         this._onTaskStarted(task);
@@ -387,7 +400,30 @@ class TaskQueue {
     }
 
     try {
-      const result = await task.run({ signal: task.signal, task });
+      let cancelTimer = null;
+      let onAbort;
+      const interrupted = new Promise((_, reject) => {
+        onAbort = () => {
+          if (this._onTaskAborted) {
+            try { executionContext.exit(() => this._onTaskAborted(task)); }
+            catch (err) { log.warn('取消身体操作失败', err.message); }
+          }
+          cancelTimer = setTimeout(() => reject(new CancelledError('动作被取消')), this.cancelGraceMs);
+        };
+        runSignal.addEventListener('abort', onAbort, { once: true });
+        if (runSignal.aborted) onAbort();
+      });
+      let result;
+      try {
+        result = await Promise.race([
+          executionContext.run({ signal: runSignal, task }, () => task.run({ signal: runSignal, task })),
+          interrupted,
+        ]);
+        if (runSignal.aborted) throw new CancelledError('动作被取消');
+      } finally {
+        clearTimeout(cancelTimer);
+        runSignal.removeEventListener('abort', onAbort);
+      }
       if (task._runToken !== myToken) {
         // **这次执行已经被作废**（被抢占后回队头重排了）→ 这次不算结束。
         // promise 保持 pending，既不 resolve（会报假成功、onDone 误触发），
@@ -416,7 +452,7 @@ class TaskQueue {
         task._resolve(task.result);
       }
     } catch (err) {
-      const cancelled = err instanceof CancelledError || err.name === 'CancelledError' || task.signal.aborted;
+      const cancelled = err instanceof CancelledError || err.name === 'CancelledError' || runSignal.aborted;
       if (task._runToken !== myToken) {
         // **被抢占后已重排 → 既不算取消也不算失败**（P4）。
         // 不 reject（否则 bot.js 的 .catch 会调 onFailed 记一笔假失败），
@@ -443,6 +479,8 @@ class TaskQueue {
       // `_current` / 历史 / 回调全部搅乱。
       if (task._runToken !== myToken) {
         log.debug(`${task.name}(${task.id}) 的旧执行收尾（已被重排取代），不碰任何状态`);
+        if (this._current === task) this._current = null;
+        this._schedule();
       } else {
         task.finishedAt = Date.now();
         // **只清掉"确实是自己"的那一份**。
@@ -556,6 +594,11 @@ class TaskQueue {
     this._schedule();
   }
 
+  setPaused(paused) {
+    this._paused = !!paused;
+    if (!this._paused) this._schedule();
+  }
+
   get currentInfo() {
     if (!this._current) return null;
     return {
@@ -575,4 +618,4 @@ class TaskQueue {
   }
 }
 
-module.exports = { TaskQueue, Task, PRIORITY, nextTaskId, PROTECTED_FROM_REFLEX };
+module.exports = { TaskQueue, Task, PRIORITY, nextTaskId, PROTECTED_FROM_REFLEX, executionContext };

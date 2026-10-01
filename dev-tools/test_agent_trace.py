@@ -14,6 +14,8 @@ user 消息开始），所以等价物是**写进"最近做过的事"**，让下
 
 import sys
 import pathlib
+import ast
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -23,7 +25,7 @@ import _paths  # noqa: E402
 _paths.require_astrbot("test_agent_trace")
 
 _paths.load_plugin()
-from astrcraft_plugin.life import LifeLoop  # noqa: E402
+from astrcraft_plugin.life import Hold, LifeLoop  # noqa: E402
 
 passed = 0
 failed = 0
@@ -57,6 +59,15 @@ def make_loop():
     loop.drives = None
     # W3 加的重试上限（真实 __init__ 里设，桩要跟上）
     loop._decide_retry_limit = 2
+    loop._decide_timeouts = 0
+    loop._blocked_reason = ""
+    loop._dead = False
+    loop._engine_up = True
+    loop._paused = False
+    loop._pause_reason = ""
+    loop._pause_until = 0.0
+    loop._is_connected = lambda: True
+    loop._announced_hold = None
     return loop
 
 
@@ -103,14 +114,27 @@ for i in range(20):
 ok("最多保留 8 条", len(lp._recent_outcomes) <= 8, f"{len(lp._recent_outcomes)} 条")
 ok("留下的是最近的", "第 19 次" in lp._recent_outcomes[-1]["detail"], lp._recent_outcomes[-1]["detail"])
 
-print("\n=== 重试上限（不再无限重试）===")
+print("\n=== 连续故障进入有限退避，且每次都留痕 ===")
 lp = make_loop()
-ok("默认最多重试 2 次", lp._decide_retry_limit == 2, f"limit={lp._decide_retry_limit}")
+lp._note_decision_failure("端点超时", kind="timeout")
+lp._note_decision_failure("端点断线", kind="failed")
+ok("两次失败都留在下一轮可见的记录中", len(lp._recent_outcomes) == 2 and all(e.get("decision") for e in lp._recent_outcomes))
+ok("保留超时和调用异常的具体原因", "端点超时" in lp._render_recent() and "端点断线" in lp._render_recent())
+ok("连续两次故障进入 BLOCKED", lp._decide_timeouts == 2 and lp.current_hold() is Hold.BLOCKED)
+ok("恢复期限有限，不会永久停牌", 0 < lp._decision_retry_at - time.time() <= 30)
+lp.note_unblocked()
+ok("成功后清零连续故障计数并解除停牌", lp._decide_timeouts == 0 and lp.current_hold() is Hold.NONE)
 
 print("\n=== 源码里确实接上了（防止只改了注释）===")
 src = (_paths.REPO / "life.py").read_text(encoding="utf-8")
-ok("两条决策路径都调了 note_decision_cut", src.count("self.note_decision_cut(") >= 3,
-   f"出现 {src.count('self.note_decision_cut(')} 次（含定义处 0 次）")
+loop_node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_loop")
+timeout_handlers = [
+    n for n in ast.walk(loop_node)
+    if isinstance(n, ast.ExceptHandler) and isinstance(n.type, ast.Attribute) and n.type.attr == "TimeoutError"
+    and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "_note_decision_failure" for c in ast.walk(n))
+]
+ok("两条决策路径的超时都接入统一失败留痕入口", len(timeout_handlers) == 2,
+   f"接入 {len(timeout_handlers)} 条决策路径")
 ok("超时到上限会进停牌", "self.note_blocked(" in src and "_decide_retry_limit" in src)
 ok("成功一次会解开 BLOCKED", "self.note_unblocked()" in src)
 

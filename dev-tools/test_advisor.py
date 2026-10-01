@@ -98,6 +98,24 @@ check(
 
 print("\n=== 决策权在 LLM：失败后先「再问一次」，而不是替他决定 ===")
 
+print("\n=== 生存优先级与就地补给 ===")
+urgent = A.advise({"wooden_pickaxe": 1, "bread": 3}, food=4)
+check("饥饿时吃饭优先于换石镐", urgent.skill == "eat" and urgent.priority == "survival")
+check("残血且不够饱时先吃到能回血", A.advise({"bread": 2}, health=8, food=16).params.get("target_food") == 20)
+check("已经吃饱的残血玩家先恢复", A.advise({"iron_pickaxe": 1}, health=6, food=20).skill == "recover")
+check("现成小麦交给补齐依赖的做饭技能", A.advise({"wheat": 9}, food=4).skill == "cook_food" and A.advise({"wheat": 9}, food=4).params == {"count": 3})
+check("有生食时先烹饪现有食材", A.advise({"chicken": 2}, food=8).skill == "cook_food")
+check("快饿死时安全生食可先救急", A.advise({"beef": 1}, food=0).params.get("item") == "beef")
+check("生鸡肉不作为救急生食", A.advise({"chicken": 1}, food=0).skill == "cook_food")
+check("优先猎取附近的猪而非盲找牛", A.advise({}, food=8, nearby_entities=[{"name": "pig", "distance": 5}]).params.get("mob") == "pig")
+check("金镐不会取代石镐的采矿等级", A.best_tool_tier({"golden_pickaxe": 1, "stone_pickaxe": 1}, ("pickaxe",)) == "stone")
+check("只有金镐仍需升级石器", A.advise({"golden_pickaxe": 1, "cobblestone": 3}).params.get("tier") == "stone")
+check("已有铁矿先熔炼", A.advise({"stone_pickaxe": 1, "raw_iron": 4, "bread": 2}, has_shelter=True).skill == "smelt")
+check("有铁锭直接升级镐", A.advise({"stone_pickaxe": 1, "iron_ingot": 3, "bread": 2}, has_shelter=True).params.get("tier") == "iron")
+check("早期也会整理满背包", A.advise({"wooden_pickaxe": 1}, inventory_slots_used=34).skill == "store_items")
+check("先吃饭再整理背包", A.advise({"bread": 2}, food=4, inventory_slots_used=36).skill == "eat")
+check("背包里没有家具不代表屋里没有", not any("没有床" in w or "没有箱子" in w for w in A.advise({"bread": 3}, has_shelter=True).warnings))
+
 
 def make_loop(llm=None) -> "L.LifeLoop":
     async def _noop(*a, **k):

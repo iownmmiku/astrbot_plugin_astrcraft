@@ -198,10 +198,15 @@ class LifeLoop(PromptRenderMixin):
         self._perception_failures = 0
         self._perception_disabled_until = 0.0
         self._decide_timeouts = 0
+        self._decision_retry_at = 0.0
+        self._probing_endpoint = False
+        # 未被模型成功处理的输入跨重试保留，避免一次端点故障吃掉玩家指令。
+        self._decision_input_text = ""
         # **有序计划（任务排序）**：LLM 一次给几步，循环里按顺序执行，
         # 中间不再问模型 —— 这是"连续行动"的关键。
         self._plan: list[dict] = []
         self._plan_source: str = ""
+        self._plan_revision = 0
         # 解析出来的"待装入"计划（_parse_decision 填、decide 末尾装队列）
         self._pending_plan: list[dict] = []
         self._session_planned = False
@@ -218,9 +223,7 @@ class LifeLoop(PromptRenderMixin):
         # 我第一版写成 self._cfg(...) → AttributeError 被循环的 except 吞掉 →
         # 每 8 秒重试一次、**永远不决策**（test_life_rhythm 立刻抓到："30 秒内行动 0 次"）。
         self._min_decide_gap = float(min_decide_gap or 0)
-        # **决策失败最多重试几次**（W3）：照 numen 的"每条链只重试一次"。
-        # 到上限就进 BLOCKED 停牌并说清楚，而不是每 8 秒无限重试
-        # （实测那样能连着几十次，她一直在"想事情"却什么都没做）。
+        # 连续失败两次后进入端点退避；到期自动探测，成功后解除。
         self._decide_retry_limit = 2
         # ---- 永不空闲（W7）----
         # **只对"同一件事反复失败"退避**，不对所有决策退避。
@@ -230,6 +233,8 @@ class LifeLoop(PromptRenderMixin):
         self._idle_since = 0.0  # 从什么时候开始连续没事做
         self._last_idle_note_at = 0.0  # 上次把"没事做"说出去的时间（别刷屏）
         self._backoff_until = 0.0  # 失败退避到什么时候
+        self._failure_backoff_seen: dict[str, tuple] = {}
+        self._failure_revisions: dict[str, int] = {}
         # ---- 输入队列（W4，见 docs/PLAN_v2.md）----
         # 主人的话与世界事件**共用**这一个队列。没有它的时候：
         # 她跑长任务时主人说话她听不见；世界事件只有下一轮决策时才知道。
@@ -372,17 +377,30 @@ class LifeLoop(PromptRenderMixin):
         （说明她卡住了，再立刻重试还是同样结果，只会刷日志）。
         """
         now = time.time()
+        counts = self._failure_counts()
+        seen = getattr(self, "_failure_backoff_seen", {})
+        revisions = getattr(self, "_failure_revisions", {})
+        fresh = {}
+        for skill, count in counts.items():
+            signature = (revisions.get(skill, 0), tuple(self._recent_failures[skill]))
+            if count >= 3 and seen.get(skill) != signature:
+                fresh[skill] = count
+                seen[skill] = signature
+        self._failure_backoff_seen = seen
+        # 新指令和急件可以打断技能退避；失败事实仍保留给下一轮改做法。
+        inbox = getattr(self, "inbox", None)
+        if inbox is not None and (inbox.has_urgent() or inbox.has_delivery(Delivery.STEER)):
+            self._backoff_until = 0.0
+            return False
         if now < self._backoff_until:
             return True
-        # 同一个技能失败 3 次以上 → 歇 30 秒（`_recent_failures` 是 W3 之前就有的）
-        counts = self._failure_counts()
-        if counts and max(counts.values()) >= 3:
+        if fresh:
             self._backoff_until = now + 30.0
             logger.info(
                 "失败退避 30 秒（同一件事已经失败 %d 次：%s）——"
                 "这不是'没事做'，是它卡住了，立刻重试只会得到同样结果",
-                max(counts.values()),
-                "、".join(sorted(counts)[:3]),
+                max(fresh.values()),
+                "、".join(sorted(fresh)[:3]),
             )
             return True
         return False
@@ -443,17 +461,23 @@ class LifeLoop(PromptRenderMixin):
 
         if ok:
             self._recent_failures.pop(name, None)
+            getattr(self, "_failure_backoff_seen", {}).pop(name, None)
+            if not self._failure_counts():
+                self._backoff_until = 0.0
             if name in ("build_shelter", "建庇护所"):
                 self._has_shelter = True
             return
         bucket = self._recent_failures.setdefault(name, [])
         bucket.append(now)
+        revisions = getattr(self, "_failure_revisions", {})
+        revisions[name] = revisions.get(name, 0) + 1
+        self._failure_revisions = revisions
         # 只保留窗口内的
         self._recent_failures[name] = [t for t in bucket if now - t <= self._failure_window][-8:]
         # **一步失败就丢掉剩余计划**：计划是按"前一步成功"排的，
         # 前一步失败还硬按原顺序做后面的事，只会连环失败。
         # 丢掉之后下一轮会重新问 LLM 排一份新的（它会看到失败记录）。
-        if self._plan:
+        if self._plan or getattr(self, "_pending_plan", []):
             self.clear_plan(f"{name} 失败：{(error or '')[:40]}")
         logger.info("记录失败：%s（近半小时第 %d 次）%s", name, len(self._recent_failures[name]), error[:60])
         # **学习回路**：同一个坑摔第三次就停下来总结一条教训。
@@ -544,20 +568,47 @@ class LifeLoop(PromptRenderMixin):
 
 
 
-    async def _build_advice(self) -> object:
+    async def _build_advice(self, state: dict | None = None) -> object:
         """算一次生存建议。"""
-        st = await self._gather_state()
+        st = state if state is not None else await self._gather_state()
         adv = advise(
             st.get("inventory") or {},
-            health=float(st.get("health", 20) or 20),
-            food=int(st.get("food", 20) or 20),
+            health=float(st["health"] if st.get("health") is not None else 20),
+            food=int(st["food"] if st.get("food") is not None else 20),
             has_shelter=bool(st.get("has_shelter", self._has_shelter)),
             recent_failures=self._failure_counts(),
             is_night=bool(st.get("is_night", False)),
             inventory_slots_used=int(st.get("inventory_slots_used", 0) or 0),
+            nearby_entities=st.get("nearby_entities") or [],
         )
         self._last_advice = adv
         return adv
+
+    async def _survival_step(self) -> dict | None:
+        """在计划的安全边界补给；保留剩余目标，不增加模型往返。"""
+        if not self._state_provider or not self._plan:
+            return None
+        revision = self._plan_revision
+        state = await self._gather_state()
+        if revision != self._plan_revision or not self.may_act() or self.inbox.has_delivery(Delivery.STEER):
+            return None
+        if not isinstance(state.get("inventory"), dict) or state.get("food") is None or state.get("health") is None:
+            return None
+        if state["health"] <= 0:
+            self.note_dead(True)
+            return None
+        advice = await self._build_advice(state)
+        if advice.priority not in ("survival", "maintenance") or not advice.skill or not self._skill_is_known(advice.skill):
+            return None
+        if advice.priority == "maintenance" and self._plan[0]["skill"] not in ("chop_tree", "mine_stone", "mine_ores", "collect", "hunt"):
+            return None
+        if self._failure_counts().get(advice.skill, 0) >= 2:
+            self.clear_plan(f"生存补给 {advice.skill} 连续失败，重新观察并换策略")
+            return None
+        if self._plan[0]["skill"] == advice.skill:
+            return None
+        logger.info("计划先处理生存需求：%s；原来的 %d 步保留", advice.why, len(self._plan))
+        return {"skill": advice.skill, "params": advice.params, "why": advice.why}
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -621,7 +672,7 @@ class LifeLoop(PromptRenderMixin):
             logger.warning("停牌：%s", self.hold_explain())
 
     def note_dead(self, dead: bool) -> None:
-        """她死了/复活了。由 main.py 在 bot.death / bot.spawn 时调用。"""
+        """她死了/复活了。由 main.py 在死亡、进服和重生通知中调用。"""
         self._dead = bool(dead)
         self._announce_hold()
 
@@ -630,15 +681,43 @@ class LifeLoop(PromptRenderMixin):
         self._engine_up = bool(up)
         self._announce_hold()
 
-    def note_blocked(self, reason: str = "") -> None:
-        """模型端点不可用（拿不到 provider、调用连续失败…）。"""
+    def note_blocked(self, reason: str = "", *, retry_after: float = 30.0) -> None:
+        """模型暂时不可用：有限退避后自动探测，不永久停住生活循环。"""
         self._blocked_reason = str(reason or "未知原因")
+        self._decision_retry_at = time.time() + max(0.0, float(retry_after))
         self._announce_hold()
 
     def note_unblocked(self) -> None:
         """模型端点恢复了。"""
         self._blocked_reason = ""
+        self._decision_retry_at = 0.0
+        self._decide_timeouts = 0
         self._announce_hold()
+
+    def retry_decision_now(self) -> None:
+        """配置或端点恢复后立即探测；保留停牌原因直到真正成功。"""
+        self._decision_retry_at = 0.0
+        self._wake.set()
+
+    def may_act(self) -> bool:
+        """提交动作前再次检查，防止模型请求期间的暂停被旧结果覆盖。"""
+        hold = self.current_hold()
+        return hold is Hold.NONE or (
+            hold is Hold.BLOCKED and getattr(self, "_probing_endpoint", False)
+        )
+
+    def _note_decision_failure(self, reason: str, *, kind: str = "failed") -> None:
+        self.note_decision_cut(reason, kind=kind)
+        self._decide_timeouts += 1
+        delay = 8.0 if self._decide_timeouts < self._decide_retry_limit else (
+            30.0 * 2 ** min(2, self._decide_timeouts - self._decide_retry_limit)
+        )
+        self._decision_retry_at = time.time() + delay
+        if self._decide_timeouts >= self._decide_retry_limit:
+            self.note_blocked(
+                f"连续 {self._decide_timeouts} 次决策失败：{reason}", retry_after=delay
+            )
+        logger.warning("决策暂不可用，%.0f 秒后自动重试（第 %d 次）", delay, self._decide_timeouts)
 
 
     def wake(self, reason: str = "") -> None:
@@ -657,268 +736,200 @@ class LifeLoop(PromptRenderMixin):
     # ------------------------------------------------------------ 主循环
 
     async def _loop(self) -> None:
-        # 进服后先等一会儿，别一上来就开始折腾
-        await asyncio.sleep(20)
+        # 区块加载给一点宽限；进服事件已经叫醒时立即开始。
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            # 启动宽限自然到期是预期路径，随后正常开始决策。
+            pass
+        next_wait = 0.0
         while not self._stopped:
             try:
-                # **用"可被唤醒的等待"代替固定 sleep。**
-                #
-                # 早期是 `await asyncio.sleep(90)` + 动作后再压 120 秒，
-                # 于是实测她的决策间隔是 **190~200 秒**——哪怕技能 10 秒就做完了，
-                # 她也要干站着三分半才想下一件事。用户看到的就是"她不动"。
-                # 真人做完一件事会**立刻**想下一步，所以这里改成：
-                #   - 平时最多等 decide_interval 秒
-                #   - 任务一结束（task.finished）立刻唤醒她继续想
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=self._decide_interval)
-                    self._wake.clear()
-                # 等超时是**正常路径**（唤醒/轮询的等待），不是错误
-                except asyncio.TimeoutError:
-                    pass
+                if next_wait > 0:
+                    try:
+                        await asyncio.wait_for(self._wake.wait(), timeout=next_wait)
+                    except asyncio.TimeoutError:
+                        # 唤醒等待的期限到达是正常轮询，不是决策失败。
+                        pass
+                self._wake.clear()
                 if self._stopped:
                     break
-
-                # **失败感知退避（W7），取代上一轮那个"一刀切 6 秒"。**
-                #
-                # 上一轮我加过 `min_decide_gap = 6`（对所有决策一律压 6 秒），
-                # 用来治"乱走乱挖"。但那个药方是错的：病根是**重新规划太频繁
-                # （每决策一次就改主意）**，不是"手上没活"。一刀切压间隔的副作用是
-                # **她没事做的时候也要干等 6 秒**——而用户明确要求"没有任务就立刻发起一个"。
-                #
-                # 现在的分工：
-                #   - "别频繁改主意" 交给**计划连续性**（见下面的计划优先）
-                #   - 时间退避**只用于"同一件事反复失败"**（真的卡住了才歇）
-                #   - 其余情况**一律立刻行动**，不等待
-                if self._should_back_off():
-                    await asyncio.sleep(2.0)
-                    continue
-
+                next_wait = self._decide_interval
+                self._probing_endpoint = False
                 self.drives.tick()
                 self.drives.save()
-
-                # 暂停超期自动恢复：不能让一次失败（比如工具报错、没有产生任务）
-                # 把她永久按在原地——那正是"她再也不自己动"的原因。
                 self._auto_resume_if_expired()
-
-                # **停牌判断收成一处**（W2）。
-                #
-                # 原来是 5 个独立条件、各自 `continue`，而且**一句日志都没有**——
-                # 她站在原地不动时，日志里只有一行"跳过"，没人说得清是哪一个。
-                # 现在：current_hold() 合成唯一答案，进/出只在变化沿打日志。
                 self._announce_hold()
                 hold = self.current_hold()
-                if hold is not Hold.NONE:
-                    # 停牌期间不空转：等一会儿再看（_wake 会在有输入时立刻叫醒）
-                    try:
-                        await asyncio.wait_for(self._wake.wait(), timeout=5.0)
-                        self._wake.clear()
-                    # 等超时是**正常路径**（唤醒/轮询的等待），不是错误
-                    except asyncio.TimeoutError:
-                        pass
+                now = time.time()
+                if hold is Hold.BLOCKED and now >= self._decision_retry_at:
+                    # 让恢复探测越过 BLOCKED，成功才清掉故障原因。
+                    self._probing_endpoint = True
+                elif hold is not Hold.NONE:
+                    next_wait = min(5.0, self._decide_interval)
+                    if hold is Hold.BLOCKED:
+                        next_wait = min(next_wait, max(0.05, self._decision_retry_at - now))
                     continue
 
-                if time.time() < self._busy_until:
+                if now < self._decision_retry_at:
+                    next_wait = min(5.0, self._decision_retry_at - now)
+                    continue
+                # 技能退避放在暂停过期处理之后，同一批失败只消费一次。
+                if self._should_back_off():
+                    next_wait = min(5.0, max(0.05, self._backoff_until - now))
+                    continue
+                if now < self._busy_until:
+                    next_wait = min(2.0, self._busy_until - now)
+                    continue
+                if await self._engine_busy():
+                    # 完成事件会直接唤醒；事件丢失时也有短轮询兜底。
+                    next_wait = min(2.0, self._decide_interval)
                     continue
 
-                # 引擎空闲才自主行动：有任务在跑说明你（或目标系统）已经在用她
-                busy = await self._engine_busy()
-                if busy:
-                    continue
-
-                # **控制条目只在完全空闲时执行**（W4）。
-                #
-                # 走到这里 = 没停牌 + 引擎空闲 + 计划空 —— 也就是"她确实没事做"。
-                # 整理记忆/清空上下文会改变她正在看的历史，干活干到一半做等于抽走图纸，
-                # 所以它们排在队首当屏障，等到这一刻才执行。
                 if self.inbox.head_is_control():
                     what = self._run_control()
                     if what:
                         self.state_note(f"我{what}了")
+                    next_wait = 0.0
                     continue
 
-                # **接续：只在她本来要停的时候接上**（W4）。
-                #
-                # 和插话的区别：插话是"她还要继续干活，顺便告诉她新情况"；
-                # 接续是"她本来要停下来了，正好有件事可以接着做"。
-                # 没有这一步的话，队列里躺着"砍树做完了""箱子满了"这类事，
-                # 而她会因为"计划空 + 没任务"被判成没事做（IDLE_NO_WORK）。
                 follow_up = self._take_follow_up_text()
                 if follow_up:
-                    logger.info("接上排队的后续事项，继续干活")
-                    self._note_busy_round()
-                    self._pending_follow_up = follow_up
-                else:
-                    self._pending_follow_up = ""
+                    self._pending_follow_up = "\n".join(
+                        text for text in (self._pending_follow_up, follow_up) if text
+                    )
 
-                # **agent 写的计划要在下一轮生效**（C 批次）。
-                #
-                # 计划机制本来就在，但只有旧路径会写它；走 agent 路径时
-                # agent 每轮都返回"我处理了"，于是计划机制是死的 ——
-                # 她每走一步都要过一次模型（玩家看到的就是"老站着不动"）。
                 if self._pending_plan and not self._plan:
                     self._set_plan(self._pending_plan, source="agent")
                     self._pending_plan = []
+                # 普通完成通知不打断既定计划；受伤、工具坏或新指令在步骤边界重规划。
+                if self.inbox.has_delivery(Delivery.STEER):
+                    self.clear_plan("有新的指令或环境变化，先处理输入")
 
-                # **计划优先：有计划就直接执行下一步，不调模型（W7 的核心）。**
-                #
-                # 为什么必须放在 agent 之前：agent 正常可用时**每轮都会返回 True**
-                # （"这一轮我处理了"），于是它下面的 `_pop_plan_step()` 永远轮不到
-                # ——**计划机制在 agent 可用时是死代码**。而它正是那条
-                # "不花 token 的路"。用户要的"没有任务就立刻发起一个"，
-                # 最省的做法就是先把已经想好的下一步做掉。
-                step = self._pop_plan_step()
+                # 计划优先：正常的步骤衔接不调模型。
+                boundary_revision = self._plan_revision
+                had_plan = bool(self._plan)
+                step = await self._survival_step()
+                if boundary_revision != self._plan_revision or not self.may_act() or (had_plan and self.inbox.has_delivery(Delivery.STEER)):
+                    next_wait = 0.0
+                    continue
+                if step is None:
+                    step = self._pop_plan_step()
                 if step is not None:
                     decision = self._decision_from_step(step)
                     logger.info(
                         "按计划执行（还剩 %d 步）：%s（技能 %s）——不调模型",
-                        len(self._plan),
-                        decision.activity,
-                        decision.skill,
+                        len(self._plan), decision.activity, decision.skill,
                     )
                     self._note_busy_round()
                     await self._act(decision)
+                    next_wait = min(2.0, self._decide_interval)
                     continue
 
-                # **首选：让 LLM 用工具直接驱动她**（让模型直接用工具）。
-                #
-                # 早期这里是"LLM 挑一个技能名 → 我提交技能任务"，
-                # 也就是说真正干活的是我写的脚本，LLM 只是在按按钮。
-                # 现在改成：把观察 + 完整工具集交给模型，它自己一步步动手。
-                # 拿不到工具集（没配 provider 等）时返回 None，自动退回旧路径。
+                # 没停牌、引擎空闲、计划也空了，才需要一次新的模型决策。
                 if self.action_agent is not None:
                     try:
                         handled = await asyncio.wait_for(
                             self._act_via_agent(), timeout=self._decide_timeout
                         )
                     except asyncio.TimeoutError:
-                        # **失败要留痕 + 只重试一次**（W3，见 docs/PLAN_v2.md）。
-                        #
-                        # 原来这里只是"打一行日志 + sleep(8) 重来"，两个毛病：
-                        #   ① 模型不知道上一轮被切断了 → 下一轮可能原样再来一遍，
-                        #      或者以为自己做过什么（其实那轮根本没跑起来）
-                        #   ② **无限重试**：`_decide_timeouts` 只计数从不放弃，
-                        #      实测能连着几十次，她一直在"想事情"但什么都没做
-                        # 现在：记进"最近做过的事"（下一轮观察里带着），
-                        # 连续 2 次就进 BLOCKED 停牌并说清楚——
-                        # 端点真有问题就该让人知道，而不是假装还在努力。
-                        self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
-                        self.note_decision_cut(
+                        self._note_decision_failure(
                             f"{self._decide_timeout:.0f} 秒没想出来", kind="timeout"
                         )
-                        if self._decide_timeouts >= self._decide_retry_limit:
-                            logger.error(
-                                "自主行动连续超时 %d 次（每次 %.0f 秒），"
-                                "不再重试——进停牌，等端点恢复或人来处理",
-                                self._decide_timeouts,
-                                self._decide_timeout,
-                            )
-                            self.note_blocked(
-                                f"连续 {self._decide_timeouts} 次决策超时"
-                                f"（每次 {self._decide_timeout:.0f} 秒）"
-                            )
-                            continue
-                        logger.warning(
-                            "自主行动超时（%.0f 秒，第 %d/%d 次），8 秒后重试一次",
-                            self._decide_timeout,
-                            self._decide_timeouts,
-                            self._decide_retry_limit,
-                        )
-                        await asyncio.sleep(8)
+                        next_wait = min(5.0, self._decision_retry_at - time.time())
                         continue
                     except asyncio.CancelledError:
                         self.note_decision_cut("循环被取消", kind="cancelled")
                         raise
                     except Exception as exc:  # noqa: BLE001
-                        self.note_decision_cut(str(exc), kind="failed")
-                        self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
-                        if self._decide_timeouts >= self._decide_retry_limit:
-                            logger.error("自主行动连续出错 %d 次，进停牌", self._decide_timeouts)
-                            self.note_blocked(f"连续 {self._decide_timeouts} 次决策出错：{exc}")
-                            continue
-                        await asyncio.sleep(8)
+                        self._note_decision_failure(str(exc))
+                        next_wait = min(5.0, self._decision_retry_at - time.time())
                         continue
                     if handled:
-                        self._decide_timeouts = 0
-                        # **成功一次就把"模型不可用"解开**：说明端点其实好的。
-                        if self._blocked_reason:
-                            self.note_unblocked()
-                        # **agent 跑了一轮**，但它可能什么都没提交（只是看了看、
-                        # 或者想不出该干嘛）。
-                        #
-                        # **判"没事做"必须把队列也算进去**（W4）：队列里躺着
-                        # "砍树做完了""箱子满了"这类排着的事，那就不叫没事做
-                        # ——下一步就会接上它们。只看"计划空 + 没提交任务"
-                        # 会把"有活排队"误判成空闲。
+                        self.note_unblocked()
+                        self._decision_input_text = ""
+                        self._pending_follow_up = ""
                         if (
                             not self._plan
+                            and not self._pending_plan
                             and not await self._engine_busy()
                             and len(self.inbox) == 0
                         ):
                             self.note_idle_round("agent 这一轮没有提交任何任务，队列也空")
+                            next_wait = min(6.0, self._decide_interval)
                         else:
                             self._note_busy_round()
+                            next_wait = 0.0 if self._pending_plan else min(2.0, self._decide_interval)
                         continue
 
-                # 走到这里说明：没停牌、引擎空闲、**计划也空了**、agent 也帮不上
-                # （不可用，或者它这一轮什么都没做）。
-                #
-                # **旧路径的 decide()**：agent 完全不可用时退回"挑技能"的老办法。
-                # （原来上面还有一段"有计划就执行下一步"，已经挪到 agent 之前了
-                # —— 放在这里它在 agent 可用时是死代码。）
-                #
-                # 决策必须带超时。LLM 卡住时若一直等，循环会永久冻结且不留日志，
-                # 表现成"她启动了却什么都不做"，排查时毫无线索。
+                decision_revision = self._plan_revision
                 try:
-                    decision = await asyncio.wait_for(self.decide(), timeout=self._decide_timeout)
-                    self._decide_timeouts = 0
-                    if self._blocked_reason:
-                        self.note_unblocked()  # 成功一次就说明端点其实好的
+                    decision = await asyncio.wait_for(
+                        self.decide(), timeout=self._decide_timeout
+                    )
                 except asyncio.TimeoutError:
-                    # 同 W3：留痕 + 只重试一次，到上限就进停牌（不再无限重试）
-                    self._decide_timeouts = getattr(self, "_decide_timeouts", 0) + 1
-                    self.note_decision_cut(
+                    self._note_decision_failure(
                         f"{self._decide_timeout:.0f} 秒没想出来", kind="timeout"
                     )
-                    if self._decide_timeouts >= self._decide_retry_limit:
-                        logger.error(
-                            "想事情连续超时 %d 次，不再重试——进停牌", self._decide_timeouts
-                        )
-                        self.note_blocked(
-                            f"连续 {self._decide_timeouts} 次决策超时"
-                            f"（每次 {self._decide_timeout:.0f} 秒）"
-                        )
-                        continue
-                    logger.warning(
-                        "想事情超时（%.0f 秒，第 %d/%d 次），8 秒后重试一次",
-                        self._decide_timeout,
-                        self._decide_timeouts,
-                        self._decide_retry_limit,
-                    )
-                    await asyncio.sleep(8)
+                    next_wait = min(5.0, self._decision_retry_at - time.time())
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self._note_decision_failure(str(exc))
+                    next_wait = min(5.0, self._decision_retry_at - time.time())
                     continue
 
+                if decision is None and decision_revision != self._plan_revision:
+                    # 重连或重新安排使这轮作废，正常丢弃不计为模型故障。
+                    # 保留输入，立刻重新观察新会话。
+                    next_wait = 0.0
+                    continue
+                if getattr(self, "_decision_model_ok", True):
+                    self.note_unblocked()
+                    self._decision_input_text = ""
+                    self._pending_follow_up = ""
+                else:
+                    self._note_decision_failure("模型没有返回可用决定")
                 if decision is None:
-                    # 旧路径也没想出任何事 → 同样是"能跑但没事做"（W7）。
-                    # 但**队列不空就不算**（W4）：还有排着的事要办。
                     if len(self.inbox) == 0:
                         self.note_idle_round("想不出该做什么，队列也空")
+                    next_wait = min(6.0, self._decide_interval)
                     continue
-
                 self._note_busy_round()
                 await self._act(decision)
+                next_wait = min(2.0, self._decide_interval)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.error("过日子循环异常：%s", exc)
+                next_wait = min(5.0, self._decide_interval)
+            finally:
+                self._probing_endpoint = False
 
 
     # ------------------------------------------------------------ 决策
 
+    def _decision_inputs(self) -> str:
+        """暂存输入直到决策成功，失败重试与旧路径都能看到同一条指令。"""
+        steer = self._drain_steer_text()
+        follow = getattr(self, "_pending_follow_up", "") or ""
+        follow_block = f"【排着的事】\n{follow}\n" if follow else ""
+        self._decision_input_text = "\n".join(
+            text for text in (
+                getattr(self, "_decision_input_text", ""), steer, follow_block
+            ) if text
+        )
+        self._pending_follow_up = ""
+        return self._decision_input_text
+
     async def decide(self) -> LifeDecision | None:
         """决定"现在想做什么"。先问 LLM，问不到就退回规则。"""
+        plan_revision = self._plan_revision
         # 思考时间探针：从 decide 入口到下面 INFO 行（提示词装配完成）的耗时，
         # 配合"决策上下文分层"行的体积 —— 「更短思考」目标的基线/回归都看它。
         t_prompt0 = time.time()
+        self._decision_model_ok = False
         self.drives.tick()
         suggestion = self.drives.suggest_activity()
         system = await self._system_prompt()
@@ -1092,7 +1103,10 @@ class LifeLoop(PromptRenderMixin):
         recent_show = _clip(recent_text, 400)
         advice_show = _clip(advice_text, 500)
         memo_show = _clip(memo_text, 300)
+        inputs = self._decision_inputs()
         prompt = f"""你现在正在 Minecraft 里自己玩，没人给你派活。决定一下接下来做什么。
+
+{inputs}
 
 【当前状态】
 {brief}
@@ -1135,6 +1149,9 @@ class LifeLoop(PromptRenderMixin):
         # 这里失败 3 次就停用 10 分钟，让决策走纯文本（至少她还在动）。
         raw = None
         used_tools: list[str] = []
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return None
         now_ts = time.time()
         perception_usable = (
             self.perception is not None and now_ts >= getattr(self, "_perception_disabled_until", 0)
@@ -1159,10 +1176,17 @@ class LifeLoop(PromptRenderMixin):
                     self._perception_failures = 0
                     logger.warning("感知决策连续失败，暂停 10 分钟，先用纯文本决策（保证她还在动）")
                 raw = None
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return None
         if raw is None:
             raw = await self._llm(prompt, system)
 
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return None
         decision = self._parse_decision(raw, suggestion)
+        self._decision_model_ok = decision is not None
         if decision is None:
             decision = self._fallback_decision(suggestion, advice)
         else:
@@ -1170,6 +1194,9 @@ class LifeLoop(PromptRenderMixin):
                 logger.info("她决定前先查看了：%s", "、".join(used_tools))
             decision = await self._reconsider_if_looping(decision, prompt, system, suggestion)
 
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return None
         self._note_intention(decision)
         # 把 LLM 给的"有序几步"装进计划队列：循环里会直接按顺序执行，
         # 中间不再问模型 —— 这是"连续行动"的关键。
@@ -1248,6 +1275,7 @@ class LifeLoop(PromptRenderMixin):
         agent = self.action_agent
         if agent is None:
             return False
+        plan_revision = self._plan_revision
 
         # **计时**（用户反馈"每次停下来思考的时间太长了"）：
         # 决策前的准备工作（状态简报 / 生存建议 / 知识库检索）**每轮都做**，
@@ -1269,10 +1297,23 @@ class LifeLoop(PromptRenderMixin):
         advice_text = ""
         try:
             advice = await self._build_advice()
-            advice_text = self._render_advice(advice) if advice else ""
+            advice_text = advise_for_prompt(advice) if advice else ""
         except Exception as exc:  # noqa: BLE001
             logger.info("拼生存建议失败：%s", exc)
         _mark("生存建议")
+
+        # 正常自主路径也必须拿到真实技能名，不能只让旧 JSON 路径维护白名单。
+        if not self._known_skills and self._skill_catalog:
+            try:
+                raw_skills = await self._skill_catalog()
+                skills = raw_skills.get("skills", []) if isinstance(raw_skills, dict) else raw_skills
+                for item in skills or []:
+                    name = (item.get("skill") or item.get("name") or "") if isinstance(item, dict) else str(item).split("(", 1)[0]
+                    if str(name).strip():
+                        self._known_skills.add(str(name).strip())
+            except Exception as exc:  # noqa: BLE001
+                logger.info("取真实技能名失败：%s", exc)
+        _mark("技能清单")
 
         recent_text = self._render_recent()
         # **把她自己学到的经验摆到面前**（按当前处境检索，最相关的几条）。
@@ -1290,7 +1331,7 @@ class LifeLoop(PromptRenderMixin):
         # 这是我们的安全注入点（agent 每一轮都重新组装提示词，
         # 不会插在 assistant 的 tool_calls 中间）。
         # 对应 numen 的 STEER："一批工具结算后、下次调模型之前"。
-        steer_text = self._drain_steer_text()
+        steer_text = self._decision_inputs()
         # **接续**（W4）：只在她本来要停时才取（循环那边已经判定过了）。
         # 和插话分开写，是因为两者的语义不同：
         #   插话 = "你继续干活，但先知道这件事"
@@ -1317,12 +1358,18 @@ class LifeLoop(PromptRenderMixin):
         system = await self._system_prompt()
         from .action_agent import ACTION_PROMPT
 
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return True
         _mark("拼提示词")
         _t_model = _t.perf_counter()
         summary, used = await agent.act(
             prompt=prompt,
             system=f"{system}\n\n{ACTION_PROMPT}",
         )
+        if plan_revision != self._plan_revision:
+            self._wake.set()
+            return True
         _model_ms = (_t.perf_counter() - _t_model) * 1000
         if summary is None and not used:
             return False  # agent 不可用 → 退回旧路径
@@ -1496,6 +1543,8 @@ class LifeLoop(PromptRenderMixin):
         if self._plan:
             logger.info("放弃剩余 %d 步计划（%s）", len(self._plan), reason or "原因未记录")
         self._plan = []
+        self._pending_plan = []
+        self._plan_revision = getattr(self, "_plan_revision", 0) + 1
 
     def on_session_start(self) -> None:
         """每次进游戏时调用：清掉旧计划，让她重新排一份。
@@ -1503,7 +1552,7 @@ class LifeLoop(PromptRenderMixin):
         用户要的"每一次进游戏也会生成一个任务"就落在这里——
         进服后第一次决策会产出一份新计划（而不是接着上次的旧计划干）。
         """
-        self._plan = []
+        self.clear_plan("重新进服，旧会话计划作废")
         self._intention_rounds = 0
         self._session_planned = False
         # **进游戏也要清打算和清单**（C 批次）。
@@ -1628,6 +1677,10 @@ class LifeLoop(PromptRenderMixin):
     # ------------------------------------------------------------ 执行
 
     async def _act(self, decision: LifeDecision) -> None:
+        plan_revision = getattr(self, "_plan_revision", 0)
+        if not self.may_act():
+            logger.info("决策期间状态已变化，暂停这次动作：%s", self.hold_explain())
+            return
         self.current = decision
         self.history.append(decision)
         if len(self.history) > 50:
@@ -1660,6 +1713,19 @@ class LifeLoop(PromptRenderMixin):
         # 真的去做
         if decision.skill:
             try:
+                # 分享/回调也会让出事件循环，提交前再检查一次。
+                if not self.may_act():
+                    return
+                if plan_revision != getattr(self, "_plan_revision", 0):
+                    self._wake.set()
+                    return
+                if self.inbox.has_delivery(Delivery.STEER):
+                    self.clear_plan("提交动作前收到新指令或环境变化")
+                    self._wake.set()
+                    return
+                # 先登记宽限，再提交：极短任务可能在 RPC 返回前就发出完成事件。
+                # 完成事件的 wake() 清掉宽限后，不能再被旧请求覆盖。
+                self._busy_until = time.time() + 8
                 if str(decision.skill).startswith("move."):
                     await self._call(decision.skill, decision.params or {})
                 else:
@@ -1669,10 +1735,10 @@ class LifeLoop(PromptRenderMixin):
                 # 实测决策间隔变成 190~200 秒——技能 10 秒做完她也要干站三分半。
                 # 真正该用的信号是"引擎里还有没有任务在跑"（_engine_busy），
                 # 所以这里只留一个很短的宽限期，避免刚提交就立刻改主意。
-                self._busy_until = time.time() + 8
             except Exception as exc:  # noqa: BLE001
                 logger.warning("她想做的技能 %s 没能开始（检查是否在线）：%s", decision.skill, exc)
-                self._busy_until = time.time() + 20
+                self.note_task_result(decision.skill, False, str(exc))
+                self._busy_until = 0.0
         else:
             # 不动手（发呆/看风景）：给一个"待着"的时间，然后重新想
             self._busy_until = time.time() + 25

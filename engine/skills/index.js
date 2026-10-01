@@ -25,7 +25,8 @@ const traverse = require('./traverse');
 // **`vec3` 和 `log` 必须显式引入**——climb_out 里要用。
 // 我第一版直接用了这两个名字（以为在作用域里），实际没有 import：
 // `node --check` 抓不到（它们是合法标识符），只会在运行到那一行时 ReferenceError。
-const { vec3 } = require('../util');
+const { vec3, delay } = require('../util');
+const { MissingItemError } = require('../actions');
 const log = require('../log');
 
 /** 参数校验小工具 */
@@ -551,14 +552,64 @@ const SKILLS = {
         state,
         ctx,
         items: params.items ? requireParam(params, 'items', { type: 'array' }) : null,
-        keep: params.keep ? requireParam(params, 'keep', { type: 'array' }) : ['torch', 'crafting_table', 'furnace'],
+        keep: params.keep ? requireParam(params, 'keep', { type: 'array' }) : null,
       });
+    },
+  },
+
+  eat: {
+    label: '进食补给',
+    description: '吃现有食物直到达到目标饱食度，恢复后继续原来的工作',
+    params: { item: { type: 'string', def: null }, target_food: { type: 'number', min: 1, max: 20, def: 18 } },
+    async run({ actions, ctx, params }) {
+      const target = requireParam(params, 'target_food', { min: 1, max: 20, def: 18 });
+      const before = actions.bot.food;
+      const eaten = [];
+      for (let i = 0; i < 20 && actions.bot.food < target; i += 1) {
+        ctx.checkAborted();
+        ctx.progress(`先吃饱：${actions.bot.food}/${target}`);
+        try {
+          const r = await actions.eat({ item: params.item || null, signal: ctx.signal });
+          eaten.push(r.ate);
+        } catch (err) {
+          if (err instanceof MissingItemError && eaten.length) break;
+          throw err;
+        }
+      }
+      const ok = actions.bot.food >= target;
+      return skillResult(ok || eaten.length > 0, { consumed: eaten.reduce((m, n) => { if (n) m[n] = (m[n] || 0) + 1; return m; }, {}),
+        note: `饱食度 ${before} → ${actions.bot.food}`,
+        extra: { target_food: target, reached_target: ok },
+        reason: ok || eaten.length ? null : '还没吃饱，需要补充食物' });
+    },
+  },
+
+  recover: {
+    label: '恢复体力',
+    description: '吃饱后在安全处短暂恢复生命，发现附近威胁或无法回血时停止并重新规划',
+    params: { target_health: { type: 'number', min: 1, max: 20, def: 12 }, timeout_seconds: { type: 'number', min: 1, max: 30, def: 20 } },
+    async run({ actions, state, ctx, params }) {
+      const target = requireParam(params, 'target_health', { min: 1, max: 20, def: 12 });
+      const seconds = requireParam(params, 'timeout_seconds', { min: 1, max: 30, def: 20 });
+      const start = actions.bot.health;
+      const deadline = Date.now() + seconds * 1000;
+      while (actions.bot.health < target && Date.now() < deadline) {
+        ctx.checkAborted();
+        if (actions.bot.food < 18) return skillResult(false, { reason: '饱食度不足，先补充食物才能回血' });
+        if (state.nearbyEntities({ radius: 12, limit: 1, hostileOnly: true }).length || actions.bot.health < start) {
+          return skillResult(false, { reason: '这里仍有威胁，先找安全地点' });
+        }
+        ctx.progress(`恢复生命：${actions.bot.health}/${target}`);
+        await delay(500, { signal: ctx.signal });
+      }
+      const ok = actions.bot.health >= target;
+      return skillResult(ok, { note: `生命 ${start} → ${actions.bot.health}`, reason: ok ? null : '没有恢复到安全血量，检查食物、效果与服务器回血规则' });
     },
   },
 
   cook_food: {
     label: '准备食物',
-    description: '打猎并把生肉烤熟，保证有东西吃',
+    description: '优先用现有小麦和生食补充食物，再猎取可见动物；缺工作台/熔炉/燃料时处理依赖',
     params: { count: { type: 'number', min: 1, max: 64, def: 4 } },
     async run({ actions, nav, state, ctx, params }) {
       return gathering.cookFood({ actions, nav, state, ctx, count: requireParam(params, 'count', { def: 4 }) });

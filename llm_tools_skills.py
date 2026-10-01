@@ -472,9 +472,9 @@ class McSkillTools:
         """取消机器人正在做的事。
 
         Args:
-            task_id(string): 要取消的任务号。留空表示取消全部（等于急停，机器人会立刻停下）
+            task_id(string): 要取消的任务号。留空表示取消全部并暂停自主行动，主人用 /mc继续 恢复。
         """
-        if not await self._ensure_engine():
+        if task_id and not await self._ensure_engine():
             yield event.plain_result("引擎未运行")
             return
         try:
@@ -482,8 +482,8 @@ class McSkillTools:
                 r = await self.engine.cancel_task(task_id)
                 yield event.plain_result(r.get("note") or "已请求取消该任务")
             else:
-                r = await self.engine.safety_stop()
-                yield event.plain_result(f"已让机器人停下，取消了 {len(r.get('cancelled') or [])} 个任务")
+                r = await self._emergency_stop()
+                yield event.plain_result(f"已急停并暂停自主行动，取消了 {len(r.get('cancelled') or [])} 个任务。主人用 /mc继续 恢复。")
         except EngineError as exc:
             yield event.plain_result(str(exc))
 
@@ -510,7 +510,7 @@ class McSkillTools:
             yield event.plain_result("机器人还没进服，先等它进服再设定目标")
             return
         try:
-            msg = await self.goals.start(goal)
+            msg = await self._start_player_goal(goal)
             yield event.plain_result(f"🎯 {msg}\n可以用 mc_goal_status 查进度。")
         except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"没法定下这个目标：{exc}")
@@ -534,6 +534,9 @@ class McSkillTools:
     @filter.llm_tool(name="mc_goal_resume")
     async def tool_mc_goal_resume(self, event: AstrMessageEvent) -> MessageEventResult:
         """继续被暂停的长期目标。"""
+        if getattr(self, "_emergency_stopped", False):
+            yield event.plain_result("机器人处于急停状态，请先由主人用 /mc继续 恢复")
+            return
         if not self.goals:
             yield event.plain_result("目标系统未初始化")
             return
@@ -618,6 +621,8 @@ class McSkillTools:
             return event.plain_result("引擎未运行，无法执行。请检查插件配置里的 engine_dir / node_path。")
         if not self.connected:
             return event.plain_result("机器人还没进服，先让它进服再安排它干活。")
+        if getattr(self, "_emergency_stopped", False):
+            return event.plain_result("机器人处于急停状态，请先由主人用 /mc继续 恢复。")
         try:
             r = await self.engine.run_skill(skill, params)
         except EngineError as exc:

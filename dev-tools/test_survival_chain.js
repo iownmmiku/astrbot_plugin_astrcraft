@@ -25,14 +25,8 @@ const PORT = 25566;
 // **分步模式**：--step 1/2/3 只跑那一步（提速用 —— 完整链一次 5~6 分钟，
 // 调某一步时不用等前两步）。不带 --step = 完整链（判据不变）。
 //
-// ⚠️ **`--step 3` 的隔离已知问题（定性完毕，3/3 稳定复现；完整链 10/10 全过）**：
-// 隔离模式下连续给材料的 ~6-8 秒静止 → **假「卡住」触发反射自救** →
-// 反射用木镐**挖开她脚下的平台**（自掘竖井，实测掉到 y=-48）→
-// 「往上挖阶梯」虽然能把人救出来（日志：爬 8 格到 -39 ✓），但**预算被吃光** →
-// 庇护所任务 timeout / 移动被取消（抢占变体）。
-// 完整链里 [1][2] 让她保持移动、不会触发假卡住 —— 所以这个坑**只存在于隔离模式**。
-// 证据文件：_s3_1/2/3.txt（引擎 INFO 日志都在）。**断言没有放宽**；
-// 若未来要在隔离模式修它，方向是「有用户任务在跑时不许反射开挖脚下」。
+// 分步与完整链均在新区域准备地形，建房都核对任务状态和 82 格实际结构。
+// 历史偶发问题不能豁免本轮失败；失败打印实际背包和引擎日志。
 const argStep = (() => {
   const i = process.argv.indexOf('--step');
   if (i < 0 || !process.argv[i + 1]) return 0;
@@ -129,12 +123,47 @@ const bad = (m) => {
 
 async function waitTask(c, id, ms) {
   const end = Date.now() + ms;
+  let nextReport = Date.now() + 30000;
   while (Date.now() < end) {
     const st = await c.call('task.status', { task_id: id });
     if (['done', 'failed', 'cancelled'].includes(st.status)) return st;
+    if (Date.now() >= nextReport) {
+      console.log(`    仍在执行：${st.name || id} / ${st.progress || st.status}（${Math.round(st.elapsed_ms / 1000)} 秒）`);
+      nextReport = Date.now() + 30000;
+    }
     await sleep(2000);
   }
   return { status: 'timeout' };
+}
+
+async function verifyShelter(c, shelter) {
+  if (!shelter || !shelter.complete || !shelter.has_roof || !shelter.has_door) {
+    throw new Error(`建成报告不完整：${JSON.stringify(shelter)}`);
+  }
+  const { origin, size, wall_height: height, door_position: door } = shelter;
+  if (!origin || size !== 5 || height !== 2 || !door) throw new Error('缺少正确的建造坐标');
+  let checked = 0;
+  for (let dx = 0; dx < size; dx += 1) {
+    for (let dz = 0; dz < size; dz += 1) {
+      const x = origin.x + dx, z = origin.z + dz;
+      const solid = async (y, label) => {
+        const b = await c.call('block.at', { x, y, z });
+        if (b.bounding_box !== 'block' || ['lava', 'water', 'magma_block', 'cactus', 'powder_snow'].includes(b.name)) {
+          throw new Error(`${label}缺失/不安全 (${x},${y},${z})：${b.name}`);
+        }
+        checked += 1;
+      };
+      await solid(origin.y - 1, '地板');
+      await solid(origin.y + height, '屋顶');
+      if ((dx === 0 || dz === 0 || dx === size - 1 || dz === size - 1) && (x !== door.x || z !== door.z)) {
+        for (let dy = 0; dy < height; dy += 1) await solid(origin.y + dy, '墙');
+      }
+    }
+  }
+  const lower = await c.call('block.at', door);
+  const upper = await c.call('block.at', { ...door, y: door.y + 1 });
+  if (!lower.name?.endsWith('_door') || lower.name !== upper.name) throw new Error('门的上下两格未安装完整');
+  return checked + 2;
 }
 
 (async () => {
@@ -201,7 +230,7 @@ async function waitTask(c, id, ms) {
     console.log('    引擎日志尾部:');
     for (const l of c.logTail(10)) console.log('      ' + l);
   }
-  if (cobble >= 8) {
+  if (t1.status === 'done' && cobble >= 8) {
     ok(`挖到圆石 ×${cobble}（真的往下挖到石头了）`);
   } else if (cobble > 0) {
     bad(`只挖到圆石 ×${cobble}（目标 8）`);
@@ -226,10 +255,10 @@ async function waitTask(c, id, ms) {
   const t2 = await waitTask(c, r2.task_id, 240000);
   const inv2 = (await c.call('inventory.get')).items;
   console.log(`    任务 ${t2.status}${t2.error ? ' 错误：' + t2.error : ''}`);
-  if (inv2.stone_pickaxe || inv2.stone_axe) {
+  if (t2.status === 'done' && inv2.stone_pickaxe && inv2.stone_axe) {
     ok(`做出石制工具：${['stone_pickaxe', 'stone_axe'].filter((k) => inv2[k]).map((k) => `${k}×${inv2[k]}`).join('、')}`);
   } else {
-    bad(`没做出石制工具（${t2.error || '无错误信息'}）`);
+    bad(`整套石制工具未完成（需要石镐和石斧；${t2.error || t2.status}；背包 ${JSON.stringify(inv2)}）`);
   }
 
   }
@@ -262,9 +291,15 @@ async function waitTask(c, id, ms) {
   const t3 = await waitTask(c, r3.task_id, 420000);
   console.log(`    任务 ${t3.status}${t3.error ? ' 错误：' + t3.error : ''}`);
   if (t3.status === 'done') {
-    ok('庇护所建成');
+    try {
+      const cells = await verifyShelter(c, t3.result?.shelter);
+      ok(`庇护所建成：实际验收 ${cells} 格地板、墙、屋顶和完整门`);
+    } catch (err) {
+      bad(`庇护所验收失败：${err.message}`);
+    }
   } else {
     bad(`庇护所未建成：${t3.error || t3.status}`);
+    if (t3.result) console.log('    建造结果：' + JSON.stringify(t3.result));
   }
 
   }

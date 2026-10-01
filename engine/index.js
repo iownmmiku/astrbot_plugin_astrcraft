@@ -31,6 +31,23 @@ const engine = new McEngine({
   },
 });
 
+// RPCs that return an action result still share the same body as queued skills.
+// Keeping their response shape avoids breaking existing tool clients.
+const bodyCalls = new Set(['move.jump', 'move.look', 'dig', 'place', 'craft', 'smelt',
+  'equip', 'eat', 'attack', 'attack.ranged', 'shield.raise', 'use.block', 'sleep',
+  'interact.entity', 'use.player', 'drop', 'container.open', 'container.deposit',
+  'container.withdraw', 'collect.drops', 'debug.dropall', 'debug.craftdiag', 'debug.usebucket']);
+const queuedCalls = new Set(['move.to', 'move.follow', 'move.to_player', 'skill.run']);
+const register = rpc.handle.bind(rpc);
+rpc.handle = (method, handler) => register(method, async (params) => {
+  if (bodyCalls.has(method) || queuedCalls.has(method)) engine.assertCanAct();
+  if (!bodyCalls.has(method)) return handler(params);
+  engine.requireBot();
+  const task = engine.submitAction({ name: method, meta: { rpc: method, params },
+    run: () => handler(params) });
+  return task.promise;
+});
+
 // ================================================================ 工具函数
 
 /** 统一的动作包装：任何失败都转成带建议的可读错误 */
@@ -707,6 +724,23 @@ rpc.handle(
 );
 
 rpc.handle(
+  'move.to_player',
+  wrap(async (params) => {
+    engine.requireBot();
+    const target = params.target || params.player;
+    if (!target) throw new GameError('缺少参数 target（玩家名）');
+    return submitAction({
+      name: `前往 ${target} 身边`,
+      run: async ({ signal, task }) => engine.nav.toPlayer(target, {
+        signal, distance: Number(params.distance) || 3,
+        timeoutMs: Number(params.timeout_ms) || 60000,
+        onTick: (info) => task.setDetail(`距 ${target} ${info.distance.toFixed(1)} 格`),
+      }),
+    });
+  }),
+);
+
+rpc.handle(
   'move.follow',
   wrap(async (params) => {
     engine.requireBot();
@@ -932,7 +966,8 @@ rpc.handle(
   'container.withdraw',
   wrap(async (params) => {
     engine.requireBot();
-    const { x, y, z } = normalizeCoords(params);
+    const supplied = ['x', 'y', 'z'].some((key) => params[key] !== undefined && params[key] !== null);
+    const { x, y, z } = supplied ? normalizeCoords(params) : {};
     return engine.actions.withdraw({ x, y, z, item: params.item || null, count: Number(params.count) || 1, reach: params.reach !== false });
   }),
 );
@@ -1127,10 +1162,11 @@ rpc.handle(
 rpc.handle(
   'safety.stop',
   wrap(async () => {
-    const r = engine.cancelAll('急停');
-    return { ...r, note: '已急停：所有动作与排队任务都已停止' };
+    return engine.safetyStop();
   }),
 );
+
+rpc.handle('safety.resume', wrap(async () => engine.safetyResume()));
 
 rpc.handle(
   'safety.set',

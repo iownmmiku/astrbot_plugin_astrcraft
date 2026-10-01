@@ -29,7 +29,7 @@ const bad = (m, d = '') => {
 
 const child = spawn(process.execPath, [path.join(__dirname, '..', 'engine', 'index.js')], {
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, MC_ENGINE_LOG_LEVEL: 'warn' },
+  env: { ...process.env, MC_ENGINE_LOG_LEVEL: process.env.MC_ENGINE_LOG_LEVEL || 'info' },
 });
 let buf = '';
 let id = 1;
@@ -57,7 +57,8 @@ child.stdout.on('data', (c) => {
   }
 });
 child.stderr.setEncoding('utf8');
-child.stderr.on('data', () => {});
+const logs = [];
+child.stderr.on('data', (chunk) => { logs.push(chunk); if (logs.length > 300) logs.shift(); });
 const call = (m, p = {}, t = 90000) =>
   new Promise((res, rej) => {
     const i = id++;
@@ -191,6 +192,7 @@ async function walkTo(x, z, ms = 60000, range = null) {
   r = await walkTo(GX + 14, GZ, 40000);
   st = await call('state.get', { detail: 'brief' });
   d = Math.hypot(st.position.x - (GX + 14), st.position.z - GZ);
+  console.log(`    引擎完成时距目标 ${r.engineDistance} 格，事后位置距目标 ${d.toFixed(2)} 格`);
   if (r.status === 'done' && d <= 3) ok('上 1 格台阶', `${r.elapsed}ms，y=${st.position.y}`);
   else bad('上 1 格台阶失败', `${r.status} ${r.error} 距目标 ${d.toFixed(1)} 格，y=${st.position.y}`);
   await rcon.command(`fill ${GX + 6} -61 ${GZ - 8} ${GX + 20} -60 ${GZ + 8} minecraft:air replace`);
@@ -300,6 +302,7 @@ async function walkTo(x, z, ms = 60000, range = null) {
   await rcon.command(`fill ${GX + 2} -60 ${GZ - 4} ${GX + 2} -58 ${GZ + 4} minecraft:air replace`);
 
   console.log(`\n=== 结果：${pass} 通过，${fail} 失败 ===`);
+  if (fail) console.log(logs.join('').split('\n').slice(-90).join('\n'));
   rcon.close();
   await call('disconnect').catch(() => {});
   await sleep(300);

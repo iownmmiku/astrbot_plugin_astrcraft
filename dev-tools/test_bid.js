@@ -47,6 +47,10 @@ function makeEngine() {
   const e = Object.create(McEngine.prototype);
   e.queue = new TaskQueue();
   e._bidLog = [];
+  e.bot = { entity: { isInWater: true }, oxygenLevel: 2, food: 10 };
+  e.config = { get: () => true };
+  e.actions = { _pickBestFood: () => ({ name: 'cooked_beef' }) };
+  e.state = { nearbyEntities: () => [{ name: 'item', type: 'object' }] };
   return e;
 }
 

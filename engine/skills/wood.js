@@ -265,7 +265,8 @@ async function makePlanks({ actions, ctx, want = 8 }) {
     const available = actions.countItem(logName);
     const times = Math.min(need, available);
     try {
-      const r = await actions.craft({ item: planksOf(logName), count: times, signal: ctx.signal });
+      // Actions.craft takes the desired number of output items, not recipe batches.
+      const r = await actions.craft({ item: planksOf(logName), count: times * 4, signal: ctx.signal });
       steps.push(`${logName}×${times} → ${planksOf(logName)}×${r.produced}`);
     } catch (err) {
       if (err instanceof CancelledError) throw err;
@@ -293,7 +294,7 @@ async function makePlanks({ actions, ctx, want = 8 }) {
   // 在 `make_tools` 上也踩过一次，这是第三次。
   const gained = planksHave() - startHave;
   if (gained < want) {
-    return skillResult(gained > 0, {
+    return skillResult(false, {
       steps,
       produced: positiveOnly(diffOf(before, actions.inventoryMap())),
       note: gained > 0 ? `只做出 ${gained} 个木板（想要 ${want} 个）` : null,
@@ -341,7 +342,7 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
           });
         }
       }
-      const pk = await makePlanks({ actions, ctx, want: 2 });
+      const pk = await makePlanks({ actions, ctx, want: 2 - countPlanks(actions) });
       steps.push(...pk.steps);
       if (countPlanks(actions) < 2) {
         const gained = actions.countItem('stick') - startHave;
@@ -371,7 +372,7 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
     const deficit = want - (actions.countItem('stick') - startHave);
     const times = Math.max(1, Math.min(Math.ceil(deficit / 4), Math.floor(actions.countItem(planks) / 2)));
     try {
-      const r = await actions.craft({ item: 'stick', count: times, signal: ctx.signal });
+      const r = await actions.craft({ item: 'stick', count: times * 4, signal: ctx.signal });
       steps.push(`木板 → 木棍×${r.produced}`);
     } catch (err) {
       if (err instanceof CancelledError) throw err;
@@ -392,7 +393,7 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
     return skillResult(false, {
       steps,
       produced: positiveOnly(diffOf(before, actions.inventoryMap())),
-      reason: `木棍一个都没做出来（可能服务端没接受点击；${planks} 有 ${actions.countItem(planks)} 个）`,
+      reason: '木棍一个都没做出来（可能服务端没接受点击）',
     });
   }
   return skillResult(true, {
@@ -426,11 +427,19 @@ function finishTools(result, tier, t0) {
 }
 
 async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = null, allowSearch = true }) {
-  const wantKinds = kinds && kinds.length ? kinds : ['pickaxe', 'axe', 'sword', 'shovel'];
+  const requestedKinds = [...new Set(kinds && kinds.length ? kinds : ['pickaxe', 'axe', 'sword', 'shovel'])];
+  const wantKinds = requestedKinds.filter((kind) => !hasTool(actions, `${tier}_${kind}`));
   const steps = [];
   const before = actions.inventoryMap();
   // 入口自检 + 日志：技能"秒退"是排查噩梦，所以每一步的耗时与判断都记下来
   const t0 = Date.now();
+  if (!wantKinds.length) return finishTools(skillResult(true, {
+    note: `已拥有：${requestedKinds.map((kind) => `${tier}_${kind}`).join('、')}`,
+    extra: { made: [], failed: [], missing: [] },
+  }), tier, t0);
+  if (wantKinds.some((kind) => !TOOL_KINDS.includes(kind))) {
+    return finishTools(skillResult(false, { reason: `工具类型仅支持 ${TOOL_KINDS.join(' / ')}` }), tier, t0);
+  }
   log.info(
     `开始做${tier}工具（${wantKinds.join('/')}）；背包现状：${Object.entries(before).map(([k, v]) => `${k}×${v}`).join('、') || '空'}`,
   );
@@ -443,40 +452,36 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
     );
   }
 
-  // 依赖链先走完，再考虑工作台。
-  // 顺序很重要：木镐/木剑只要有木板和木棍就能随身做出来（2×2），
-  // 上来就强制要工作台会让"空手做石镐"这种请求一开局就卡住。
+  // Gather only the materials for missing tools, then prepare their 3×3 workstation.
   //
   // 材料需求量**按实际要做的工具种类算**，不要写死。
   // 早期版本固定要 11 个锭/圆石（那是做整套工具的用量），
   // 结果"只做一把铁镐"也会先去挖 12 个矿，白白多花一两分钟，
   // 甚至因为挖到石头层卡住。一把镐只需要 3 个材料。
-  const materialPerTool = 3;
-  const materialNeeded = Math.max(3, wantKinds.length * materialPerTool);
+  const materialCounts = { pickaxe: 3, axe: 3, sword: 2, shovel: 1 };
+  const stickCounts = { pickaxe: 2, axe: 2, sword: 1, shovel: 2 };
+  const materialNeeded = wantKinds.reduce((sum, kind) => sum + materialCounts[kind], 0);
+  const sticksNeeded = wantKinds.reduce((sum, kind) => sum + stickCounts[kind], 0);
+
+  const ensurePlanks = async (needed) => {
+    const deficit = Math.max(0, needed - countPlanks(actions));
+    if (!deficit) return { ok: true };
+    const logDeficit = Math.max(0, Math.ceil(deficit / 4) - totalLogs(actions));
+    if (logDeficit > 0 && allowSearch) {
+      const chop = await chopTree({ actions, nav, state, ctx, want: logDeficit });
+      steps.push(...chop.steps);
+      if (!chop.ok && totalLogs(actions) < Math.ceil(deficit / 4)) return chop;
+    }
+    if (totalLogs(actions) < Math.ceil(deficit / 4)) {
+      return { ok: false, reason: `还缺 ${deficit} 个木板，需要补 ${logDeficit} 根原木${allowSearch ? '' : '（已禁用自动找树）'}` };
+    }
+    const result = await makePlanks({ actions, ctx, want: deficit });
+    steps.push(...result.steps);
+    return countPlanks(actions) >= needed ? { ok: true } : result;
+  };
 
   if (tier === 'wooden') {
-    if (totalLogs(actions) < 3) {
-      // allowSearch=false 时直接报缺材料，不去满世界找树。
-      // 这用于"给定材料的合成测试"：把合成逻辑与采集能力分开验证，
-      // 避免在没树的环境里白白花一分钟找树。
-      if (!allowSearch) {
-        return finishTools(
-          skillResult(false, { steps, reason: '需要原木才能做木工具，但当前没有（已禁用自动找树）' }),
-          tier,
-          t0,
-        );
-      }
-      const chop = await chopTree({ actions, nav, state, ctx, want: 4 });
-      steps.push(...chop.steps);
-      if (!chop.ok) {
-        return finishTools(skillResult(false, { steps, reason: `做木工具需要原木，但砍树失败：${chop.reason}` }), tier, t0);
-      }
-    }
-    if (countPlanks(actions) < 8) {
-      const pk = await makePlanks({ actions, ctx, want: 8 });
-      steps.push(...pk.steps);
-      if (!pk.ok) return finishTools(skillResult(false, { steps, reason: pk.reason }), tier, t0);
-    }
+    // The shared wood budget below includes planks, sticks and a table only if needed.
   } else if (tier === 'stone') {
     // 石制工具需要圆石：先确保有木镐
     if (!hasTool(actions, 'wooden_pickaxe') && !hasBetterPickaxe(actions, 'wooden')) {
@@ -503,7 +508,7 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
         allowSearch,
       });
       steps.push(...r.steps);
-      if (actions.countItem('cobblestone') < 3 && !r.ok) {
+      if (actions.countItem('cobblestone') < materialNeeded && !r.ok) {
         return finishTools(skillResult(false, { steps, reason: `挖圆石失败：${r.reason}` }), tier, t0);
       }
     }
@@ -529,10 +534,10 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
         const sm = await require('../skills/mining').smeltOres({ actions, nav, state, ctx, item: 'raw_iron', count: raw });
         steps.push(...sm.steps);
       }
-      if (actions.countItem('iron_ingot') < 3) {
+      if (actions.countItem('iron_ingot') < materialNeeded) {
         const got = actions.countItem('iron_ingot');
         return finishTools(
-          skillResult(false, { steps, reason: `铁锭不够做${wantKinds.join('/')}（需要 3 个，只有 ${got} 个）` }),
+          skillResult(false, { steps, reason: `铁锭不够做${wantKinds.join('/')}（需要 ${materialNeeded} 个，只有 ${got} 个）` }),
           tier,
           t0,
         );
@@ -553,8 +558,14 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
 
   // 木棍（木制工具也需要）。allow_search 要透传下去：
   // 否则在"已给材料、禁止找树"的定向测试里，它会跑出去找树。
-  if (actions.countItem('stick') < 8) {
-    const st = await makeSticks({ actions, nav, state, ctx, want: 8, allowSearch });
+  const missingSticks = Math.max(0, sticksNeeded - actions.countItem('stick'));
+  const nearbyTable = actions.bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 });
+  const tablePlanks = nearbyTable || actions.countItem('crafting_table') > 0 ? 0 : 4;
+  const plankBudget = (tier === 'wooden' ? materialNeeded : 0) + Math.ceil(missingSticks / 4) * 2 + tablePlanks;
+  const wood = await ensurePlanks(plankBudget);
+  if (!wood.ok) return finishTools(skillResult(false, { steps, reason: wood.reason }), tier, t0);
+  if (missingSticks > 0) {
+    const st = await makeSticks({ actions, nav, state, ctx, want: missingSticks, allowSearch });
     steps.push(...st.steps);
     if (!st.ok) return finishTools(skillResult(false, { steps, reason: st.reason }), tier, t0);
   }
@@ -591,13 +602,13 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
     // 关键：做第一件会消耗木板与木棍，不补的话第二件必然失败——
     // 实测"做木镐+木斧"时只出了镐子，斧头因为木板不够而失败，
     // 而背包里明明还有 6 根原木。真玩家会顺手再做点木板，这里也照做。
-    if (actions.countItem('stick') < 2) {
-      const st = await makeSticks({ actions, nav, state, ctx, want: 4, allowSearch });
+    if (actions.countItem('stick') < stickCounts[kind]) {
+      const st = await makeSticks({ actions, nav, state, ctx, want: stickCounts[kind] - actions.countItem('stick'), allowSearch });
       steps.push(...st.steps);
     }
-    if (tier === 'wooden' && countPlanks(actions) < 3) {
-      const pk = await makePlanks({ actions, ctx, want: 4 });
-      steps.push(...pk.steps);
+    if (tier === 'wooden' && countPlanks(actions) < materialCounts[kind]) {
+      const pk = await ensurePlanks(materialCounts[kind]);
+      if (!pk.ok) { failed.push({ name, error: pk.reason }); continue; }
     }
 
     try {
@@ -624,12 +635,12 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
   const after = actions.inventoryMap();
   const stillMissing = wantKinds.map((k) => `${tier}_${k}`).filter((n) => !hasTool(actions, n));
   // 只要"至少一套里有一件"就算部分成功，但 note 必须如实说清缺什么
-  const ok = made.length > 0 && stillMissing.length < wantKinds.length;
+  const ok = stillMissing.length === 0;
   return finishTools(
     skillResult(ok, {
       steps,
       produced: positiveOnly(diffOf(before, after)),
-      note: ok
+      note: made.length > 0
         ? `已获得：${made.join('、')}${stillMissing.length ? `；还缺：${stillMissing.join('、')}` : ''}`
         : `一件工具都没做出来：${failed.map((f) => `${f.name}(${f.error})`).join('、') || '材料不足'}`,
       reason: ok ? null : failed.map((f) => f.error).join('；') || `材料不足以合成 ${wantKinds.join('/')}`,
@@ -671,7 +682,7 @@ async function ensureCraftingTable({ actions, ctx, steps = [] }) {
     if (totalLogs(actions) === 0) {
       return { ok: false, reason: '需要工作台，但既没有工作台也没有原木' };
     }
-    const pk = await makePlanks({ actions, ctx, want: 4 });
+    const pk = await makePlanks({ actions, ctx, want: 4 - countPlanks(actions) });
     steps.push(...pk.steps);
     if (!pk.ok) return { ok: false, reason: `做木板失败：${pk.reason}` };
   }

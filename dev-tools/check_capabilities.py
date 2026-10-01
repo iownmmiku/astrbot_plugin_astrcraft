@@ -59,7 +59,7 @@ SKILLS_DOCS = ROOT / "skills_docs"
 # 新增能力时：先在这里加一行，再写代码。**这一行就是"我承诺了"的登记。**
 PROMISES: list[tuple[str, str, str, str]] = [
     # ---- 走路 / 地形 ----
-    ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "bot/movement.js", "只描述，不改世界"),
+    ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "engine/movement.js", "只描述，不改世界"),
     ("挖台阶/垫脚从坑里出来", "climbToSurface", "engine/skills/common.js", "代码已有"),
     ("垫脚上升（跳起来往脚下放方块）", "pillarUpOne", "engine/skills/common.js", "climbToSurface 内部"),
     # 下面这几条**故意留成失败**，等 B 批次做完再打开——
@@ -231,8 +231,8 @@ def main() -> int:
         path = ROOT / where
         text = _read(path)
         if not text:
-            print(f"  ⚠️ {claim}：找不到文件 {where}")
-            warns.append(f"{where} 不存在")
+            print(f"  ❌ {claim}：找不到文件 {where}")
+            fails.append(f"{where} 不存在")
             continue
         # 工具名要去注册表里找，代码符号在文件里找
         if symbol.startswith("mc_"):

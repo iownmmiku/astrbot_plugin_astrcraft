@@ -57,6 +57,7 @@ class ProtectedBlockError extends ActionError {
 
 const REACH = 4.4; // 原版生存交互距离，略留余量
 const DIG_TIMEOUT_BASE = 8000;
+const WINDOW_GUARD = Symbol('astrcraftWindowGuard');
 
 class Actions {
   constructor({ bot, config, navigator }) {
@@ -65,7 +66,142 @@ class Actions {
     this._nav = navigator;
     this._lastEatAt = 0;
     this._eating = false;
+    this._stopped = false;
+    this._installControlGuards();
+    // Supply the queue's signal to RPCs as well as to explicit skill calls.
+    // Async context also protects continuations that forgot to forward it.
+    const { executionContext } = require('./goals');
+    const optionIndexes = { equipBestToolFor: 1, lookAtPoint: 3 };
+    for (const name of Object.getOwnPropertyNames(Actions.prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(Actions.prototype, name);
+      const method = descriptor.value;
+      if (name.startsWith('_') || !method || method.constructor.name !== 'AsyncFunction') continue;
+      this[name] = (...args) => {
+        if (this._stopped) return Promise.reject(new CancelledError('引擎已急停，请先恢复'));
+        const index = optionIndexes[name] || 0;
+        const opts = args[index] || {};
+        const inherited = executionContext.getStore();
+        const signal = opts.signal || (inherited && inherited.signal) || null;
+        if (signal && signal.aborted) return Promise.reject(new CancelledError('动作被取消'));
+        args[index] = { ...opts, signal };
+        return executionContext.run({ ...inherited, signal }, () => method.apply(this, args));
+      };
+    }
   }
+
+  _installControlGuards() {
+    const { executionContext } = require('./goals');
+    const bot = this._bot;
+    if (!bot || bot._astrcraftControlGuard) return;
+    bot._astrcraftControlGuard = true;
+    const check = () => {
+      const ctx = executionContext.getStore();
+      if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧动作已取消');
+    };
+    this._guardWindow(bot.inventory);
+    if (typeof bot.on === 'function') bot.on('windowOpen', (window) => this._guardWindow(window));
+    const guardWindow = (window) => this._guardWindow(window);
+    for (const name of ['dig', 'placeBlock', 'craft', 'consume', 'equip', 'unequip',
+      'activateItem', 'deactivateItem', 'activateBlock', 'activateEntity', 'activateEntityAt',
+      'attack', 'look', 'lookAt', 'setControlState', 'clearControlStates', 'clickWindow',
+      'transfer', 'putAway', 'putSelectedItemRange', 'moveSlotItem', 'toss', 'tossStack',
+      'openBlock', 'openEntity', 'openContainer', 'openFurnace', 'sleep', 'closeWindow']) {
+      if (typeof bot[name] !== 'function') continue;
+      const original = bot[name];
+      const returnsWindow = ['openBlock', 'openEntity', 'openContainer', 'openFurnace'].includes(name);
+      bot[name] = function (...args) {
+        check();
+        if (name === 'closeWindow' && args[0] !== bot.currentWindow && args[0] !== bot.inventory) return;
+        const result = original.apply(this, args);
+        if (result && typeof result.then === 'function') {
+          return result.then((value) => {
+            // mineflayer adds close/withdraw/furnace helpers after windowOpen.
+            if (returnsWindow) guardWindow(value);
+            check();
+            return value;
+          });
+        }
+        if (returnsWindow) guardWindow(result);
+        return result;
+      };
+    }
+    if (bot.pathfinder) {
+      for (const name of ['setGoal', 'stop']) {
+        const original = bot.pathfinder[name];
+        if (typeof original !== 'function') continue;
+        bot.pathfinder[name] = function (...args) { check(); return original.apply(this, args); };
+      }
+    }
+    // Library routines may retain their private click function across awaits.
+    // Drop their late interaction packets; normal network/physics packets keep flowing.
+    if (bot._client && typeof bot._client.write === 'function') {
+      const writes = new Set(['block_dig', 'block_place', 'use_item', 'use_entity',
+        'window_click', 'held_item_slot', 'arm_animation', 'close_window']);
+      const original = bot._client.write;
+      bot._client.write = function (name, ...args) {
+        const ctx = executionContext.getStore();
+        if (writes.has(name) && ctx && ctx.signal && ctx.signal.aborted) return;
+        return original.call(this, name, ...args);
+      };
+    }
+  }
+
+  _guardWindow(window) {
+    if (!window || typeof window !== 'object') return window;
+    const { executionContext } = require('./goals');
+    const bot = this._bot;
+    const interactions = new Set(['close', 'withdraw', 'deposit', 'putInput', 'putFuel',
+      'takeInput', 'takeFuel', 'takeOutput']);
+    // These helpers retain private inventory functions that bypass bot's public guards.
+    // Guard local slot updates too, before a stale click can corrupt the new window.
+    for (const name of [...interactions, 'acceptClick', 'updateSlot']) {
+      const original = window[name];
+      if (typeof original !== 'function' || original[WINDOW_GUARD]) continue;
+      const check = () => {
+        const ctx = executionContext.getStore();
+        if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧窗口操作已取消');
+        if (interactions.has(name) && window !== bot.currentWindow) {
+          throw new ActionError('容器窗口已关闭或已切换，请重新打开容器');
+        }
+      };
+      const guarded = function (...args) {
+        // Closing a superseded window must not copy its old inventory or clear the new one.
+        if (name === 'close' && window !== bot.currentWindow) return;
+        check();
+        const result = original.apply(this, args);
+        if (result && typeof result.then === 'function') {
+          return result.then((value) => {
+            const ctx = executionContext.getStore();
+            if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧窗口操作已取消');
+            return value;
+          });
+        }
+        return result;
+      };
+      guarded[WINDOW_GUARD] = true;
+      window[name] = guarded;
+    }
+    return window;
+  }
+
+  stopCurrent() {
+    const { executionContext } = require('./goals');
+    executionContext.exit(() => {
+      for (const name of ['stopDigging', 'deactivateItem', 'clearControlStates']) {
+        try { if (typeof this._bot[name] === 'function') this._bot[name](); } catch { /* best effort */ }
+      }
+      try {
+        const window = this._bot.currentWindow;
+        if (window) {
+          if (typeof window.close === 'function') window.close();
+          else this._bot.closeWindow(window);
+        }
+      } catch { /* best effort */ }
+      try { if (this._nav) this._nav.stop(); } catch { /* best effort */ }
+    });
+  }
+
+  setStopped(stopped) { this._stopped = !!stopped; }
 
   get bot() {
     return this._bot;
@@ -169,7 +305,8 @@ class Actions {
     const canDig = bot.canDigBlock(block);
     const timeout = canDig ? DIG_TIMEOUT_BASE : 2000;
     try {
-      await this._raceAbort(bot.dig(block), signal, timeout, `挖掘 ${block.name} 超时（${(timeout / 1000).toFixed(0)} 秒）`);
+      await this._raceAbort(() => bot.dig(block), signal, timeout, `挖掘 ${block.name} 超时（${(timeout / 1000).toFixed(0)} 秒）`,
+        () => bot.stopDigging());
     } catch (err) {
       if (err instanceof CancelledError) throw err;
       const { reason, hint } = humanizeError(err);
@@ -624,7 +761,7 @@ class Actions {
     }
   }
 
-  async place({ x, y, z, item: itemName = null, signal = null, reach = false }) {
+  async place({ x, y, z, item: itemName = null, signal = null, reach = false, fast = false }) {
     this._requireBot();
     const bot = this._bot;
     const target = { x, y, z };
@@ -657,7 +794,9 @@ class Actions {
     }
     // 必须确保真的拿在手里：装备悄悄失败时 mineflayer 只会报
     // "must be holding an item to place"，非常难排查
-    await this.holdItem({ item: blockItem.name, signal });
+    if (!fast || !bot.heldItem || bot.heldItem.name !== blockItem.name || bot.heldItem.count < 1) {
+      await this.holdItem({ item: blockItem.name, signal });
+    }
 
     // 找参考方块：目标六个方向上的第一个实体方块，优先下方（最符合"搭上去"的直觉）
     const faces = [
@@ -684,7 +823,7 @@ class Actions {
 
     try {
       // 放置前看向目标（渐进转头；终点角度一致，服务器朝向判定不受影响）
-      if (this._config.get('humanize') === false) {
+      if (fast || this._config.get('humanize') === false) {
         await bot.lookAt(blockCenter(x, y, z), true);
       } else {
         await smoothLookAt(bot, blockCenter(x, y, z), { signal, durationMs: 100 });
@@ -699,7 +838,7 @@ class Actions {
       // 目标被占、被保护）它也会"成功返回"，表现为"物品被消耗了但方块没出现"。
       // placeBlock 会等 blockUpdate 回执，被拒绝时抛出可读错误。
       await this._raceAbort(
-        bot.placeBlock(reference, vec3(faceVec.x, faceVec.y, faceVec.z)),
+        () => bot.placeBlock(reference, vec3(faceVec.x, faceVec.y, faceVec.z)),
         signal,
         8000,
         `放置 ${blockItem.name} 超时（服务器没有回应放置请求）`,
@@ -841,7 +980,7 @@ class Actions {
       await this._syncInventoryWindow(bot, signal);
       const beforeThis = this.inventoryMap();
       try {
-        await this._raceAbort(bot.craft(recipe, 1, table || undefined), signal, 30000, `合成 ${want} 超时`);
+        await this._raceAbort(() => this._craftBatch(bot, recipe, table, signal), signal, 30000, `合成 ${want} 超时`);
       } catch (err) {
         // 关键善后（这条是 crafttest 三连测抓出来的）：
         // _raceAbort 只是放弃了 Promise，mineflayer 的合成**还在后台继续点击**，
@@ -878,13 +1017,18 @@ class Actions {
     //   2. 链式合成（木板→木棍→工具）每一步都看不到上一步的产物，
     //      材料检查直接判"缺料" → 链条必断 → 玩家看到"让她做木镐，失败了"
     const craftOnceAndSettle = async (t) => {
+      const beforeBatch = this.inventoryMap()[want] || 0;
       await craftOnce(t);
-      await this._waitForInventory(
+      // mineflayer locally predicts the crafting result; read the server's
+      // inventory snapshot before trusting that prediction or starting another batch.
+      await this._syncInventoryWindow(bot, signal);
+      const confirmed = await this._waitForInventory(
         () => this.inventoryMap(),
         want,
-        (before[want] || 0) + 1,
+        beforeBatch + Math.max(1, Number(recipe.result && recipe.result.count) || 1),
         { signal, timeoutMs: 1800 },
       );
+      if (!confirmed) log.warn(`合成 ${want} 的本批产出尚未确认（之前 ${beforeBatch} 个）`);
     };
 
     // 找到"真正能用"的合成方式：先试随身 2×2，报缺工作台再找/放一个
@@ -1009,6 +1153,86 @@ class Actions {
             : undefined
           : '合成没有产出，检查材料是否被消耗后又被放回',
     };
+  }
+
+  /** 新协议逐次确认点击，使用服务器计算的产出，不把本地预测当成合成结果。 */
+  async _craftBatch(bot, recipe, table, signal) {
+    if (!bot.supportFeature?.('stateIdUsed') || typeof bot._syncWindow !== 'function') {
+      return bot.craft(recipe, 1, table || undefined);
+    }
+    if (recipe.requiresTable && !table) throw new Error('Recipe requires craftingTable');
+    let window = bot.inventory;
+    if (table) {
+      window = await bot.openBlock(table);
+      if (!String(window.type).startsWith('minecraft:crafting')) throw new ActionError('打开的不是工作台');
+    }
+    const width = table ? 3 : 2;
+    const sync = () => bot._syncWindow(window);
+    const click = async (slot, button = 0) => {
+      if (signal?.aborted) throw new CancelledError();
+      await bot.clickWindow(slot, button, 0);
+      await sync();
+      // 点击自身也可能触发整窗纠正；再做一次同步，让前一次请求的回复先收敛。
+      await sync();
+    };
+    const putCursorAway = async () => {
+      let stalled = 0;
+      while (window.selectedItem) {
+        const held = window.selectedItem;
+        const stack = window.findItemRange(window.inventoryStart, window.inventoryEnd,
+          held.type, held.metadata, true, held.nbt);
+        const slot = stack?.slot ?? window.firstEmptySlotRange(window.inventoryStart, window.inventoryEnd);
+        if (slot === null || slot === undefined) throw new ActionError('背包没有空位，无法收回合成材料');
+        const before = held.count;
+        await click(slot);
+        if (window.selectedItem && window.selectedItem.type === held.type && window.selectedItem.count >= before) {
+          stalled += 1;
+          if (stalled >= 3) throw new ActionError(`服务器没有确认收回光标物品：${held.name}×${before} → ${window.selectedItem.name}×${window.selectedItem.count}，目标槽 ${slot}`);
+          // 一次点击可能被状态纠正拒绝；先等待服务器收敛，再按实际光标重试。
+          await delay(50, { signal });
+          await sync();
+        } else {
+          stalled = 0;
+        }
+      }
+    };
+    try {
+      await sync();
+      await putCursorAway();
+      for (let slot = 1; slot <= width * width; slot += 1) {
+        if (!window.slots[slot]) continue;
+        await click(slot);
+        await putCursorAway();
+      }
+      const inputs = [];
+      if (recipe.inShape) {
+        for (let y = 0; y < recipe.inShape.length; y += 1) {
+          for (let x = 0; x < recipe.inShape[y].length; x += 1) {
+            const ingredient = recipe.inShape[y][x];
+            if (ingredient && ingredient.id >= 0) inputs.push({ slot: 1 + x + width * y, ingredient });
+          }
+        }
+      } else {
+        for (const [index, ingredient] of (recipe.ingredients || []).entries()) {
+          if (ingredient && ingredient.id >= 0) inputs.push({ slot: index + 1, ingredient });
+        }
+      }
+      for (const { slot, ingredient } of inputs) {
+        const source = window.findInventoryItem(ingredient.id, ingredient.metadata);
+        if (!source) throw new MissingItemError('合成材料', '材料已不在背包中');
+        await click(source.slot);
+        await click(slot, 1);
+        await putCursorAway();
+      }
+      const result = window.slots[0];
+      if (!result || result.type !== recipe.result.id || result.count < recipe.result.count) {
+        throw new ActionError(`服务器合成格产出不符：${result?.name || '空'}，停止收取`);
+      }
+      await click(0);
+      await putCursorAway();
+    } finally {
+      if (table && bot.currentWindow === window) await bot.closeWindow(window);
+    }
   }
 
   /**
@@ -1294,17 +1518,20 @@ class Actions {
     this._eating = true;
     const beforeFood = bot.food;
     try {
-      if (bot.heldItem && bot.heldItem.name !== food.name) {
+      if (!bot.heldItem || bot.heldItem.name !== food.name) {
         await bot.equip(food, 'hand');
         await delay(120, { signal });
       }
       const timeout = 8000;
       const start = Date.now();
-      await this._raceAbort(bot.consume(), signal, timeout, '进食超时');
+      await this._raceAbort(() => bot.consume(), signal, timeout, '进食超时', () => bot.deactivateItem());
       // 等饱食度真的涨（服务器确认）
       while (Date.now() - start < timeout) {
         if (bot.food > beforeFood || bot.food >= 20) break;
         await delay(200, { signal });
+      }
+      if (beforeFood < 20 && bot.food <= beforeFood) {
+        throw new ActionError('服务器没有确认饱食度恢复');
       }
       return {
         ok: true,
@@ -1330,16 +1557,18 @@ class Actions {
       cooked_mutton: 86, cooked_chicken: 84, cooked_salmon: 82, cooked_cod: 80, cooked_rabbit: 78,
       bread: 70, baked_potato: 68, golden_carrot: 95, apple: 60, carrot: 55, rabbit_stew: 92,
       mushroom_stew: 88, beetroot_soup: 85, pumpkin_pie: 75, cookie: 40, melon_slice: 35,
-      sweet_berries: 30, glow_berries: 32, dried_kelp: 25, rotten_flesh: 5, spider_eye: 1,
-      poisonous_potato: 1, raw_beef: 45, raw_porkchop: 43, raw_chicken: 40, raw_mutton: 42,
-      raw_salmon: 38, raw_cod: 36, tropical_fish: 20, pufferfish: 1,
+      sweet_berries: 30, glow_berries: 32, dried_kelp: 25, rotten_flesh: 5,
+      beef: 45, porkchop: 43, chicken: 40, mutton: 42,
+      salmon: 38, cod: 36, tropical_fish: 20, rabbit: 41, potato: 15, beetroot: 28,
     };
     let best = null;
     let bestScore = -1;
     for (const item of bot.inventory.items()) {
       const s = scores[item.name];
       if (s === undefined) continue;
-      const score = s + Math.min(item.count, 8);
+      const isGolden = item.name === 'golden_apple' || item.name === 'enchanted_golden_apple';
+      // 普通补给不消耗应急金苹果；残血时才优先利用它的恢复效果。
+      const score = (isGolden && bot.health > 8 ? 10 : s) + Math.min(item.count, 8);
       if (score > bestScore) {
         bestScore = score;
         best = item;
@@ -1354,7 +1583,7 @@ class Actions {
     if (!bot || !bot.entity) return null;
     if (!this._config.get('autoEat')) return null;
     const threshold = Number(this._config.get('eatFoodLevel')) || 14;
-    if (bot.food >= threshold) return null;
+    if (bot.food >= threshold && !(bot.health <= 12 && bot.food < 18)) return null;
     if (Date.now() - this._lastEatAt < 10000) return null; // 冷却，避免刷屏
     if (this._eating) return null;
     const food = this._pickBestFood();
@@ -1982,6 +2211,17 @@ class Actions {
 
   /** 从箱子取出物品 */
   async withdraw({ x, y, z, item: itemName, count = 1, signal = null, reach = true }) {
+    if ([x, y, z].every((v) => v === undefined || v === null)) {
+      const bot = this._requireBot();
+      const block = bot.findBlock({
+        matching: (b) => !!b && /^(chest|trapped_chest|barrel|ender_chest|(?:[a-z_]+_)?shulker_box)$/.test(b.name),
+        maxDistance: 16,
+      });
+      if (!block || !block.position) throw new ActionError('16 格内没有找到箱子、木桶或潜影盒，请先走近容器');
+      ({ x, y, z } = block.position);
+    } else if (![x, y, z].every((v) => v !== null && v !== undefined && Number.isFinite(Number(v)))) {
+      throw new ActionError('容器坐标需完整提供 x/y/z，或全部省略以选择附近箱子');
+    }
     const container = await this.openContainer({ x, y, z, signal, reach });
     const win = container.win;
     const taken = {};
@@ -2111,13 +2351,13 @@ class Actions {
    */
   async _syncInventoryWindow(bot, signal = null) {
     if (!bot || typeof bot._syncWindow !== 'function') return;
-    const targets = [];
-    if (bot.inventory) targets.push(bot.inventory);
-    if (bot.currentWindow && bot.currentWindow !== bot.inventory) targets.push(bot.currentWindow);
+    // 服务端打开容器时只处理当前窗口；向已隐藏的窗口 0 同步会白等超时。
+    const targets = [bot.currentWindow || bot.inventory].filter(Boolean);
     for (const win of targets) {
       try {
-        await Promise.race([bot._syncWindow(win), delay(2000, { signal })]);
+        await this._raceAbort(() => bot._syncWindow(win), signal, 2000, '窗口状态同步超时', () => {});
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
         log.debug(`窗口状态同步失败（忽略）：${err.message}`);
       }
     }
@@ -2271,7 +2511,8 @@ class Actions {
         const here = blockAt(bot, x, y, z);
         const below = blockAt(bot, x, y - 1, z);
         if (!here || !below) continue;
-        const hereFree = here.boundingBox === 'empty' || here.name === 'air';
+        // 火把、门等没有完整碰撞箱，却仍占着方块格，服务器不能在原地放工作台。
+        const hereFree = ['air', 'cave_air', 'void_air'].includes(here.name);
         const belowSolid = below.boundingBox === 'block' && !isGui(below.name);
         if (hereFree && belowSolid) return { x, y, z };
       }
@@ -2280,31 +2521,36 @@ class Actions {
   }
 
   /** 把 Promise 和取消信号 + 超时绑在一起 */
-  async _raceAbort(promise, signal, timeoutMs, timeoutMessage) {
-    if (!signal) {
-      return Promise.race([
-        promise,
-        delay(timeoutMs).then(() => {
-          throw new TimeoutError(timeoutMessage);
-        }),
-      ]);
-    }
-    if (signal.aborted) throw new CancelledError();
+  async _raceAbort(operation, signal, timeoutMs, timeoutMessage, onCancel = null) {
+    if (signal && signal.aborted) throw new CancelledError();
+    const { executionContext } = require('./goals');
+    const controller = new AbortController();
+    let timer;
     let onAbort;
-    const abortPromise = new Promise((_, reject) => {
-      onAbort = () => reject(new CancelledError('动作被取消'));
-      signal.addEventListener('abort', onAbort, { once: true });
+    let interrupted = false;
+    const pending = executionContext.run({ ...executionContext.getStore(), signal: controller.signal },
+      () => typeof operation === 'function' ? Promise.resolve().then(() => {
+        if (controller.signal.aborted) throw new CancelledError();
+        return operation();
+      }) : Promise.resolve(operation));
+    const interrupt = new Promise((_, reject) => {
+      const stop = (err) => {
+        if (interrupted) return;
+        interrupted = true;
+        controller.abort();
+        try { executionContext.exit(() => onCancel ? onCancel() : this.stopCurrent()); } catch { /* best effort */ }
+        reject(err);
+      };
+      onAbort = () => stop(new CancelledError('动作被取消'));
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(() => stop(new TimeoutError(timeoutMessage)), timeoutMs);
+      if (signal && signal.aborted) onAbort();
     });
     try {
-      return await Promise.race([
-        promise,
-        abortPromise,
-        delay(timeoutMs).then(() => {
-          throw new TimeoutError(timeoutMessage);
-        }),
-      ]);
+      return await Promise.race([pending, interrupt]);
     } finally {
-      signal.removeEventListener('abort', onAbort);
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
   }
 }

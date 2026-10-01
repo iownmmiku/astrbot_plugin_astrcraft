@@ -37,6 +37,8 @@ from astrbot.core.agent.message import (
     ToolCallMessageSegment,
 )
 from astrbot.core.agent.tool import ToolSet
+from .game_agent import tool_changes_body
+from .inbox import Delivery
 
 # **动作代理能用的工具**：所有 mc_ 开头的能力工具。
 #
@@ -91,6 +93,11 @@ ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在�
 比如"去砍树"就调 `mc_chop_tree(count=8)`；"看看背包"就调 `mc_inventory`。
 工具返回什么，你就根据真实结果决定下一步。
 
+先保证能活着完成目标：饥饿或受伤时先补给，残血且附近有敌人先避险。
+优先利用手上的食材、已有工作台/熔炉和看得见的动物；原矿先加工成铁锭再升级工具。
+连续计划在步骤之间会检查生存需求，必要时先吃饭或恢复，再接回原计划；不要因为补给重新安排整套开荒。
+已放下的家具不在背包里，判断屋里有没有床或箱子需要查看世界，不能只看物品数量。
+
 **第二重要的规则：多步的事，用「技能工具」，不要用原语一步步硬拼。**
 
 **和上面同等重要：知道接下来几步就一次交代清楚（`mc_plan_do`）。**
@@ -103,7 +110,10 @@ ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在�
 我会按顺序替她执行，**中间不再来问你**。这样她做完第一步会**立刻**接第二步。
 
     mc_plan_do(steps="chop_tree, make_tools, mine_stone")
-    mc_plan_do(steps="collect(oak_log, 8), make_tools(tier=\"wooden\")")
+    mc_plan_do(steps='[{"skill":"chop_tree","params":{"count":4}},{"skill":"make_tools","params":{"tier":"wooden","kinds":["pickaxe"]}}]')
+
+不带参数时可以用逗号分隔技能名；**需要数量、工具等级等参数时，steps 必须是 JSON 数组字符串**，
+每一步写 skill 和 params，不要把函数调用表达式写进技能名。
 
 **什么时候不用**：你也不确定下一步该干嘛（那就先看一眼情况再说）。
 **不确定也可以写短的** —— 写一步也比不写好（至少省一次往返）。
@@ -236,6 +246,16 @@ class ActionAgent:
         return toolset if count else None
 
     async def _execute(self, name: str, args: dict, event) -> str:
+        if not name.startswith("mc_") or name in EXCLUDED_TOOLS:
+            return f"error: 当前自主行动不允许调用工具 {name}"
+        if tool_changes_body(name, args or {}):
+            life = getattr(self.plugin, "life", None)
+            if getattr(self.plugin, "_emergency_stopped", False):
+                return "error: 机器人已急停，请先由主人恢复行动"
+            if life is not None and callable(getattr(life, "may_act", None)) and not life.may_act():
+                return f"error: 当前不能自主行动：{life.hold_explain()}"
+            if life is not None and life.inbox.has_delivery(Delivery.STEER):
+                return "error: 有新的指令或紧急情况，请先读取新输入再决定动作"
         manager = self._manager()
         if manager is None:
             return "error: 工具管理器不可用"
@@ -275,6 +295,8 @@ class ActionAgent:
                 调用方应该退回"挑技能"的旧路径。
         """
         plugin = self.plugin
+        life = getattr(plugin, "life", None)
+        initial_revision = getattr(life, "_plan_revision", 0)
         try:
             provider = await plugin.context.get_using_provider_async()
         except Exception as exc:  # noqa: BLE001
@@ -282,6 +304,8 @@ class ActionAgent:
             provider = None
         if provider is None:
             return None, []
+        if initial_revision != getattr(life, "_plan_revision", 0):
+            return "（环境已改变，重新观察后再安排）", []
 
         toolset = self._toolset()
         if toolset is None:
@@ -292,6 +316,11 @@ class ActionAgent:
         used: list[str] = []
 
         for _ in range(self.max_steps):
+            life = getattr(plugin, "life", None)
+            plan_revision = getattr(life, "_plan_revision", 0)
+            pending_before = getattr(life, "_pending_plan", None)
+            if pending_before:
+                return "（收到新的计划，先按最新安排做）", used
             try:
                 resp = await provider.text_chat(
                     contexts=list(contexts),
@@ -301,7 +330,29 @@ class ActionAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自主行动的模型调用失败：%s", exc)
-                return (None, used) if not used else ("（模型调用失败，先这样）", used)
+                # 调用失败要传给恢复回路，不能伪装成代理不可用后再烧一次模型请求。
+                if not any(tool_changes_body(name, {}) for name in used):
+                    raise RuntimeError(f"自主行动模型调用失败：{exc}") from exc
+                return "（模型调用失败，已执行的动作先保留）", used
+
+            life = getattr(plugin, "life", None)
+            if plan_revision != getattr(life, "_plan_revision", 0):
+                # 重连或计划被撤销后，旧模型响应不属于现在的会话。
+                return "（环境已改变，重新观察后再安排）", used
+            if (life is not None and getattr(life, "_pending_plan", None)
+                    and life._pending_plan is not pending_before):
+                # 玩家在模型思考期间写了计划，旧响应不能再覆盖它或提交旧动作。
+                return "（收到新的计划，先按最新安排做）", used
+            if life is not None and life.inbox.has_delivery(Delivery.STEER):
+                fresh = life._drain_steer_text()
+                if fresh:
+                    life.clear_plan("模型思考期间收到新输入")
+                    life._decision_input_text = "\n".join(
+                        text for text in (getattr(life, "_decision_input_text", ""), fresh) if text
+                    )
+                    # 这次响应还没执行工具，可安全丢弃旧决定并重新读最新情况。
+                    contexts.append(Message(role="user", content=fresh))
+                    continue
 
             # **记一次用量**（W6）。每一步都是一次模型往返，所以每一轮都要记——
             # 只记最后一步的话，"一次决策花多少 token"会严重低估
@@ -343,6 +394,8 @@ class ActionAgent:
                 logger.debug("回显工具调用失败（不影响执行）：%s", exc)
 
             for idx, nm in enumerate(names):
+                if plan_revision != getattr(life, "_plan_revision", 0):
+                    return "（环境已改变，重新观察后再安排）", used
                 a = args_list[idx] if idx < len(args_list) else {}
                 if not isinstance(a, dict):
                     try:
@@ -356,6 +409,9 @@ class ActionAgent:
                 contexts.append(
                     ToolCallMessageSegment(role="tool", tool_call_id=call_id, content=str(out))
                 )
+                if nm == "mc_plan_do" and life is not None and getattr(life, "_pending_plan", []):
+                    logger.info("她已经交代完整计划，立即交给生活循环连续执行")
+                    return "（安排好了，按顺序开始做）", used
                 # **提交了长任务就立刻结束这一轮——在代码里强制，不能只写在提示词里。**
                 #
                 # 为什么必须强制：技能工具（mc_chop_tree / mc_make_tools…）返回的是
