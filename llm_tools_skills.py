@@ -529,7 +529,7 @@ class McSkillTools:
         if not self.goals:
             yield event.plain_result("目标系统未初始化")
             return
-        yield event.plain_result(await self.goals.pause())
+        yield event.plain_result(await self._pause_play())
 
     @filter.llm_tool(name="mc_goal_resume")
     async def tool_mc_goal_resume(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -540,7 +540,7 @@ class McSkillTools:
         if not self.goals:
             yield event.plain_result("目标系统未初始化")
             return
-        yield event.plain_result(await self.goals.resume())
+        yield event.plain_result(await self._resume_play())
 
     # ============================================================ 社交
 

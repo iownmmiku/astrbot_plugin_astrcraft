@@ -45,6 +45,7 @@ from .knowledge import KnowledgeBase
 from .llm_tools_core import McPerceptionTools
 from .llm_tools_skills import McSkillTools
 from .llm_tools_life import McLifeTools
+from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
@@ -80,6 +81,7 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
   /mc技能              她能做的事
   /mc看她              看她：观战窗口（浏览器里的第一视角）+ 她的背包 + 她在干什么
   /mc开观战            立刻打开观战窗口（不用重进服）
+  /mc控制台            WebUI 地址与访问令牌（管理员）
   /mc调试              排障信息
   /mc帮助              显示本帮助
 
@@ -113,8 +115,10 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         self.connected = False
         self._manual_disconnect_requested = False
         self._emergency_stopped = False
+        self._owner_paused = False
         self._background_tasks: set[asyncio.Task] = set()
         self._terminating = False
+        self.webui: WebUI | None = None
         self._player_action_inflight = 0
         self._engine_task: asyncio.Task | None = None
         self._subscribers: set[str] = set()
@@ -311,6 +315,21 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if self._cfg("forward_engine_events", True):
             self.engine.on("*", self._on_any_engine_event)
 
+        # Keep diagnostics available even when Node cannot start.
+        if self._cfg("enable_webui", False):
+            try:
+                self.webui = WebUI(
+                    self, host=str(self._cfg("webui_host", "127.0.0.1")),
+                    port=int(self._cfg("webui_port", 3008)),
+                    token=WebUI.load_token(self._data_dir, str(self._cfg("webui_token", ""))),
+                    version=PLUGIN_VERSION,
+                )
+                self.webui.start()
+                logger.info("Astrcraft WebUI 已启动：%s（管理员发送 /mc控制台 获取访问令牌）", self.webui.url)
+            except Exception as exc:
+                self.webui = None
+                logger.error("WebUI 启动失败：%s", exc)
+
         try:
             await self.engine.start()
         except EngineUnavailable as exc:
@@ -358,6 +377,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """插件卸载：停目标与过日子、落盘、断游戏、关引擎。"""
         logger.info("Minecraft 插件正在卸载")
         self._terminating = True
+        if getattr(self, "webui", None):
+            await self.webui.close()
         if self._supervise_task and not self._supervise_task.done():
             self._supervise_task.cancel()
             await asyncio.gather(self._supervise_task, return_exceptions=True)
@@ -551,6 +572,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """保护目标建立期间的暂停，旧任务的完成事件不能提前归还自主权。"""
         if self._emergency_stopped:
             raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
+        self._owner_paused = False  # A newly assigned goal explicitly takes control.
         self._player_action_inflight = getattr(self, "_player_action_inflight", 0) + 1
         try:
             if self.life:
@@ -564,19 +586,28 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     logger.debug("准备新目标时未能取消旧动作，将继续建立目标：%s", exc)
             if self._emergency_stopped:
                 raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
+            if self._owner_paused:
+                raise EngineError("目标准备期间收到暂停，先用 /mc继续 恢复")
             message = await self.goals.start(goal)
             # 目标规划可能等待模型；期间收到急停时，新目标仍需保持暂停。
-            if self._emergency_stopped:
+            if self._emergency_stopped or self._owner_paused:
                 await self.goals.pause()
-                raise EngineError("目标准备期间收到急停，先用 /mc继续 恢复")
+                reason = "急停" if self._emergency_stopped else "暂停"
+                raise EngineError(f"目标准备期间收到{reason}，先用 /mc继续 恢复")
             return message
         finally:
             self._player_action_inflight = max(0, self._player_action_inflight - 1)
-            if (self.life and not self._emergency_stopped
-                    and not self._player_action_inflight
-                    and not (self.goals and self.goals.active)):
+            if self.life and self._can_resume_autonomy():
                 self.life.resume()
                 self.life.wake(reason="目标未建立，恢复自主游玩")
+
+    def _can_resume_autonomy(self) -> bool:
+        return not (getattr(self, "_emergency_stopped", False)
+                    or getattr(self, "_owner_paused", False)
+                    or getattr(self, "_manual_disconnect_requested", False)
+                    or getattr(self, "_terminating", False)
+                    or getattr(self, "_player_action_inflight", 0)
+                    or (self.goals and self.goals.active))
 
     async def _ensure_engine(self) -> bool:
         if not self.engine:
@@ -587,6 +618,11 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             await self.engine.start()
             if self._emergency_stopped:
                 await self.engine.safety_stop()
+            if self.life:
+                self.life.note_engine_up(True)
+            supervise = getattr(self, "_supervise_task", None)
+            if not getattr(self, "_terminating", False) and (supervise is None or supervise.done()):
+                self._supervise_task = asyncio.create_task(self._supervise_loop(), name="mc-engine-supervise")
             return True
         except Exception as exc:  # noqa: BLE001
             logger.error("启动引擎失败：%s", exc)
@@ -1223,10 +1259,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if data.get("kind") == "reflex":
             return
         # 玩家指派的活干完了 → 她可以继续过自己的日子
-        if (self.life and self.life.paused
-                and not getattr(self, "_emergency_stopped", False)
-                and not getattr(self, "_player_action_inflight", 0)
-                and not (self.goals and self.goals.active)):
+        if self.life and self.life.paused and self._can_resume_autonomy():
             self.life.resume()
             logger.debug("任务结束，过日子循环已恢复")
 
@@ -1682,17 +1715,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         elif event == "goal.done":
             await self._notify_subscribers(f"🏁 目标完成「{data.get('goal')}」")
             # 指派的任务做完了 → 她回去过自己的日子
-            if (self.life and not getattr(self, "_emergency_stopped", False)
-                    and not getattr(self, "_player_action_inflight", 0)
-                    and not (self.goals and self.goals.active)):
+            if self.life and self._can_resume_autonomy():
                 self.life.resume()
         elif event == "goal.failed":
             await self._notify_subscribers(
                 f"⚠️ 目标受阻「{data.get('goal')}」\n卡在：{data.get('step')}\n原因：{data.get('reason')}"
             )
-            if (self.life and not getattr(self, "_emergency_stopped", False)
-                    and not getattr(self, "_player_action_inflight", 0)
-                    and not (self.goals and self.goals.active)):
+            if self.life and self._can_resume_autonomy():
                 self.life.resume()
 
     # ================================================================ 会话推送
@@ -2172,25 +2201,36 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc暂停", alias={"mcpause"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_pause(self, event: AstrMessageEvent):
-        """暂停当前目标"""
-        yield event.plain_result(await self.goals.pause() if self.goals else "目标系统未初始化")
+        """暂停目标与自主行动，并取消当前动作。"""
+        try:
+            yield event.plain_result(await self._pause_play())
+        except Exception as exc:
+            yield event.plain_result(f"暂停动作失败，自主行动保持暂停：{exc}")
 
-    @filter.command("mc继续", alias={"mcresume"})
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def cmd_resume(self, event: AstrMessageEvent):
-        """恢复急停或继续当前目标；无目标时恢复自主生活。"""
+    async def _pause_play(self) -> str:
+        self._owner_paused = True
+        if self.life:
+            self.life.pause(reason="用户暂停", max_seconds=0)
+        msg = await self.goals.pause() if self.goals else ""
+        if self.engine and self.engine.running:
+            await self.engine.call("task.cancel", {}, timeout=10.0)
+        return msg if self.goals and self.goals.active else "自主行动已暂停，发送 /mc继续 恢复"
+
+    async def _resume_play(self) -> str:
+        """Shared recovery path for chat and WebUI; failed recovery stays stopped."""
         try:
             if self.engine and self.engine.running:
                 await self.engine.call("safety.resume", {}, timeout=10.0)
             self._emergency_stopped = False
+            self._owner_paused = False
             msg = await self.goals.resume() if self.goals else ""
             if self.life and not (self.goals and self.goals.active):
                 self.life.resume()
                 self.life.retry_decision_now()
                 self.life.wake(reason="用户继续自主游玩")
                 msg = "已恢复自主游玩"
-            yield event.plain_result(msg or "已解除急停")
-        except Exception as exc:  # noqa: BLE001
+            return msg or "已解除急停"
+        except Exception:
             self._emergency_stopped = True
             if self.life:
                 self.life.pause(reason="恢复失败", max_seconds=0)
@@ -2199,17 +2239,45 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     await self.engine.safety_stop()
                 except Exception:
                     logger.warning("恢复失败后重新急停引擎失败")
+            raise
+
+    @filter.command("mc继续", alias={"mcresume"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_resume(self, event: AstrMessageEvent):
+        """恢复急停或继续当前目标；无目标时恢复自主生活。"""
+        try:
+            yield event.plain_result(await self._resume_play())
+        except Exception as exc:  # noqa: BLE001
             yield event.plain_result(f"恢复失败，仍保持暂停：{exc}")
 
     @filter.command("mc放弃", alias={"mcabandon"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_abandon(self, event: AstrMessageEvent):
         """放弃当前目标"""
+        yield event.plain_result(await self._abandon_goal())
+
+    async def _abandon_goal(self) -> str:
         msg = await self.goals.abandon() if self.goals else "目标系统未初始化"
+        self._owner_paused = False
         # 任务结束了 → 让她继续过自己的日子
-        if self.life and not self._emergency_stopped:
+        if self.life and self._can_resume_autonomy():
             self.life.resume()
-        yield event.plain_result(msg)
+        return msg
+
+    @filter.command("mc控制台", alias={"mcwebui"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_webui(self, event: AstrMessageEvent):
+        """获取 WebUI 地址和令牌；只在管理员私聊中返回凭据。"""
+        ui = getattr(self, "webui", None)
+        if not ui:
+            yield event.plain_result("WebUI 未启动。在插件配置开启 enable_webui 后重载插件；启动失败请查看 AstrBot 日志。")
+            return
+        # An admin command in a group must not distribute its credential to everyone.
+        private = getattr(event, "is_private_chat", None)
+        if not callable(private) or not private():
+            yield event.plain_result(f"控制台：{ui.url}\n请在管理员私聊发送 /mc控制台 获取令牌；也可读取插件数据目录的 webui_token.txt 或使用配置的 webui_token。")
+            return
+        yield event.plain_result(f"控制台：{ui.url}\n访问令牌：{ui.token}\n远程或容器部署时将地址替换为 AstrBot 主机地址并映射 WebUI 端口。")
 
     @filter.command("mc订阅", alias={"mcsubscribe"})
     async def cmd_subscribe(self, event: AstrMessageEvent):

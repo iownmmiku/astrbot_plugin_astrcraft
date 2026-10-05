@@ -1,4 +1,24 @@
 {
+  "enable_webui": {
+    "type": "bool",
+    "description": "【WebUI】启用 Astrcraft 网页控制台，查看生存、任务、背包并控制机器人。修改后重载插件",
+    "default": false
+  },
+  "webui_host": {
+    "type": "string",
+    "description": "【WebUI】监听地址，默认只允许本机。容器或局域网访问可设 0.0.0.0；公网使用 HTTPS 反向代理",
+    "default": "127.0.0.1"
+  },
+  "webui_port": {
+    "type": "int",
+    "description": "【WebUI】控制台端口，与 3D 观战端口独立。修改后重载插件",
+    "default": 3008
+  },
+  "webui_token": {
+    "type": "string",
+    "description": "【WebUI】访问令牌；留空自动生成并保存在插件数据目录 webui_token.txt。管理员私聊发送 mc控制台 获取。修改后重载插件",
+    "default": ""
+  },
   "engine_dir": {
     "type": "string",
     "description": "【常用】Minecraft Node 引擎目录。留空优先使用插件内的 engine/；外置部署时填写绝对路径",

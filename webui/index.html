@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light"><title>Astrcraft · 她的世界</title>
+  <link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script>
+</head>
+<body>
+<svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
+  <symbol id="i-task" viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M9 9h6M9 13h6M9 17h4"/></symbol>
+  <symbol id="i-bag" viewBox="0 0 24 24"><path d="M8 7V5a4 4 0 018 0v2M5 7h14l1 14H4L5 7zM8 11v2m8-2v2"/></symbol>
+  <symbol id="i-log" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5l5 5-5 5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8V4z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="1"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 1v3m0 16v3M1 12h3m16 0h3M4 4l2 2m12 12l2 2M4 20l2-2M18 6l2-2"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21L3 12C-2 5 7-1 12 6 17-1 26 5 21 12l-9 9z"/></symbol>
+  <symbol id="i-food" viewBox="0 0 24 24"><path d="M4 3v6a3 3 0 006 0V3M7 3v19M20 3c-5 0-5 12 0 12V3zm0 12v7"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 1116 0z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+</defs></svg>
+<aside class="sidebar">
+  <a class="brand" href="/" aria-label="Astrcraft 首页"><span class="brand-mark">A<span>✦</span></span><span>Astrcraft<small>她的世界，由她探索。</small></span></a>
+  <div class="nav-label">控制中心 <span>CONTROL ROOM</span></div>
+  <nav aria-label="主导航">
+    <button class="nav-item active" data-page="overview" aria-current="page"><svg><use href="#i-grid"/></svg>世界总览<span>01</span></button>
+    <button class="nav-item" data-page="tasks"><svg><use href="#i-task"/></svg>行动与目标<span>02</span></button>
+    <button class="nav-item" data-page="inventory"><svg><use href="#i-bag"/></svg>随身背包<span>03</span></button>
+    <button class="nav-item" data-page="events"><svg><use href="#i-log"/></svg>世界记录<span>04</span></button>
+  </nav>
+  <div class="sidebar-world"><div class="little-block" aria-hidden="true"></div><p>一点一点，<br>建起她的生活。</p><span>OBSERVE · EXPLORE · SURVIVE</span></div>
+  <div class="sidebar-bottom"><div class="connection"><span class="dot" id="connection-dot"></span><div><strong id="connection-label">等待连接</strong><small id="connection-detail">输入令牌，进入控制台</small></div></div><button class="text-button" id="logout">退出控制台 ↗</button><div class="version" id="version">ASTRCRAFT / WEBUI</div></div>
+</aside>
+<main>
+  <header><div class="breadcrumb">Astrcraft <span>/</span> 控制中心</div><div class="header-actions"><button class="button danger header-stop" data-action="stop" aria-label="急停所有动作" title="急停所有动作"><svg><use href="#i-stop"/></svg><span>急停</span></button><span id="refresh-state" class="refresh-state">尚未同步</span><button id="mobile-logout" class="icon-button mobile-logout" aria-label="退出控制台" title="退出控制台">⇥</button><button id="refresh" class="icon-button" aria-label="刷新状态" title="刷新状态">↻</button><button class="button outline" data-action="viewer"><svg><use href="#i-eye"/></svg>开启观战</button><a id="viewer-link" class="button outline" target="_blank" rel="noopener noreferrer" hidden>进入观战 ↗</a></div></header>
+  <div class="page-heading"><div><div class="eyebrow">A WINDOW INTO HER WORLD</div><h1 id="page-title">世界总览<span class="title-dot">.</span></h1><p id="page-subtitle">看看她在哪里，正在想什么，又准备去做什么。</p></div><div class="heading-tag"><span class="dot" id="game-dot"></span><span id="game-status">尚未读取游戏</span></div></div>
+  <div class="notice" id="notice" role="status" hidden></div>
+  <section data-panel="overview">
+    <div class="hero">
+      <div class="hero-copy"><div class="hero-label"><span class="dot"></span><span id="mode-label">等待同步</span><span class="hero-number">FIELD NOTES / 001</span></div><h2 id="hero-title">她的冒险，<br>从这里开始。</h2><p id="hero-description">连接控制台后，查看她的真实状态与自主行动。</p><div class="hero-actions"><button class="button light" data-action="connect"><svg><use href="#i-play"/></svg>进入服务器</button><button class="button hero-outline" data-action="resume">继续游玩<svg><use href="#i-arrow"/></svg></button></div><div class="hero-footer"><span id="hero-server">—</span><span id="world-clock">世界时间 —</span></div></div>
+      <div class="scene" aria-hidden="true"><div class="scene-orbit"></div><div class="scene-sun"></div><div class="scene-cloud cloud-one"></div><div class="scene-cloud cloud-two"></div><svg viewBox="0 0 440 330" class="camp-art">
+        <ellipse cx="220" cy="291" rx="158" ry="20" fill="#123b30" opacity=".42"/>
+        <path d="M48 195l168-86 177 93-166 96z" fill="#9cb777"/><path d="M48 195v31l179 97v-25z" fill="#557250"/><path d="M227 298v25l166-91v-30z" fill="#3e6245"/>
+        <path d="M59 205l168 86 151-82M75 218v18m27-3v18m28-4v18m28-4v18m28-4v18m51 9v17m28-33v18m28-34v18m28-32v18m28-33v18m28-33v18" fill="none" stroke="#284a36" stroke-width="3" opacity=".3"/>
+        <path d="M112 189l76-39 80 42-76 40z" fill="#d0bc86"/><path d="M112 189v49l80 43v-49z" fill="#b49767"/><path d="M192 232v49l76-42v-47z" fill="#927754"/>
+        <path d="M104 187l88-74 84 74-84 47z" fill="#d99f64"/><path d="M192 113l77 43 31 44-24-13z" fill="#a46e45"/><path d="M104 187l88-74v121z" fill="#e0b57a"/>
+        <path d="M153 219v37l23 12v-36z" fill="#47604a"/><path d="M122 210v17l18 10v-17z" fill="#56775a"/><path d="M215 227v18l22-12v-18z" fill="#7599a0"/><path d="M225 221v18m-10-3l22-12" stroke="#dac8a1" stroke-width="2"/>
+        <path d="M249 143v-40l16-8 17 9v57" fill="#b6ab96"/><path d="M249 103l16 8 17-7-17-9z" fill="#d4cbb8"/><path d="M265 111v43" stroke="#8f8a76" stroke-width="2"/>
+        <path d="M322 216v-68l10-5 10 6v67l-10 6z" fill="#886943"/><path d="M296 110l33-18 37 19v47l-34 18-36-19z" fill="#4c8155"/><path d="M296 110l36 19 34-18-37-19z" fill="#89aa70"/><path d="M332 129v47l34-18v-47z" fill="#3f6e4c"/>
+        <path d="M280 95l49-25 51 26v31l-48 25-52-26z" fill="#5d8e59"/><path d="M280 95l52 27 48-26-51-26z" fill="#9cb77a"/><path d="M332 122v30l48-25V96z" fill="#4c7b52"/>
+        <path d="M75 176v-41l8-4 8 4v42l-8 4z" fill="#886943"/><path d="M58 110l25-13 28 15v33l-26 14-27-15z" fill="#598b5b"/><path d="M58 110l27 14 26-12-28-15z" fill="#95b67c"/><path d="M85 124v35l26-14v-33z" fill="#41714f"/>
+        <path d="M219 266l23-12 40 21-23 12zM246 250l23-12 39 21-23 12zM273 234l23-12 39 21-23 12z" fill="#d5c5a0"/>
+        <path d="M121 260l-2-12m-3 9l-6-5m9 0l5-6M355 218l1-15m0 9l7-6m-7 4l-5-4" stroke="#427547" stroke-width="3"/>
+        <path d="M298 195v-12m-5 2h10" stroke="#dcb764" stroke-width="3"/><path d="M298 178v-7" stroke="#ffdc83" stroke-width="6"/>
+      </svg><span class="scene-caption">像素营地 · 控制台插画</span></div>
+    </div>
+    <div class="metrics">
+      <article class="metric"><div class="metric-label"><svg class="red"><use href="#i-heart"/></svg>生命值<span id="health-status">未读取</span></div><div class="metric-number"><strong id="health">—</strong><span id="max-health">/ —</span></div><div class="meter health-meter"><span id="health-meter"></span></div></article>
+      <article class="metric"><div class="metric-label"><svg class="amber"><use href="#i-food"/></svg>饱食度<span id="food-status">未读取</span></div><div class="metric-number"><strong id="food">—</strong><span>/ 20</span></div><div class="meter food-meter"><span id="food-meter"></span></div></article>
+      <article class="metric"><div class="metric-label"><svg><use href="#i-pin"/></svg>当前位置<span id="dimension">未知维度</span></div><div class="coordinates" id="coordinates">— / — / —</div><div class="metric-foot" id="standing">脚下地形尚未读取</div></article>
+      <article class="metric"><div class="metric-label"><svg><use href="#i-sun"/></svg>环境与经验<span id="weather">—</span></div><div class="metric-number"><strong id="xp">—</strong><span>LEVEL</span></div><div class="metric-foot" id="environment">光照 — · 延迟 —</div></article>
+    </div>
+    <div class="overview-grid">
+      <article class="card intention-card"><div class="card-heading"><h3>她正在做什么</h3><span class="tag" id="life-tag">待同步</span></div><div class="intention"><div class="avatar" aria-hidden="true">✦</div><div><h4 id="activity">还没有读取她的行动</h4><p id="reason">自主决策与等待原因会在这里显示。</p></div></div><div class="note-block"><span>此刻的打算</span><p id="intention">—</p></div><div class="card-bottom"><span id="plan-count">计划尚未读取</span><button class="text-button" data-page="tasks">查看行动 <span>↗</span></button></div></article>
+      <article class="card"><div class="card-heading"><h3>当前目标</h3><button class="text-button" data-page="tasks">指派目标 ↗</button></div><h4 class="goal-title" id="goal-title">暂无长期目标</h4><p class="muted" id="goal-detail">读取状态后展示实际目标进度。</p><div class="meter goal-meter"><span id="goal-meter"></span></div><div class="goal-controls"><button class="button small" data-action="pause">暂停行动</button><button class="button small outline" data-action="resume">继续</button><button class="text-button" data-action="abandon">放弃目标</button></div></article>
+      <article class="card event-card"><div class="card-heading"><h3>最近的世界记录</h3><button class="text-button" data-page="events">全部记录 ↗</button></div><div id="recent-events" class="timeline"><p class="empty">还没有收到世界事件。</p></div></article>
+      <article class="card control-card"><div class="card-heading"><h3>一起游玩</h3><span class="tiny-label">YOUR TURN</span></div><form id="chat-form"><label for="chat-input">让她在游戏里说一句话</label><div class="input-row"><input id="chat-input" maxlength="250" placeholder="向服务器里的伙伴打个招呼…" autocomplete="off"><button class="button" type="submit">发送 <svg><use href="#i-arrow"/></svg></button></div></form><div class="control-divider"></div><div class="safe-control"><div><strong>需要让她停下来？</strong><p>急停会停止动作，保留暂停状态。</p></div><button class="button danger" data-action="stop"><svg><use href="#i-stop"/></svg>立即急停</button></div><button class="text-button disconnect" data-action="disconnect">断开游戏连接 ↗</button></article>
+    </div>
+  </section>
+  <section data-panel="tasks" hidden><div class="tasks-grid"><article class="card"><div class="card-heading"><h3>给她一个新目标</h3><span class="tag">技能链执行</span></div><form id="goal-form"><label for="goal-input">这次，希望她做些什么？</label><textarea id="goal-input" rows="4" maxlength="500" placeholder="例如：砍 10 根木头，或盖一个庇护所"></textarea><div class="suggestions"><button type="button" data-suggestion="自己去生存">自主生存</button><button type="button" data-suggestion="砍 10 根木头">采集木头</button><button type="button" data-suggestion="盖一个庇护所">建造庇护所</button></div><p class="muted">新目标会替换原目标，暂时接管自主生活。完成后她会继续自己的日程。</p><button type="submit" class="button">开始目标 <svg><use href="#i-arrow"/></svg></button></form><div class="control-divider"></div><div class="goal-controls"><button class="button outline" data-action="pause">暂停行动</button><button class="button" data-action="resume">继续游玩</button><button class="text-button" data-action="abandon">放弃目标</button><button class="button danger" data-action="stop">急停</button></div></article><article class="card"><div class="card-heading"><h3>目标步骤</h3><span class="tag" id="goal-status">无目标</span></div><h4 id="task-goal-title">暂无长期目标</h4><ol id="goal-steps" class="steps"></ol><p id="goal-error" class="error-text" hidden></p></article><article class="card"><div class="card-heading"><h3>自主行动计划</h3><span class="tiny-label">LIFE LOOP</span></div><p id="hold-reason" class="muted">—</p><ol id="life-plan" class="steps"></ol></article><article class="card"><div class="card-heading"><h3>引擎任务</h3><span id="queue-count" class="tag">—</span></div><div id="engine-tasks"></div></article><article class="card wide"><div class="card-heading"><h3>控制操作记录</h3><span class="tiny-label">异步执行 · 不自动重试</span></div><div id="jobs"></div></article></div></section>
+  <section data-panel="inventory" hidden><article class="card"><div class="card-heading"><div><h3>随身物资</h3><p class="muted" id="inventory-detail">读取真实背包槽位</p></div><input id="item-filter" type="search" placeholder="搜索物品名称…" aria-label="搜索背包物品"></div><div class="inventory-layout"><div><div class="section-label">主背包 <span>27 SLOTS</span></div><div id="inventory-main" class="inventory-grid"></div><div class="section-label hotbar-label">快捷栏 <span>9 SLOTS</span></div><div id="inventory-hotbar" class="inventory-grid hotbar"></div></div><aside class="equipment"><h4>手持与装备</h4><div id="equipment"></div><p class="muted">背包只用于查看；物品转移由游戏技能处理。</p></aside></div><div id="item-results" class="item-results" hidden></div></article></section>
+  <section data-panel="events" hidden><article class="card"><div class="card-heading"><div><h3>世界事件与任务结果</h3><p class="muted">保留最近 40 条引擎事件，按新到旧显示。</p></div><select id="event-filter" aria-label="筛选事件"><option value="all">全部事件</option><option value="chat">游戏聊天</option><option value="task">任务结果</option><option value="bot">连接与生存</option></select></div><div id="all-events" class="event-list"></div></article><article class="card event-explain"><h3>状态说明</h3><p id="life-summary" class="pre-wrap muted">—</p></article></section>
+  <footer><span>ASTRCRAFT <span class="footer-spark">✦</span> 给她一片世界，也给她一点自由。</span><span>实时状态 · 每 2 秒同步</span></footer>
+</main>
+<dialog id="login-dialog"><form id="login-form"><div class="login-brand">ASTRCRAFT <span>✦</span></div><h2>走进她的世界。</h2><p>使用访问令牌连接 Astrcraft 控制台。</p><label for="token-input">访问令牌</label><input id="token-input" type="password" required maxlength="512" autocomplete="off" placeholder="输入 WebUI 访问令牌"><p class="error-text" id="login-error" hidden></p><button type="submit" class="button">进入控制台 <svg><use href="#i-arrow"/></svg></button><div class="login-hint">管理员私聊发送 <code>/mc控制台</code> 获取令牌。<br>也可读取插件数据目录中的 <code>webui_token.txt</code>。</div></form></dialog>
+<div id="login-shade"></div><div id="toast" class="toast" role="status" hidden></div>
+</body></html>

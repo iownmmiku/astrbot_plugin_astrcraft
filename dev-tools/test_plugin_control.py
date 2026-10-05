@@ -6,7 +6,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _paths
@@ -129,6 +129,82 @@ async def results(generator):
 
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_goal_tool_resume_clears_webui_owner_pause(self):
+        p = plugin()
+        p._owner_paused = True
+        p.life.paused = True
+        class Goals:
+            active = True
+            async def resume(self):
+                return "目标已继续"
+        p.goals = Goals()
+        self.assertIn("目标已继续", "".join(await results(p.tool_mc_goal_resume(Event()))))
+        self.assertFalse(p._owner_paused)
+        self.assertTrue(p.life.paused)  # The still-active goal retains ownership.
+        p.goals.active = False
+        await p._on_goal_event("goal.done", {"goal": "完成"})
+        self.assertFalse(p.life.paused)
+
+    async def test_manual_start_after_initial_failure_restores_life_and_supervisor(self):
+        p = plugin()
+        p.engine.running = False
+        p.life.note_engine_up = Mock()
+        self.assertTrue(await p._ensure_engine())
+        p.life.note_engine_up.assert_called_once_with(True)
+        self.assertFalse(p._supervise_task.done())
+        p._supervise_task.cancel()
+        await asyncio.gather(p._supervise_task, return_exceptions=True)
+
+    async def test_owner_pause_survives_task_and_goal_notifications(self):
+        p = plugin()
+        p.config["announce_task_done"] = False
+        await p._pause_play()
+        self.assertTrue(p._owner_paused)
+        self.assertTrue(p.life.paused)
+        await p._on_task_finished({"kind": "skill", "name": "采集", "status": "cancelled"})
+        await p._on_goal_event("goal.done", {"goal": "旧目标"})
+        await p._on_goal_event("goal.failed", {"goal": "旧目标"})
+        self.assertTrue(p.life.paused)
+        await p._resume_play()
+        self.assertFalse(p._owner_paused)
+        self.assertFalse(p.life.paused)
+
+    async def test_owner_pause_survives_failed_cancel_rpc(self):
+        p = plugin()
+        p.engine.call = AsyncMock(side_effect=RuntimeError("unavailable"))
+        with self.assertRaises(RuntimeError):
+            await p._pause_play()
+        self.assertTrue(p.life.paused)
+        self.assertFalse(p._can_resume_autonomy())
+
+    async def test_cancelled_goal_during_disconnect_does_not_resume_life(self):
+        p = plugin()
+        entered = asyncio.Event()
+        class Goals:
+            active = False
+            async def start(self, goal):
+                entered.set()
+                await asyncio.Event().wait()
+        p.goals = Goals()
+        task = asyncio.create_task(p._start_player_goal("慢目标"))
+        await entered.wait()
+        p._manual_disconnect_requested = True
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(p.life.paused)
+
+    async def test_webui_token_only_returned_to_admin_private_chat(self):
+        from types import SimpleNamespace
+        p = plugin()
+        p.webui = SimpleNamespace(url="http://127.0.0.1:3008", token="private-secret")
+        event = Event()
+        event.is_private_chat = lambda: False
+        self.assertNotIn("private-secret", "".join(await results(p.cmd_webui(event))))
+        event.is_private_chat = lambda: True
+        self.assertIn("private-secret", "".join(await results(p.cmd_webui(event))))
+        p.webui = None
+        self.assertIn("enable_webui", "".join(await results(p.cmd_webui(event))))
+
     async def test_cancelled_skill_is_interruption_without_failure_backoff(self):
         from test_life_recovery import make_loop
         p = plugin()
