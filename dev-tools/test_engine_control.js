@@ -6,7 +6,8 @@ const assert = require('node:assert/strict');
 const { EventEmitter, getEventListeners } = require('node:events');
 const { Actions } = require('../engine/actions');
 const { McEngine } = require('../engine/bot');
-const { Navigator } = require('../engine/movement');
+const { Navigator, setupPathfinder } = require('../engine/movement');
+const { Config } = require('../engine/config');
 const { TaskQueue, PRIORITY, executionContext } = require('../engine/goals');
 const { vec3, delay, CancelledError } = require('../engine/util');
 const wood = require('../engine/skills/wood');
@@ -44,6 +45,232 @@ function engineWithBot(bot = fakeBot()) {
   return engine;
 }
 
+function weaponFixture(items, held = null) {
+  const bot = fakeBot();
+  const equipped = [];
+  bot.inventory.items = () => items;
+  bot.heldItem = held;
+  bot.equip = async (item, destination) => {
+    equipped.push({ item, destination });
+    bot.heldItem = { ...item, slot: 36 };
+  };
+  const actions = new Actions({ bot, config, navigator: { stop() {} } });
+  return { bot, actions, equipped };
+}
+
+function realShieldFixture(onPacket = null) {
+  const bot = new EventEmitter();
+  const registry = require('../engine/node_modules/minecraft-data')('1.20.1');
+  const Item = require('../engine/node_modules/prismarine-item')(registry);
+  const packets = [];
+  Object.assign(bot, {
+    version: '1.20.1', registry, QUICK_BAR_START: 36,
+    entity: { id: 1, position: vec3(0, 1, 0), yaw: 0, pitch: 0 },
+    health: 20, entities: {}, supportFeature: registry.supportFeature,
+  });
+  bot._client = new EventEmitter();
+  bot._client.write = (name, data) => {
+    packets.push({ name, data });
+    onPacket?.(name, data);
+  };
+  require('../engine/node_modules/mineflayer/lib/plugins/inventory')(bot, { hideErrors: true });
+  bot.quickBarSlot = 0;
+  bot.inventory.slots[36] = new Item(registry.itemsByName.shield.id, 1);
+  bot.inventory.slots[45] = null;
+  bot.equip = async (item, destination) => {
+    assert.equal(destination, 'hand');
+    bot.inventory.slots[36] = item;
+  };
+  const actions = new Actions({ bot, config, navigator: { stop() {} } });
+  return { bot, actions, packets };
+}
+
+test('combat replaces a held wooden sword with the stronger carried sword', async () => {
+  const worn = { name: 'wooden_sword', count: 1, slot: 36, maxDurability: 59, durabilityUsed: 58 };
+  const diamond = { name: 'diamond_sword', count: 1, slot: 10, maxDurability: 1561, durabilityUsed: 0 };
+  const { bot, actions, equipped } = weaponFixture([worn, diamond], worn);
+  assert.equal(await actions.equipBestWeapon(), 'diamond_sword');
+  assert.equal(bot.heldItem.name, 'diamond_sword');
+  assert.equal(equipped.length, 1);
+  assert.equal(equipped[0].item, diamond);
+});
+
+test('combat replaces the worn same-name stack and ignores stale held-slot durability', async () => {
+  const worn = { name: 'iron_sword', count: 1, slot: 36, maxDurability: 250, durabilityUsed: 249 };
+  const stale = { ...worn, durabilityUsed: 0 };
+  const spare = { ...stale, slot: 12 };
+  const { bot, actions, equipped } = weaponFixture([stale, spare], worn);
+  assert.equal(await actions.equipBestWeapon(), 'iron_sword');
+  assert.equal(bot.heldItem.durabilityUsed, 0);
+  assert.equal(equipped.length, 1);
+  assert.equal(equipped[0].item, spare);
+});
+
+test('combat excludes exhausted weapons and keeps the existing sword score priority', async () => {
+  const broken = { name: 'netherite_sword', count: 1, slot: 36, maxDurability: 2031, durabilityUsed: 2031 };
+  const axe = { name: 'netherite_axe', count: 1, slot: 10, maxDurability: 2031, durabilityUsed: 0 };
+  const sword = { name: 'stone_sword', count: 1, slot: 12, maxDurability: 131, durabilityUsed: 0 };
+  const { actions, equipped } = weaponFixture([broken, axe, sword], broken);
+  assert.equal(await actions.equipBestWeapon(), 'stone_sword');
+  assert.equal(equipped[0].item, sword);
+});
+
+test('combat keeps the actual strongest held weapon without a redundant equipment operation', async () => {
+  const held = { name: 'diamond_sword', count: 1, slot: 36, maxDurability: 1561, durabilityUsed: 5 };
+  const weaker = { name: 'iron_sword', count: 1, slot: 10, maxDurability: 250, durabilityUsed: 0 };
+  const { actions, equipped } = weaponFixture([weaker], held);
+  assert.equal(await actions.equipBestWeapon(), 'diamond_sword');
+  assert.equal(equipped.length, 0);
+});
+
+test('combat without any usable carried weapon leaves an ordinary held item alone', async () => {
+  const bread = { name: 'bread', count: 4, slot: 36 };
+  const empty = { name: 'diamond_sword', count: 0, slot: 10, maxDurability: 1561, durabilityUsed: 0 };
+  const { bot, actions, equipped } = weaponFixture([bread, empty], bread);
+  assert.equal(await actions.equipBestWeapon(), null);
+  assert.equal(bot.heldItem, bread);
+  assert.equal(equipped.length, 0);
+});
+
+test('combat refreshes a moved inventory stack after an ordinary equipment failure', async () => {
+  const first = { name: 'iron_sword', count: 1, slot: 10, maxDurability: 250, durabilityUsed: 0 };
+  const moved = { ...first, slot: 12, durabilityUsed: 2 };
+  const { bot, actions } = weaponFixture([first]);
+  let attempts = 0;
+  bot.equip = async (item) => {
+    attempts += 1;
+    if (attempts === 1) {
+      bot.inventory.items = () => [moved];
+      throw new Error('slot changed');
+    }
+    assert.equal(item, moved);
+    bot.heldItem = { ...item, slot: 36 };
+  };
+  assert.equal(await actions.equipBestWeapon(), 'iron_sword');
+  assert.equal(attempts, 2);
+  assert.equal(bot.heldItem.durabilityUsed, 2);
+});
+
+test('failed combat equipment stops before attacking and retries only three times', async () => {
+  const sword = { name: 'diamond_sword', count: 1, slot: 10, maxDurability: 1561, durabilityUsed: 0 };
+  const { bot, actions } = weaponFixture([sword]);
+  const target = { id: 2, name: 'zombie', position: vec3(1, 1, 0) };
+  bot.entities = { 2: target };
+  let attempts = 0, attacks = 0;
+  bot.equip = async () => { attempts += 1; throw new Error('slot changed'); };
+  bot.attack = () => { attacks += 1; };
+  await assert.rejects(actions.attack({ target }), { name: 'ActionError' });
+  assert.equal(attempts, 3);
+  assert.equal(attacks, 0);
+  assert.equal(bot.heldItem, null);
+});
+
+test('silent equipment failure cannot report an unheld weapon as equipped', async () => {
+  const sword = { name: 'diamond_sword', count: 1, slot: 10, maxDurability: 1561, durabilityUsed: 0 };
+  const { bot, actions } = weaponFixture([sword]);
+  let attempts = 0;
+  bot.equip = async () => { attempts += 1; };
+  await assert.rejects(actions.equipBestWeapon(), { name: 'ActionError' });
+  assert.equal(attempts, 3);
+  assert.equal(bot.heldItem, null);
+});
+
+test('weapon equipment propagates an independent cancellation object unchanged', async () => {
+  const sword = { name: 'iron_sword', count: 1, slot: 10, maxDurability: 250, durabilityUsed: 0 };
+  const { bot, actions } = weaponFixture([sword]);
+  const cancelled = new CancelledError('equipment superseded');
+  let attempts = 0;
+  bot.equip = async () => { attempts += 1; throw cancelled; };
+  await assert.rejects(actions.equipBestWeapon(), (error) => error === cancelled);
+  assert.equal(attempts, 1);
+});
+
+test('weapon equipment propagates cancellation after the asynchronous inventory operation', async () => {
+  const sword = { name: 'iron_sword', count: 1, slot: 10, maxDurability: 250, durabilityUsed: 0 };
+  const { bot, actions } = weaponFixture([sword]);
+  const controller = new AbortController();
+  let attempts = 0;
+  bot.equip = async () => { attempts += 1; controller.abort(); };
+  await assert.rejects(actions.equipBestWeapon({ signal: controller.signal }), CancelledError);
+  assert.equal(attempts, 1);
+});
+
+test('shield uses the main hand through the real Mineflayer inventory packet implementation', async () => {
+  const { bot, actions, packets } = realShieldFixture();
+  const result = await actions.raiseShield({ holdMs: 300 });
+  assert.equal(result.ok, true);
+  assert.equal(bot.heldItem.name, 'shield');
+  assert.equal(bot.inventory.slots[45], null);
+  const uses = packets.filter(({ name }) => name === 'use_item');
+  assert.equal(uses.length, 1);
+  assert.equal(uses[0].data.hand, 0);
+  assert.equal(bot.usingHeldItem, false);
+});
+
+test('shield holding cancellation keeps its cancellation type after actual activation', async () => {
+  const controller = new AbortController();
+  const { actions, packets } = realShieldFixture((name) => {
+    if (name === 'use_item') controller.abort();
+  });
+  await assert.rejects(actions.raiseShield({ holdMs: 300, signal: controller.signal }), CancelledError);
+  assert.equal(packets.filter(({ name }) => name === 'use_item').length, 1);
+});
+
+test('shield activation propagates an independent cancellation object unchanged', async () => {
+  const { bot, actions } = realShieldFixture();
+  const cancelled = new CancelledError('shield superseded');
+  bot.activateItem = () => { throw cancelled; };
+  await assert.rejects(actions.raiseShield({ holdMs: 300 }), (error) => error === cancelled);
+});
+
+function protectedDigFixture() {
+  const bot = fakeBot();
+  bot.game = { dimension: 'overworld' };
+  bot._client.socket = { remoteAddress: 'localhost', remotePort: 25566 };
+  const home = { server: 'localhost:25566', dimension: 'overworld',
+    origin: { x: 0, y: 1, z: 0 }, size: 5, wall_height: 2 };
+  const dug = [];
+  bot.dig = async (block) => dug.push(block.position);
+  bot.blockAt = (p) => ({ name: 'cobblestone', diggable: true, boundingBox: 'block', position: p });
+  const actions = new Actions({ bot, config, navigator: { stop() {}, goTo: async () => {
+    throw new Error('a protected dig must stop before movement');
+  } } });
+  return { bot, actions, home, dug };
+}
+
+test('autonomous explicit digging refuses the registered base before movement', async () => {
+  const { actions, home, dug } = protectedDigFixture();
+  await assert.rejects(executionContext.run({ protectedHome: home },
+    () => actions.dig({ x: 4, y: 3, z: 4, reach: true })), { name: 'ProtectedHomeError' });
+  assert.equal(dug.length, 0);
+});
+
+test('native dig guard protects foundation, wall and roof without changing manual dig', async () => {
+  const { bot, home, dug } = protectedDigFixture();
+  await executionContext.run({ protectedHome: home }, async () => {
+    for (const y of [0, 1, 3]) {
+      assert.throws(() => bot.dig(bot.blockAt(vec3(0, y, 0))), { name: 'ProtectedHomeError' });
+    }
+    await bot.dig(bot.blockAt(vec3(5, 1, 0)));
+  });
+  await bot.dig(bot.blockAt(vec3(0, 1, 0)));
+  assert.deepEqual(dug.map((p) => [p.x, p.y, p.z]), [[5, 1, 0], [0, 1, 0]]);
+});
+
+test('private block packets cannot bypass base protection and can still cancel a dig', () => {
+  const { bot, home } = protectedDigFixture();
+  const inside = vec3(0, 1, 0), outside = vec3(-1, 1, 0);
+  executionContext.run({ protectedHome: home }, () => {
+    for (const status of [0, 2]) bot._client.write('block_dig', { status, location: inside });
+    bot._client.write('block_dig', { status: 1, location: inside });
+    bot._client.write('block_dig', { status: 0, location: outside });
+    bot._client.write('keep_alive', { keepAliveId: 123 });
+  });
+  bot._client.write('block_dig', { status: 0, location: inside });
+  assert.deepEqual(bot.packets.map(({ name, data }) => [name, data.status]),
+    [['block_dig', 1], ['block_dig', 0], ['keep_alive', undefined], ['block_dig', 0]]);
+});
+
 test('workstation placement skips occupied torch and door cells', async () => {
   const bot = fakeBot();
   bot.entity.yaw = 0;
@@ -71,6 +298,259 @@ test('navigation recovery cannot dig terrain during shelter furnishing', async (
   bot.emit('path_update', { status: 'noPath' });
   await assert.rejects(path, /找不到/);
   assert.equal(dug, 0, 'the event callback must retain the terrain restriction');
+});
+
+test('native pathfinder forbids digging for a guarded path and restores it after cancellation', async () => {
+  const bot = fakeBot();
+  const navigator = Object.create(Navigator.prototype);
+  navigator._bot = bot;
+  navigator._config = config;
+  const movements = { canDig: true };
+  let observed;
+  const controller = new AbortController();
+  bot.pathfinder = { movements, setGoal(goal) { if (goal) observed = movements.canDig; } };
+  const run = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath({}, {
+    x: 4, y: 1, z: 0, range: 1, timeout: 2000, signal: controller.signal, t0: Date.now(),
+  }));
+  assert.equal(observed, false);
+  controller.abort();
+  await assert.rejects(run, CancelledError);
+  assert.equal(movements.canDig, true);
+  assert.equal(movements._astrcraftNoDigGuard, undefined);
+});
+
+test('disabled path placement leaves native bridge and tower planners without building items', async () => {
+  const bot = fakeBot();
+  bot.registry = require('../engine/node_modules/minecraft-data')(bot.version);
+  bot.inventory.items = () => [{ type: bot.registry.itemsByName.cobblestone.id, count: 64 }];
+  bot.pathfinder.setMovements = (movements) => { bot.pathfinder.movements = movements; };
+  const settings = new Config();
+  settings.update({ humanize: false, allowPlaceInPath: false });
+  const movements = setupPathfinder(bot, settings);
+  assert.equal(bot.inventory.items()[0].count, 64, 'the player actually has building material');
+  assert.equal(movements.countScaffoldingItems(), 0, 'native A* cannot plan a bridge with those items');
+  assert.equal(movements.getScaffoldingItem(), null, 'native execution cannot equip a scaffold');
+  assert.equal(movements.allow1by1towers, false);
+});
+
+test('guarded travel disables real native scaffolding locally and restores normal placement afterwards', async () => {
+  const bot = fakeBot();
+  bot.registry = require('../engine/node_modules/minecraft-data')(bot.version);
+  bot.inventory.items = () => [{ type: bot.registry.itemsByName.cobblestone.id, count: 64 }];
+  bot.pathfinder.setMovements = (movements) => { bot.pathfinder.movements = movements; };
+  const settings = new Config(); settings.update({ humanize: false, allowPlaceInPath: true });
+  const movements = setupPathfinder(bot, settings);
+  assert.equal(movements.countScaffoldingItems(), 64);
+  const navigator = Object.create(Navigator.prototype); navigator._bot = bot; navigator._config = settings;
+  const controller = new AbortController();
+  bot.pathfinder.setGoal = (goal) => {
+    if (!goal) return;
+    assert.equal(movements.countScaffoldingItems(), 0);
+    assert.equal(movements.getScaffoldingItem(), null);
+    assert.equal(movements.allow1by1towers, false);
+  };
+  const run = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath({}, {
+    x: 4, y: 1, z: 0, range: 1, timeout: 2000, signal: controller.signal, t0: Date.now(),
+  }));
+  controller.abort(); await assert.rejects(run, CancelledError);
+  assert.equal(movements.countScaffoldingItems(), 64);
+  assert.equal(movements.allow1by1towers, true);
+});
+
+test('a native delayed equipment continuation cannot place for a superseded path', async () => {
+  const bot = fakeBot(), oldPath = {}, newPath = {};
+  const nav = { _activePathOwner: oldPath, stop() {} };
+  bot.pathfinder.goal = {};
+  let finishEquip, placed = 0;
+  bot.equip = () => new Promise((resolve) => { finishEquip = resolve; });
+  bot.placeBlock = async () => { placed += 1; };
+  new Actions({ bot, config, navigator: nav });
+  // Native pathfinder's external physicsTick continuation equips then places.
+  const oldPlacement = bot.equip({ name: 'cobblestone' }, 'hand').then(() => bot.placeBlock({}, vec3(0, 1, 0)));
+  nav._activePathOwner = newPath;
+  finishEquip();
+  await assert.rejects(oldPlacement, CancelledError);
+  assert.equal(placed, 0);
+  assert.equal(nav._activePathOwner, newPath);
+  bot.equip = async () => {};
+});
+
+test('noPath clears the native goal before releasing its no-dig guard', async () => {
+  const bot = fakeBot();
+  const navigator = Object.create(Navigator.prototype);
+  navigator._bot = bot;
+  let digRestarts = 0;
+  const stoppedWith = [];
+  bot.pathfinder = {
+    movements: { canDig: true }, goal: null, path: [],
+    setGoal(goal) {
+      this.goal = goal;
+      if (goal === null) {
+        stoppedWith.push(this.movements.canDig);
+        this.path = [];
+      }
+    },
+  };
+  bot.on('blockUpdate', () => {
+    if (bot.pathfinder.goal && bot.pathfinder.movements.canDig) digRestarts += 1;
+  });
+  const run = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath({}, {
+    x: 20, y: 1, z: 0, range: 1, timeout: 1000, t0: Date.now(),
+  }));
+  bot.emit('path_update', { status: 'noPath' });
+  // Native pathfinder assigns results.path after emitting path_update.
+  bot.pathfinder.path = [{ residual: true }];
+  await assert.rejects(run, /找不到/);
+  assert.equal(bot.pathfinder.goal, null);
+  assert.deepEqual(bot.pathfinder.path, []);
+  assert.equal(stoppedWith[0], false, 'the old goal must stop while digging is still forbidden');
+  assert.equal(bot.pathfinder.movements.canDig, true);
+  bot.emit('blockUpdate');
+  assert.equal(digRestarts, 0, 'a world update cannot revive the failed goal');
+});
+
+test('real native pathfinder cannot restart a failed guarded goal on later physics ticks', async () => {
+  const bot = fakeBot();
+  bot.registry = require('../engine/node_modules/prismarine-registry')('1.20.4');
+  const native = require('../engine/node_modules/mineflayer-pathfinder');
+  native.pathfinder(bot);
+  const movements = { canDig: true, clearCollisionIndex() {} };
+  bot.pathfinder.setMovements(movements);
+  let searches = 0;
+  bot.pathfinder.getPathTo = () => {
+    searches += 1;
+    assert.equal(movements.canDig, false);
+    return { status: 'noPath', path: [] };
+  };
+  const navigator = Object.create(Navigator.prototype);
+  navigator._bot = bot;
+  const run = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath(new native.goals.GoalBlock(20, 1, 0), {
+    x: 20, y: 1, z: 0, range: 1, timeout: 1000, t0: Date.now(),
+  }));
+  bot.emit('physicsTick');
+  await assert.rejects(run, /找不到/);
+  assert.equal(bot.pathfinder.goal, null);
+  assert.equal(movements.canDig, true);
+  bot.emit('chunkColumnLoad', vec3(16, 0, 0));
+  bot.emit('physicsTick');
+  bot.emit('physicsTick');
+  assert.equal(searches, 1, 'only the original guarded path may request a native search');
+});
+
+for (const obstruction of ['head', 'side']) {
+  test(`real ${obstruction} recovery digs without replacing its own navigation to collect drops`, async () => {
+    const bot = fakeBot();
+    bot.entity.position = vec3(0.5, 1, 0.5);
+    const blockedPosition = obstruction === 'head' ? vec3(0, 2, 0) : vec3(1, 1, 0);
+    let blocked = true, physicalDigs = 0;
+    bot.entities = {};
+    bot.blockAt = (p) => {
+      const position = vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
+      const isObstruction = blocked && position.equals(blockedPosition);
+      return { position, name: isObstruction ? 'dirt' : position.y === 0 ? 'stone' : 'air',
+        type: isObstruction ? 9 : position.y === 0 ? 1 : 0,
+        boundingBox: isObstruction || position.y === 0 ? 'block' : 'empty', diggable: true };
+    };
+    bot.canDigBlock = () => true;
+    bot.dig = async (block) => {
+      assert.ok(block.position.equals(blockedPosition));
+      assert.equal(blocked, true);
+      physicalDigs += 1;
+      blocked = false;
+      // This real drop is beyond automatic pickup range: collect:true would
+      // call Actions.collectDrops -> Navigator.goTo and replace the active path.
+      bot.entities[7] = { id: 7, name: 'item', position: vec3(3.5, 1, 0.5) };
+    };
+    const navigator = Object.create(Navigator.prototype);
+    navigator._bot = bot;
+    navigator._config = config;
+    const goal = { original: true }, installedGoals = [];
+    bot.pathfinder = { movements: { canDig: true }, goal: null,
+      setGoal(nextGoal) {
+        this.goal = nextGoal;
+        if (!nextGoal) return;
+        installedGoals.push(nextGoal);
+        if (installedGoals.length === 2) queueMicrotask(() => {
+          bot.entity.position = vec3(4.5, 1, 0.5);
+          bot.emit('goal_reached', nextGoal);
+        });
+      },
+    };
+    const actions = new Actions({ bot, config, navigator });
+    navigator.attachActions(actions);
+    const run = navigator._runPath(goal, {
+      x: 4.5, y: 1, z: 0.5, range: 0.6, timeout: 1000, t0: Date.now(),
+    });
+    bot.emit('path_update', { status: 'noPath' });
+    const result = await run;
+    assert.equal(result.arrived, true);
+    assert.equal(result.distance_to_target, 0);
+    assert.equal(physicalDigs, 1);
+    assert.deepEqual(installedGoals, [goal, goal], 'resume the original goal without a collection goal');
+    assert.equal(bot.entities[7].name, 'item', 'the recovery drop remains for later idle pickup');
+    assert.deepEqual(actions.inventoryMap(), {}, 'physical recovery need not claim collected output');
+    assert.equal(navigator._activeResolve, null);
+    assert.equal(bot.pathfinder.goal, null);
+    assert.equal(bot.listenerCount('path_update'), 0);
+    assert.equal(bot.listenerCount('goal_reached'), 0);
+  });
+}
+
+test('late recovery and cancellation of an old path cannot stop a new path', async () => {
+  const bot = fakeBot();
+  const navigator = Object.create(Navigator.prototype);
+  navigator._bot = bot;
+  bot.pathfinder = { movements: { canDig: true }, goal: null,
+    setGoal(goal) { this.goal = goal; } };
+  let release;
+  navigator._digOut = async () => {
+    await new Promise((resolve) => { release = resolve; });
+    return true;
+  };
+  const oldController = new AbortController();
+  const oldGoal = { old: true }, newGoal = { current: true };
+  const oldRun = navigator._runPath(oldGoal, {
+    x: 4, y: 1, z: 0, range: 1, timeout: 1000, signal: oldController.signal, t0: Date.now(),
+  });
+  const oldFinished = assert.rejects(oldRun, CancelledError);
+  bot.emit('path_update', { status: 'noPath' });
+  assert.equal(typeof release, 'function');
+  const newController = new AbortController();
+  const newRun = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath(newGoal, {
+    x: 20, y: 1, z: 0, range: 1, timeout: 1000, signal: newController.signal, t0: Date.now(),
+  }));
+  const newFinished = assert.rejects(newRun, CancelledError);
+  await oldFinished;
+  oldController.abort();
+  release();
+  await tick();
+  bot.emit('goal_reached', oldGoal);
+  assert.equal(bot.pathfinder.goal, newGoal);
+  assert.equal(bot.pathfinder.movements.canDig, false);
+  assert.equal(bot.listenerCount('path_update'), 1, 'only the current path listens for native updates');
+  assert.equal(getEventListeners(oldController.signal, 'abort').length, 0);
+  newController.abort();
+  await newFinished;
+  assert.equal(bot.pathfinder.goal, null);
+  assert.equal(bot.pathfinder.movements.canDig, true);
+});
+
+test('old cleanup preserves a goal installed outside this Navigator path', async () => {
+  const bot = fakeBot();
+  const navigator = Object.create(Navigator.prototype);
+  navigator._bot = bot;
+  bot.pathfinder = { movements: { canDig: true }, goal: null,
+    setGoal(goal) { this.goal = goal; } };
+  const controller = new AbortController();
+  const run = executionContext.run({ allowTerrainDig: false }, () => navigator._runPath({}, {
+    x: 20, y: 1, z: 0, range: 1, timeout: 1000, signal: controller.signal, t0: Date.now(),
+  }));
+  const externalGoal = { external: true };
+  bot.pathfinder.setGoal(externalGoal);
+  controller.abort();
+  await assert.rejects(run, CancelledError);
+  assert.equal(bot.pathfinder.goal, externalGoal);
+  assert.equal(bot.pathfinder.movements.canDig, true);
 });
 
 test('jump placement uses a prepared hand but still equips a mismatched item', async () => {
@@ -320,6 +800,77 @@ test('cancelled dig stops the underlying block mutation', async () => {
   assert.equal(stops, 1);
 });
 
+for (const spawnAfter of [0, 600]) {
+  test(spawnAfter ? 'collection waits for a late server item spawn' :
+    'collection approaches an item outside physical pickup range', async () => {
+    const bot = fakeBot();
+    const item = { id: 7, name: 'item', position: vec3(1.3, 1, 0) };
+    let coal = 0, moves = 0;
+    bot.entities = spawnAfter ? {} : { 7: item };
+    bot.inventory.items = () => coal ? [{ name: 'coal', count: coal }] : [];
+    const spawnTimer = spawnAfter ? setTimeout(() => { bot.entities[7] = item; }, spawnAfter) : null;
+    const navigator = { stop() {}, async goTo({ x, y, z, range, signal }) {
+      if (signal?.aborted) throw new CancelledError();
+      moves += 1;
+      bot.entity.position = vec3(x - range, y, z);
+      // Only the server's physical pickup updates the inventory. Stopping one
+      // block away (the former navigation range) cannot collect this item.
+      if (bot.entity.position.distanceTo(item.position) <= 0.6 && bot.entities[7]) {
+        coal += 1;
+        delete bot.entities[7];
+      }
+      return { arrived: true };
+    } };
+    const actions = new Actions({ bot, config, navigator });
+    try {
+      const result = await actions.collectDrops({ expectIncrease: true, timeoutMs: 1600 });
+      assert.equal(moves, 1, '1.3 blocks is outside physical pickup range and requires movement');
+      assert.ok(bot.entity.position.distanceTo(item.position) <= 0.6);
+      assert.deepEqual(result.gained, { coal: 1 });
+      assert.deepEqual(result.delta, { coal: 1 });
+      assert.equal(result.unreachable, 0);
+      assert.equal(coal, 1);
+      assert.equal(bot.entities[7], undefined);
+    } finally { if (spawnTimer) clearTimeout(spawnTimer); }
+  });
+}
+
+test('collection confirms delayed close-range server pickup without navigating', async () => {
+  const bot = fakeBot();
+  let coal = 0, moves = 0;
+  bot.entities = { 7: { id: 7, name: 'item', position: vec3(0.3, 1, 0) } };
+  bot.inventory.items = () => coal ? [{ name: 'coal', count: coal }] : [];
+  const pickupTimer = setTimeout(() => { coal = 1; delete bot.entities[7]; }, 600);
+  const actions = new Actions({ bot, config, navigator: { stop() {}, async goTo() { moves += 1; } } });
+  try {
+    const result = await actions.collectDrops({ expectIncrease: true, timeoutMs: 1600 });
+    assert.equal(moves, 0);
+    assert.deepEqual(result.gained, { coal: 1 });
+    assert.equal(result.unreachable, 0);
+    assert.equal(coal, 1);
+  } finally { clearTimeout(pickupTimer); }
+});
+
+test('collection aborts its late-spawn wait and releases the signal listener', async () => {
+  const bot = fakeBot();
+  bot.entities = {};
+  let moves = 0, finished = false;
+  const actions = new Actions({ bot, config, navigator: { stop() {}, async goTo() { moves += 1; } } });
+  const controller = new AbortController();
+  const collection = actions.collectDrops({ expectIncrease: true, timeoutMs: 1600, signal: controller.signal });
+  collection.then(() => { finished = true; }, () => { finished = true; });
+  try {
+    await delay(425);
+    assert.equal(finished, false, 'a missing initial entity must wait for the server spawn');
+    const cancelledAt = Date.now();
+    controller.abort();
+    await assert.rejects(collection, CancelledError);
+    assert.ok(Date.now() - cancelledAt < 250, 'abort must interrupt the wait immediately');
+    assert.equal(moves, 0);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  } finally { controller.abort(); await collection.catch(() => {}); }
+});
+
 test('timeout cancels late interaction packets and clears its timer/listener', async () => {
   const bot = fakeBot();
   const actions = new Actions({ bot, config, navigator: { stop() {} } });
@@ -526,13 +1077,20 @@ test('food preparation without new supplies cannot pretend to make progress', as
 test('default storage keeps tools and food but explicit item selection is honored', async () => {
   for (const items of [null, ['stone_pickaxe']]) {
     const bot = fakeBot();
-    bot.findBlock = () => ({ name: 'chest', position: vec3(1, 1, 0) });
+    const chest = { name: 'chest', position: vec3(1, 1, 0) };
+    bot.findBlock = ({ matching, useExtraInfo }) => matching({ name: chest.name }) &&
+      (typeof useExtraInfo !== 'function' || useExtraInfo(chest)) ? chest : null;
+    bot.blockAt = () => chest;
     const inv = { stone_pickaxe: 1, bread: 4, cobblestone: 64 };
-    const actions = { bot, inventoryMap: () => inv, deposit: async ({ keep }) => {
+    const actions = { bot, inventoryMap: () => ({ ...inv }), deposit: async ({ keep, items: selection }) => {
       assert.equal(keep.includes('stone_pickaxe'), items === null);
       assert.equal(keep.includes('bread'), items === null);
       assert.equal(keep.includes('cobblestone'), false);
-      return { stored: { cobblestone: 64 }, total: 64 };
+      const stored = {};
+      for (const [name, count] of Object.entries(inv)) if (!keep.includes(name) && (!selection || selection.includes(name))) {
+        stored[name] = count; delete inv[name];
+      }
+      return { stored, total: Object.values(stored).reduce((sum, count) => sum + count, 0) };
     } };
     assert.equal((await gathering.storeItems({ actions, items, ctx: new skills.SkillContext({ signal: null }) })).ok, true);
   }
@@ -597,17 +1155,35 @@ test('withdraw finds a nearby chest and keeps explicit coordinates valid', async
   bot.findBlock = ({ maxDistance }) => { assert.equal(maxDistance, 16); return { position: vec3(2, 1, 0) }; };
   let opened;
   let closed = 0;
+  const inventory = { bread: 0 };
+  const containers = new Map();
   engine.actions.openContainer = async (opts) => {
     opened = opts;
-    return { win: { containerItems: () => [{ name: 'bread', type: 1, count: 4 }],
-      withdraw: async () => {}, close: () => { closed += 1; } } };
+    const key = `${opts.x},${opts.y},${opts.z}`;
+    if (!containers.has(key)) containers.set(key, 4);
+    const win = {
+      containerItems: () => containers.get(key) > 0 ? [{ name: 'bread', type: 1, count: containers.get(key) }] : [],
+      items: () => inventory.bread > 0 ? [{ name: 'bread', type: 1, count: inventory.bread }] : [],
+      withdraw: async (type, metadata, count) => {
+        assert.equal(type, 1);
+        assert(containers.get(key) >= count);
+        containers.set(key, containers.get(key) - count);
+        inventory.bread += count;
+      },
+      close: () => { closed += 1; if (bot.currentWindow === win) bot.currentWindow = null; },
+    };
+    bot.currentWindow = win;
+    return { win };
   };
   assert.deepEqual((await engine.actions.withdraw({ item: 'bread', count: 2 })).taken, { bread: 2 });
   assert.equal(opened.x, 2);
   await engine.actions.withdraw({ x: 5, y: 1, z: 0, item: 'bread' });
   assert.equal(opened.x, 5);
   await assert.rejects(engine.actions.withdraw({ x: 5, item: 'bread' }), /完整/);
-  assert.equal(closed, 2);
+  assert.equal(closed, 4, 'each real transfer closes both its action and confirmation windows');
+  assert.equal(inventory.bread, 3);
+  assert.equal(containers.get('2,1,0'), 2);
+  assert.equal(containers.get('5,1,0'), 3);
 });
 
 function materialActions(initial) {

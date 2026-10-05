@@ -10,7 +10,7 @@
 
 const log = require('../log');
 const { delay, distance, CancelledError, describeFailure, vec3 } = require('../util');
-const { skillResult, mergeCounts, positiveOnly, driveUntil, dropToGround, climbToSurface } = require('./common');
+const { skillResult, mergeCounts, positiveOnly, collectionCheckpoint, driveUntil, dropToGround, climbToSurface, canDigDownSafely } = require('./common');
 
 /** 各类原木（含下界菌柄） */
 const LOG_NAMES = [
@@ -26,11 +26,15 @@ function planksOf(logName) {
 /**
  * 砍树：找到最近的树，把树干整根挖掉，直到拿到 want 个原木。
  */
-async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAttempts = 24 }) {
+async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAttempts = 24, logNames = LOG_NAMES }) {
   const steps = [];
-  const before = actions.inventoryMap();
-  const have = () => LOG_NAMES.reduce((s, n) => s + actions.countItem(n), 0);
-  const startHave = have();
+  const have = () => logNames.reduce((s, n) => s + actions.countItem(n), 0);
+  const checkpoint = collectionCheckpoint(ctx, ['chopTree', want, radius, maxAttempts, [...logNames].sort()],
+    { have, want, inventory: () => actions.inventoryMap() });
+  if (checkpoint.result) return checkpoint.result;
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: '砍树取木材' });
+  const before = checkpoint.before;
+  const startHave = checkpoint.initialHave;
 
   ctx.progress(`开始砍树，目标 ${want} 根原木（当前 ${startHave}）`);
   log.info(`chopTree 开始：want=${want} radius=${radius} 当前原木=${startHave}`);
@@ -38,6 +42,10 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAt
   // 先确认自己在地表。挖完矿她会待在洞里（实测 y=54 而地表 y=64），
   // 树都在地面上，不先爬出来就只会在洞里瞎转、报"附近找不到树"。
   const climb = await climbToSurface({ actions, nav, ctx });
+  if (!climb.ok) return skillResult(false, {
+    produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+    reason: climb.reason || '还未离开地下，先完成脱困再找树',
+  });
   if (climb.steps > 0) {
     steps.push(`挖阶梯回到地表 ${climb.steps} 格`);
     log.info(`砍树前先爬出矿道：${climb.steps} 格（ok=${climb.ok}）`);
@@ -47,22 +55,26 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAt
     have,
     want: startHave + want,
     ctx,
+    checkpoint,
     maxAttempts,
     label: '砍树',
     fetchOne: async (attempt) => {
       ctx.checkAborted();
-      const tree = await findLogBlock({ actions, state, radius });
+      require('./preparation').assertPreparationSearch({ actions, ctx, operation: '砍树取木材' });
+      const tree = await findLogBlock({ actions, state, radius, logNames });
       log.debug(`chopTree 第 ${attempt} 轮：findLogBlock → ${tree ? JSON.stringify(tree) : 'null'}`);
       if (!tree) {
         // 附近没有树：走远一点找
-        const far = await wanderLookingFor(LOG_NAMES, { actions, nav, ctx, radius });
+        const far = await wanderLookingFor(logNames, { actions, nav, ctx, radius });
         log.debug(`chopTree 第 ${attempt} 轮：wanderLookingFor → ${far ? JSON.stringify(far) : 'null'}`);
         if (!far) return false;
-        const r = await actions.dig({ x: far.x, y: far.y, z: far.z, signal: ctx.signal, collect: true, reach: true });
+        require('./preparation').assertPreparationSearch({ actions, ctx, operation: '砍树取木材' });
+        const r = await actions.dig({ x: far.x, y: far.y, z: far.z, signal: ctx.signal, collect: true, reach: true, safe: true });
         steps.push(`挖 ${r.block}`);
         return true;
       }
-      const r = await actions.dig({ x: tree.x, y: tree.y, z: tree.z, signal: ctx.signal, collect: true, reach: true });
+      require('./preparation').assertPreparationSearch({ actions, ctx, operation: '砍树取木材' });
+      const r = await actions.dig({ x: tree.x, y: tree.y, z: tree.z, signal: ctx.signal, collect: true, reach: true, safe: true });
       steps.push(`挖 ${r.block} @(${tree.x},${tree.y},${tree.z})`);
 
       // 挖了但没拿到东西，最常见的原因是站在树冠上、掉落物掉到下面的树叶上了。
@@ -89,14 +101,15 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAt
 
   const after = actions.inventoryMap();
   const produced = positiveOnly(diffOf(before, after));
-  return skillResult(result.reached, {
+  ctx.checkAborted();
+  return (checkpoint.result = skillResult(result.reached, {
     steps,
     produced,
     note: result.reached
       ? `砍到 ${result.gained} 根原木`
       : `只砍到 ${result.gained} 根原木${result.lastError ? `（${result.lastError}）` : '（附近找不到足够的树）'}`,
     reason: result.reached ? null : result.lastError || '附近没有足够的树，可以换个方向或走远一点再试',
-  });
+  }));
 }
 
 /**
@@ -123,14 +136,14 @@ async function chopTree({ actions, nav, state, ctx, want = 8, radius = 48, maxAt
  *   2. **由近到远**扫描，找到第一棵就返回（附近有树时几乎瞬时）
  *   3. 每扫 400 列让出一次事件循环，最坏情况也能保持 RPC 可响应
  */
-async function findLogBlock({ actions, state, radius }) {
+async function findLogBlock({ actions, state, radius, logNames = LOG_NAMES }) {
   const bot = actions.bot;
   const pos = bot.entity.position;
   const cx = Math.floor(pos.x);
   const cy = Math.floor(pos.y);
   const cz = Math.floor(pos.z);
   const r = Math.min(32, radius || 32);
-  const logSet = new Set(LOG_NAMES);
+  const logSet = new Set(logNames);
 
   // 先按水平距离把候选列排好序，之后由近到远扫
   const cols = [];
@@ -171,6 +184,7 @@ async function findLogBlock({ actions, state, radius }) {
     }
     const b = blockAt(bot, col.x, baseY, col.z);
     if (!b) continue;
+    if (require('./mining_return').isProtectedHomePosition(bot, b.position || { x: col.x, y: baseY, z: col.z })) continue;
 
     // 关键过滤：最低块的高度必须是机器人站在地上能够得着的！
     // 丛林树冠的分支原木经常悬空在空中（比如离地 8-15 格高，下面全是空气或树叶）。
@@ -197,23 +211,20 @@ async function wanderLookingFor(names, { actions, nav, ctx, radius = 48, maxHops
   const bot = actions.bot;
   for (let hop = 0; hop < maxHops; hop += 1) {
     ctx.checkAborted();
+    require('./preparation').assertPreparationSearch({ actions, ctx, operation: '外出探索原料' });
 
-    // **先把她的位置取出来，别在回调里现读。**
-    //
-    // 这里踩过两个坑，最后是靠"失败现场"的调用栈定位的
-    // （这个报错在记忆里出现过 46 次，是她最高频的失败）：
-    //   1. 回调里现读 `bot.entity.position.y`：她死了正在重生时 bot.entity 是 null
-    //   2. **`b.position` 本身也可能是 null** —— `b` 存在但方块在未加载的区块里，
-    //      于是 `b.position.y` 直接抛 "Cannot read properties of null (reading 'y')"。
-    //      这一个是真正的根因：`findBlock` 会把回调调用成百上千次，
-    //      只要扫到一个"空壳方块"整个砍树任务就崩。
+    // The type matcher first receives positionless palette blocks. Check
+    // height only in useExtraInfo, after Mineflayer reads the actual block.
+    // Capture the body height before searching; respawn may replace the body.
     if (!bot.entity) throw new Error('她现在不在游戏里（可能正在重生），稍后再试');
     const hereY = bot.entity.position.y;
     const found = bot.findBlock({
-      matching: (b) => b && b.position && names.includes(b.name) && Math.abs(b.position.y - hereY) <= 4,
+      matching: (b) => b && names.includes(b.name),
+      useExtraInfo: (b) => !!b?.position && Math.abs(b.position.y - hereY) <= 4 &&
+        !require('./mining_return').isProtectedHomePosition(bot, b.position),
       maxDistance: radius,
     });
-    if (found) {
+    if (found && !require('./mining_return').isProtectedHomePosition(bot, found.position)) {
       return { x: found.position.x, y: found.position.y, z: found.position.z, name: found.name };
     }
 
@@ -233,7 +244,7 @@ async function wanderLookingFor(names, { actions, nav, ctx, radius = 48, maxHops
 }
 
 /** 把原木合成木板（自动处理"原木不够就先砍"的依赖） */
-async function makePlanks({ actions, ctx, want = 8 }) {
+async function makePlanks({ actions, ctx, want = 8, reserveItems = {} }) {
   const steps = [];
   const before = actions.inventoryMap();
   const planksHave = () => {
@@ -245,31 +256,34 @@ async function makePlanks({ actions, ctx, want = 8 }) {
   // want 是"要新增多少"，不是"最终要有多少"。
   // 早期按绝对值判断，手头已有 16 个木板时还会继续合成，白白消耗原木。
   const startHave = planksHave();
+  const availableLogs = (name) => Math.max(0, actions.countItem(name) -
+    Math.max(0, Math.ceil(Number(reserveItems?.[name] ?? reserveItems?.[`minecraft:${name}`]) || 0)));
   let guard = 0;
 
   while (planksHave() - startHave < want) {
     ctx.checkAborted();
     if (guard++ > 64) break; // 防御：避免任何计数异常导致死循环
-    const logName = LOG_NAMES.find((n) => actions.countItem(n) > 0);
+    const logName = LOG_NAMES.find((n) => availableLogs(n) > 0);
     if (!logName) {
       const gained = planksHave() - startHave;
       return skillResult(false, {
         steps,
         produced: positiveOnly(diffOf(before, actions.inventoryMap())),
         note: gained > 0 ? `已做出 ${gained} 个木板` : null,
-        reason: '没有原木可用了，先用 mc_chop_tree 砍点树',
+        reason: '没有未保留的原木可用了，先用 mc_chop_tree 砍点树',
       });
     }
     const deficit = want - (planksHave() - startHave);
     const need = Math.ceil(deficit / 4);
-    const available = actions.countItem(logName);
+    const available = availableLogs(logName);
     const times = Math.min(need, available);
     try {
       // Actions.craft takes the desired number of output items, not recipe batches.
       const r = await actions.craft({ item: planksOf(logName), count: times * 4, signal: ctx.signal });
       steps.push(`${logName}×${times} → ${planksOf(logName)}×${r.produced}`);
     } catch (err) {
-      if (err instanceof CancelledError) throw err;
+      if (err instanceof CancelledError || ['CancelledError', 'AbortError', 'PreparationBlockedError',
+        'ProtectedBlockError', 'ProtectedHomeError'].includes(err?.name)) throw err;
       return skillResult(false, {
         steps,
         produced: positiveOnly(diffOf(before, actions.inventoryMap())),
@@ -313,6 +327,7 @@ async function makePlanks({ actions, ctx, want = 8 }) {
 
 /** 合成木棍（木板不够时会自己补做木板，木板不够再找原木——完整自愈） */
 async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = true }) {
+  if (typeof ctx.child === 'function') ctx = ctx.child(['makeSticks', want, allowSearch]);
   const steps = [];
   const before = actions.inventoryMap();
   const startHave = actions.countItem('stick');
@@ -357,7 +372,7 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
 
     const planks = findAnyPlanks(actions);
     if (!planks) {
-      return skillResult(false, { steps, reason: '没有木板可做木棍' });
+      return skillResult(false, { steps, reason: '现有木板不足以完成木棍配方' });
     }
     const canMake = Math.floor(actions.countItem(planks) / 2) * 4;
     if (canMake <= 0) {
@@ -405,7 +420,7 @@ async function makeSticks({ actions, nav, state, ctx, want = 4, allowSearch = tr
 
 function findAnyPlanks(actions) {
   const map = actions.inventoryMap();
-  const found = Object.entries(map).find(([n, c]) => n.endsWith('_planks') && c > 0);
+  const found = Object.entries(map).find(([n, c]) => n.endsWith('_planks') && c >= 2);
   return found ? found[0] : null;
 }
 
@@ -426,13 +441,15 @@ function finishTools(result, tier, t0) {
   return result;
 }
 
-async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = null, allowSearch = true }) {
+async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = null, allowSearch = true, forceReplace = false }) {
   const requestedKinds = [...new Set(kinds && kinds.length ? kinds : ['pickaxe', 'axe', 'sword', 'shovel'])];
-  const wantKinds = requestedKinds.filter((kind) => !hasTool(actions, `${tier}_${kind}`));
+  if (typeof ctx.child === 'function') ctx = ctx.child(['makeTools', tier, [...requestedKinds].sort(), allowSearch, forceReplace]);
+  const wantKinds = requestedKinds.filter((kind) => forceReplace || !hasTool(actions, `${tier}_${kind}`));
   const steps = [];
   const before = actions.inventoryMap();
   // 入口自检 + 日志：技能"秒退"是排查噩梦，所以每一步的耗时与判断都记下来
   const t0 = Date.now();
+  let miningMetadata = {};
   if (!wantKinds.length) return finishTools(skillResult(true, {
     note: `已拥有：${requestedKinds.map((kind) => `${tier}_${kind}`).join('、')}`,
     extra: { made: [], failed: [], missing: [] },
@@ -463,12 +480,13 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
   const materialNeeded = wantKinds.reduce((sum, kind) => sum + materialCounts[kind], 0);
   const sticksNeeded = wantKinds.reduce((sum, kind) => sum + stickCounts[kind], 0);
 
-  const ensurePlanks = async (needed) => {
+  const ensurePlanks = async (needed, scope) => {
+    const supplyCtx = typeof ctx.child === 'function' ? ctx.child(['planks', scope]) : ctx;
     const deficit = Math.max(0, needed - countPlanks(actions));
     if (!deficit) return { ok: true };
     const logDeficit = Math.max(0, Math.ceil(deficit / 4) - totalLogs(actions));
     if (logDeficit > 0 && allowSearch) {
-      const chop = await chopTree({ actions, nav, state, ctx, want: logDeficit });
+      const chop = await chopTree({ actions, nav, state, ctx: supplyCtx, want: logDeficit });
       steps.push(...chop.steps);
       if (!chop.ok && totalLogs(actions) < Math.ceil(deficit / 4)) return chop;
     }
@@ -480,11 +498,33 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
     return countPlanks(actions) >= needed ? { ok: true } : result;
   };
 
+  // Furnace fuel may be ordinary wood. Turn the tool's reserved wood into
+  // sticks/a table before smelting; reserve the sticks below because they burn too.
+  if (tier === 'iron' && actions.countItem('iron_ingot') < materialNeeded) {
+    const missingSticks = Math.max(0, sticksNeeded - actions.countItem('stick'));
+    const tablePlanks = findCraftingTable(actions) || actions.countItem('crafting_table') > 0 ? 0 : 4;
+    const prepared = await ensurePlanks(Math.ceil(missingSticks / 4) * 2 + tablePlanks, 'beforeSmelting');
+    if (!prepared.ok) return finishTools(skillResult(false, { steps, reason: prepared.reason }), tier, t0);
+    if (missingSticks > 0) {
+      const st = await makeSticks({ actions, nav, state, ctx, want: missingSticks, allowSearch });
+      steps.push(...st.steps);
+      if (!st.ok) return finishTools(skillResult(false, { steps, reason: st.reason }), tier, t0);
+    }
+    const table = await ensureCraftingTable({ actions, ctx, steps });
+    if (!table.ok) return finishTools(skillResult(false, { steps, reason: table.reason }), tier, t0);
+  }
+
   if (tier === 'wooden') {
     // The shared wood budget below includes planks, sticks and a table only if needed.
   } else if (tier === 'stone') {
+    const stoneMaterial = ['cobblestone', 'cobbled_deepslate', 'blackstone']
+      .find((name) => actions.countItem(name) >= materialNeeded) || 'cobblestone';
+    if (!allowSearch && actions.countItem(stoneMaterial) < materialNeeded) {
+      return finishTools(skillResult(false, { steps,
+        reason: `圆石不足（需要 ${materialNeeded} 个，只有 ${actions.countItem('cobblestone')} 个；已禁用自动采料）` }), tier, t0);
+    }
     // 石制工具需要圆石：先确保有木镐
-    if (!hasTool(actions, 'wooden_pickaxe') && !hasBetterPickaxe(actions, 'wooden')) {
+    if (actions.countItem(stoneMaterial) < materialNeeded && !hasTool(actions, 'wooden_pickaxe') && !hasBetterPickaxe(actions, 'wooden')) {
       log.info('石制工具需要先有木镐，先做木镐');
       const r = await makeTools({ actions, nav, state, ctx, tier: 'wooden', kinds: ['pickaxe'], allowSearch });
       steps.push(...r.steps);
@@ -496,48 +536,91 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
         );
       }
     }
-    if (actions.countItem('cobblestone') < materialNeeded) {
+    if (actions.countItem(stoneMaterial) < materialNeeded) {
       ctx.progress(`挖圆石准备石制工具（需要 ${materialNeeded} 个，现有 ${actions.countItem('cobblestone')}）`);
-      const r = await mineSpecific({
-        actions,
-        nav,
-        ctx,
-        blockNames: ['stone', 'cobblestone', 'deepslate', 'andesite', 'granite', 'diorite'],
-        want: materialNeeded - actions.countItem('cobblestone'),
-        itemName: 'cobblestone',
-        allowSearch,
-      });
-      steps.push(...r.steps);
-      if (actions.countItem('cobblestone') < materialNeeded && !r.ok) {
-        return finishTools(skillResult(false, { steps, reason: `挖圆石失败：${r.reason}` }), tier, t0);
-      }
-    }
-  } else if (tier === 'iron') {
-    if (actions.countItem('iron_ingot') < materialNeeded) {
-      const needIngots = materialNeeded - actions.countItem('iron_ingot');
-      ctx.progress(`需要 ${needIngots} 个铁锭（做 ${wantKinds.join('/')}）`);
-      const r = await require('../skills/mining').mineOre({
+      const r = await require('./mining').mineStone({
         actions,
         nav,
         state,
         ctx,
-        ore: 'iron',
-        want: needIngots,
+        want: materialNeeded - actions.countItem('cobblestone'),
+        radius: 40,
+        strictOnly: true,
         allowSearch,
       });
+      ctx.checkAborted();
       steps.push(...r.steps);
-      if (!r.ok) return finishTools(skillResult(false, { steps, reason: r.reason }), tier, t0);
-      // 刚挖到的是粗铁，要熔炼成锭才能做工具
-      const raw = actions.countItem('raw_iron');
-      if (raw > 0 && actions.countItem('iron_ingot') < materialNeeded) {
-        ctx.progress(`熔炼 ${raw} 个粗铁`);
-        const sm = await require('../skills/mining').smeltOres({ actions, nav, state, ctx, item: 'raw_iron', count: raw });
-        steps.push(...sm.steps);
+      if (r.return_status) miningMetadata = { return_status: r.return_status };
+      if (r.return_status?.ok === false) {
+        return finishTools(skillResult(false, {
+          steps, produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+          reason: r.reason || r.return_status.reason || '采石后尚未安全返回，先完成脱困再做工具',
+          extra: { collection_ok: false, material_collection_ok: r.collection_ok, return_status: r.return_status },
+        }), tier, t0);
+      }
+      if (actions.countItem('cobblestone') < materialNeeded && !r.ok) {
+        return finishTools(skillResult(false, { steps, reason: `挖圆石失败：${r.reason}`, extra: miningMetadata }), tier, t0);
+      }
+    }
+  } else if (tier === 'iron') {
+    if (actions.countItem('iron_ingot') < materialNeeded) {
+      const mining = require('./mining');
+      const ironInputs = ['raw_iron', 'iron_ore', 'deepslate_iron_ore'];
+      let materialFailure = null;
+      const stopUnsafeSmelting = (sm) => finishTools(skillResult(false, {
+        steps, produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+        reason: sm.reason || sm.return_status.reason || '准备熔炉后尚未安全返回，先完成脱困再做工具',
+        extra: { collection_ok: false, material_collection_ok: sm.material_collection_ok === true,
+          return_status: sm.return_status },
+      }), tier, t0);
+      const smeltAvailable = async () => {
+        for (const item of ironInputs) {
+          ctx.checkAborted();
+          const need = materialNeeded - actions.countItem('iron_ingot');
+          const amount = Math.min(need, actions.countItem(item));
+          if (amount <= 0) continue;
+          ctx.progress(`先熔炼现有 ${item}×${amount}，补齐铁制工具材料`);
+          const sm = await mining.smeltOres({ actions, nav, state, ctx, item, count: amount, allowSearch,
+            reserveItems: { stick: sticksNeeded } });
+          ctx.checkAborted();
+          steps.push(...sm.steps);
+          if (sm.return_status?.ok === false) return sm;
+          if (!sm.ok || actions.countItem(item) > 0 && actions.countItem('iron_ingot') < materialNeeded) {
+            materialFailure = sm.reason || sm.failed?.map((f) => f.error).join('；') || '现有铁矿还没有熔炼完成';
+          }
+        }
+      };
+      // Coarse iron and silk-touched ore already in the pack are an indoor
+      // resource. Do not mine replacements for ore that merely needs a furnace.
+      const initialSmelt = await smeltAvailable();
+      if (initialSmelt?.return_status?.ok === false) return stopUnsafeSmelting(initialSmelt);
+      if (allowSearch && actions.countItem('iron_ingot') < materialNeeded && !ironInputs.some((item) => actions.countItem(item) > 0)) {
+        const needIngots = materialNeeded - actions.countItem('iron_ingot');
+        ctx.progress(`现有铁料已用完，还需挖 ${needIngots} 个铁矿（做 ${wantKinds.join('/')}）`);
+        const r = await mining.mineOre({ actions, nav, state, ctx, ore: 'iron', want: needIngots, allowSearch });
+        ctx.checkAborted();
+        steps.push(...r.steps);
+        if (r.return_status) miningMetadata = { return_status: r.return_status };
+        // Inventory can be sufficient while the body is still stranded. Stop
+        // before opening a furnace or crafting at that unsafe position.
+        if (r.return_status?.ok === false) {
+          return finishTools(skillResult(false, {
+            steps, produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+            reason: r.reason || r.return_status.reason || '采铁后尚未安全返回，先完成脱困再做工具',
+            extra: { collection_ok: false, material_collection_ok: r.collection_ok, return_status: r.return_status },
+          }), tier, t0);
+        }
+        if (!r.ok) materialFailure = r.reason;
+        // A partial mining result can still leave useful ore in the pack.
+        const gatheredSmelt = await smeltAvailable();
+        if (gatheredSmelt?.return_status?.ok === false) return stopUnsafeSmelting(gatheredSmelt);
       }
       if (actions.countItem('iron_ingot') < materialNeeded) {
         const got = actions.countItem('iron_ingot');
         return finishTools(
-          skillResult(false, { steps, reason: `铁锭不够做${wantKinds.join('/')}（需要 ${materialNeeded} 个，只有 ${got} 个）` }),
+          skillResult(false, { steps, produced: positiveOnly(diffOf(before, actions.inventoryMap())),
+            reason: `铁锭不够做${wantKinds.join('/')}（需要 ${materialNeeded} 个，只有 ${got} 个）${materialFailure ? `：${materialFailure}` : ''}`,
+            extra: miningMetadata }),
           tier,
           t0,
         );
@@ -559,10 +642,10 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
   // 木棍（木制工具也需要）。allow_search 要透传下去：
   // 否则在"已给材料、禁止找树"的定向测试里，它会跑出去找树。
   const missingSticks = Math.max(0, sticksNeeded - actions.countItem('stick'));
-  const nearbyTable = actions.bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 });
+  const nearbyTable = findCraftingTable(actions);
   const tablePlanks = nearbyTable || actions.countItem('crafting_table') > 0 ? 0 : 4;
   const plankBudget = (tier === 'wooden' ? materialNeeded : 0) + Math.ceil(missingSticks / 4) * 2 + tablePlanks;
-  const wood = await ensurePlanks(plankBudget);
+  const wood = await ensurePlanks(plankBudget, 'budget');
   if (!wood.ok) return finishTools(skillResult(false, { steps, reason: wood.reason }), tier, t0);
   if (missingSticks > 0) {
     const st = await makeSticks({ actions, nav, state, ctx, want: missingSticks, allowSearch });
@@ -593,7 +676,7 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
   for (const kind of wantKinds) {
     ctx.checkAborted();
     const name = `${tier}_${kind}`;
-    if (hasTool(actions, name)) {
+    if (!forceReplace && hasTool(actions, name)) {
       made.push(name);
       continue;
     }
@@ -607,13 +690,13 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
       steps.push(...st.steps);
     }
     if (tier === 'wooden' && countPlanks(actions) < materialCounts[kind]) {
-      const pk = await ensurePlanks(materialCounts[kind]);
+      const pk = await ensurePlanks(materialCounts[kind], kind);
       if (!pk.ok) { failed.push({ name, error: pk.reason }); continue; }
     }
 
     try {
       const crafted = await actions.craft({ item: name, count: 1, signal: ctx.signal });
-      const nowHave = hasTool(actions, name);
+      const nowHave = forceReplace ? actions.countItem(name) > (before[name] || 0) : hasTool(actions, name);
       // 不能因为 craft 没抛异常就认为做成了：以背包里真的有这件工具为准。
       // 注意判断顺序：**先看背包**。crafted.ok 依赖"这次调用前后该物品的增量"，
       // 如果这件工具在调用前就已经在背包里（例如刚补过料、或上一轮部分成功），
@@ -633,7 +716,8 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
   }
 
   const after = actions.inventoryMap();
-  const stillMissing = wantKinds.map((k) => `${tier}_${k}`).filter((n) => !hasTool(actions, n));
+  const stillMissing = wantKinds.map((k) => `${tier}_${k}`).filter((n) =>
+    forceReplace ? actions.countItem(n) <= (before[n] || 0) : !hasTool(actions, n));
   // 只要"至少一套里有一件"就算部分成功，但 note 必须如实说清缺什么
   const ok = stillMissing.length === 0;
   return finishTools(
@@ -644,7 +728,8 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
         ? `已获得：${made.join('、')}${stillMissing.length ? `；还缺：${stillMissing.join('、')}` : ''}`
         : `一件工具都没做出来：${failed.map((f) => `${f.name}(${f.error})`).join('、') || '材料不足'}`,
       reason: ok ? null : failed.map((f) => f.error).join('；') || `材料不足以合成 ${wantKinds.join('/')}`,
-      extra: { made, failed, missing: stillMissing },
+      extra: { made, failed, missing: stillMissing, ...miningMetadata,
+        ...(miningMetadata.return_status ? { collection_ok: ok } : {}) },
     }),
     tier,
     t0,
@@ -654,7 +739,7 @@ async function makeTools({ actions, nav, state, ctx, tier = 'stone', kinds = nul
 /** 确保有工作台：有就放一个在脚边 */
 async function ensureCraftingTable({ actions, ctx, steps = [] }) {
   const bot = actions.bot;
-  const nearby = bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 });
+  const nearby = findCraftingTable(actions);
   if (nearby) return { ok: true, position: nearby.position, note: '附近已有工作台' };
 
   if (actions.countItem('crafting_table') > 0) {
@@ -719,6 +804,7 @@ async function ensureCraftingTable({ actions, ctx, steps = [] }) {
  * （实测：她在真实服务器上因此永远挖不到石头，整条生存链锁死）。
  */
 async function digToward({ actions, ctx, target }) {
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: '挖掘原料通道' });
   const bot = actions.bot;
   const p = bot.entity.position;
   const bx = Math.floor(p.x);
@@ -737,16 +823,22 @@ async function digToward({ actions, ctx, target }) {
 
   for (const [ex, ey, ez] of cands) {
     ctx.checkAborted();
+    require('./preparation').assertPreparationSearch({ actions, ctx, operation: '挖掘原料通道' });
     const x = bx + ex;
     const y = by + ey;
     const z = bz + ez;
     const b = blockAt(bot, x, y, z);
     if (!b) continue;
-    if (!b.diggable) continue;
+    if (!b.diggable || b.boundingBox !== 'block') continue;
     // 别挖到岩浆/水/基岩
     if (b.name === 'lava' || b.name === 'water' || b.name === 'bedrock') continue;
+    const common = require('./common');
+    if (ey < 0 ? !common.canDigDownSafely(bot, bx, by, bz) :
+        !common.canOpenCellSafely(bot, x, y, z)) continue;
     try {
-      await actions.dig({ x, y, z, signal: ctx.signal, collect: true, reach: false });
+      // Keep the body on its support while opening a path. A drop-collection
+      // path can otherwise walk into the newly opened cell before it is safe.
+      await actions.dig({ x, y, z, signal: ctx.signal, collect: false, reach: false });
       return true;
     } catch (err) {
       if (err instanceof CancelledError) throw err;
@@ -757,13 +849,17 @@ async function digToward({ actions, ctx, target }) {
 }
 
 /** 背包里耐久最多的镐子（没有则 null） */
-function bestPickaxe(actions) {
+function bestPickaxe(actions, minTier = 'wooden') {
   const bot = actions.bot;
   let best = null;
   let bestRemain = -1;
   for (const item of bot.inventory.items()) {
     if (!/_pickaxe$/.test(item.name)) continue;
+    const tier = item.name.split('_')[0];
+    const harvestTier = TIERS.indexOf(tier === 'golden' ? 'wooden' : tier);
+    if (harvestTier < TIERS.indexOf(minTier)) continue;
     const remain = item.maxDurability ? item.maxDurability - (item.durabilityUsed || 0) : 9999;
+    if (remain <= 0) continue;
     if (remain > bestRemain) {
       bestRemain = remain;
       best = item;
@@ -772,68 +868,103 @@ function bestPickaxe(actions) {
   return best ? { name: best.name, remain: bestRemain } : null;
 }
 
-/**
- * 镐子快坏了就用圆石做一把石镐。
- *
- * **为什么需要**：木镐只有 59 次耐久，而挖一组石头就要用掉几十次。
- * 实测：她挖到 17 个圆石时木镐先碎了，紧接着"做石制工具"因为没镐而失败，
- * 一整轮生存链又断在这里。真人的做法就是**一拿到 3 个圆石立刻换石镐**
- * （石镐 131 耐久），这里照做——在挖掘过程中每轮检查一次，够料就换。
- */
-async function ensurePickaxeDurability({ actions, nav, state, ctx, need = 10 }) {
-  const pick = bestPickaxe(actions);
-  if (!pick) return false;
-  if (pick.remain > need) return false;
-  // 只有圆石够 3 个才值得换（石镐配方：3 圆石 + 2 木棍）
-  const mats = ['cobblestone', 'cobbled_deepslate', 'blackstone'];
-  const mat = mats.find((m) => actions.countItem(m) >= 3);
-  if (!mat) return false;
-  try {
-    ctx.progress(`镐子快坏了（剩 ${pick.remain}），用 ${mat} 换一把石镐`);
-    const r = await makeTools({
-      actions,
-      nav,
-      state,
-      ctx,
-      tier: 'stone',
-      kinds: ['pickaxe'],
-      allowSearch: false, // 不要为了做镐去满世界找树/挖矿，就地做
-    });
-    if (r && r.ok) {
-      log.info(`已补做石镐（原 ${pick.name} 剩 ${pick.remain}）`);
-      return true;
+/** Select a usable replacement from carried materials without mining dependencies. */
+function carriedPickaxeTiers(actions, minTier = 'wooden', preferred = null) {
+  // A worn wooden/golden pickaxe should upgrade to carried stone rather than
+  // spend wood making another fragile pickaxe when a stone recipe is ready.
+  if (preferred === 'wooden' || preferred === 'golden') preferred = null;
+  const replacements = [preferred, 'stone', 'iron', 'diamond', 'wooden']
+    .filter((tier, index, all) => tier && all.indexOf(tier) === index &&
+      TIERS.indexOf(tier) >= TIERS.indexOf(minTier));
+  return replacements.filter((tier) => {
+    if (tier === 'stone') return ['cobblestone', 'cobbled_deepslate', 'blackstone']
+      .some((name) => actions.countItem(name) >= 3);
+    if (tier === 'wooden') return countPlanks(actions) >= 3 || totalLogs(actions) > 0;
+    if (tier === 'iron') return ['iron_ingot', 'raw_iron', 'iron_ore', 'deepslate_iron_ore']
+      .reduce((sum, name) => sum + actions.countItem(name), 0) >= 3;
+    return tier === 'diamond' && actions.countItem('diamond') >= 3;
+  }).sort((a, b) => Number(a === 'iron' && actions.countItem('iron_ingot') < 3) -
+    Number(b === 'iron' && actions.countItem('iron_ingot') < 3));
+}
+
+function carriedPickaxeTier(actions, minTier = 'wooden', preferred = null) {
+  return carriedPickaxeTiers(actions, minTier, preferred)[0] || null;
+}
+
+/** Replace a worn or broken pickaxe using only carried material and a real table. */
+async function ensurePickaxeDurability({ actions, nav, state, ctx, need = 10, minTier = 'wooden' }) {
+  const pick = bestPickaxe(actions, minTier);
+  if (pick && pick.remain > need) return false;
+  const tiers = carriedPickaxeTiers(actions, minTier, pick?.name.split('_')[0]);
+  for (const tier of tiers) {
+    try {
+      ctx.checkAborted();
+      ctx.progress(`${pick ? `镐子快坏了（剩 ${pick.remain}）` : '缺少可用镐'}，就地补一把 ${tier} 镐`);
+      const r = await makeTools({
+        actions,
+        nav,
+        state,
+        ctx,
+        tier,
+        kinds: ['pickaxe'],
+        allowSearch: false, // 不要为了做镐去满世界找树/挖矿，就地做
+        forceReplace: true,
+      });
+      if (r && r.ok) {
+        log.info(`已补做 ${tier} 镐${pick ? `（原 ${pick.name} 剩 ${pick.remain}）` : ''}`);
+        return true;
+      }
+      if (r?.return_status?.ok === false) return false;
+      log.info(`补做 ${tier} 镐没成功：${r && r.reason}`);
+    } catch (err) {
+      if (err instanceof CancelledError || ['PreparationBlockedError', 'ProtectedBlockError', 'ProtectedHomeError'].includes(err?.name)) throw err;
+      log.info(`补做 ${tier} 镐失败：${err.message}`);
     }
-    log.info(`补做石镐没成功：${r && r.reason}`);
-  } catch (err) {
-    if (err instanceof CancelledError) throw err;
-    log.info(`补做石镐失败：${err.message}`);
   }
   return false;
 }
 
 async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want, itemName = null, itemNames = null, radius = 40, maxAttempts = 40, allowSearch = true }) {
   const steps = [];
-  const before = actions.inventoryMap();
+  // This helper also collects blocks such as obsidian. A stone replacement
+  // cannot satisfy every target; use the installed version's harvest tools.
+  let minTier = 'wooden';
+  const data = actions.bot.registry?.blocksByName ? actions.bot.registry :
+    (actions.bot.version ? require('minecraft-data')(actions.bot.version) : null);
+  for (const name of blockNames) {
+    const tiers = Object.keys(data?.blocksByName?.[name]?.harvestTools || {})
+      .map((id) => data.items?.[id]?.name || '').filter((item) => item.endsWith('_pickaxe'))
+      .map((item) => TIERS.indexOf(item.split('_')[0])).filter((index) => index >= 0);
+    if (tiers.length) minTier = TIERS[Math.max(TIERS.indexOf(minTier), Math.min(...tiers))];
+  }
   // **要数哪些物品**：早期只数 itemName 一个名字，导致"挖了 18 个石质方块却判定为
   // 一个都没挖到"——因为安山岩/闪长岩掉的是它们自己，不是圆石。
   // 现在支持传入多个可计数的产物名（石质方块各自的掉落物都算进度）。
-  const counted = itemNames && itemNames.length ? itemNames : [itemName || blockNames[0]];
+  const counted = [...new Set(itemNames && itemNames.length ? itemNames : [itemName || blockNames[0]])];
   const target = counted.length === 1 ? counted[0] : counted.join('/');
-  const startHave = counted.reduce((s, n) => s + actions.countItem(n), 0);
   const have = () => counted.reduce((s, n) => s + actions.countItem(n), 0);
+  const checkpoint = collectionCheckpoint(ctx,
+    ['mineSpecific', [...blockNames].sort(), [...counted].sort(), want, radius, maxAttempts, allowSearch],
+    { have, want, inventory: () => actions.inventoryMap() });
+  if (checkpoint.result) return checkpoint.result;
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: `采集 ${target}` });
+  const before = checkpoint.before;
+  const startHave = checkpoint.initialHave;
 
   const result = await driveUntil({
     have,
     want: startHave + want,
     ctx,
+    checkpoint,
     maxAttempts,
     label: `挖${target}`,
     fetchOne: async (attempt) => {
       ctx.checkAborted();
+      require('./preparation').assertPreparationSearch({ actions, ctx, operation: `采集 ${target}` });
       // 每轮检查一次镐子耐久：木镐只有 59 次，挖一组石头就会用掉几十次，
       // 等它碎了再补救就来不及（实测就是这样断掉整条链的）。够料就换成石镐。
       if (attempt > 1) {
-        await ensurePickaxeDurability({ actions, nav, state, ctx });
+        await ensurePickaxeDurability({ actions, nav, state, ctx, minTier });
       }
       const found = findNearestDiggable(actions, blockNames, radius);
       if (!found) {
@@ -850,15 +981,18 @@ async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want,
         return !!moved;
       }
       try {
-        const r = await actions.dig({ x: found.x, y: found.y, z: found.z, signal: ctx.signal, collect: true, reach: true });
+        require('./preparation').assertPreparationSearch({ actions, ctx, operation: `采集 ${target}` });
+        const r = await actions.dig({ x: found.x, y: found.y, z: found.z, signal: ctx.signal, collect: true, reach: true, safe: true });
         steps.push(`挖 ${r.block}`);
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
+        if (err?.name === 'NoToolError' &&
+            await ensurePickaxeDurability({ actions, nav, state, ctx, minTier })) return true;
         // **受保护方块必须往上抛**（与 mining.js 同一个理由）：
         // 白/黑名单与出生点保护是配置层面的拒绝，换个地方再挖 40 次也一样，
         // 吞掉它只会让技能报"附近没有找到足够的X"，把真正原因藏起来。
-        if (err && err.name === 'ProtectedBlockError') throw err;
+        if (['ProtectedBlockError', 'ProtectedHomeError', 'NoToolError'].includes(err?.name)) throw err;
         log.info(`挖 ${found.name} 失败：${err.message}`);
         // 够不到（典型情况：目标被埋在泥土/岩石下面，寻路走不过去）
         // → 朝目标挖一格，下一轮往往就能挖到了。这也是真玩家的做法。
@@ -873,13 +1007,14 @@ async function mineSpecific({ actions, nav, state = null, ctx, blockNames, want,
   // 以"背包里真的多了这么多"为准，而不是以内部循环是否跑完为准。
   // 早期版本直接返回 result.reached，出现过"什么都没挖到却报成功"的假成功。
   const ok = gained >= want || (gained > 0 && result.reached);
-  return skillResult(ok, {
+  ctx.checkAborted();
+  return (checkpoint.result = skillResult(ok, {
     steps,
     produced: positiveOnly(diffOf(before, after)),
     note: ok ? `已挖到 ${gained} 个 ${target}` : `只挖到 ${gained} 个 ${target}（目标 ${want}）`,
     reason: ok ? null : result.lastError || `附近没有找到足够的${target}（${blockNames.slice(0, 3).join('/')}…），可以换个方向、往下挖，或换一种材料`,
     extra: { item: target, gained, wanted: want },
-  });
+  }));
 }
 
 /**
@@ -924,34 +1059,41 @@ function canSeeBlock(bot, block) {
 
 function findNearestDiggable(actions, names, radius) {
   const bot = actions.bot;
-  const want = new Set(names);
-  // 取一批候选（而不是只取最近那一个）：最近的那个可能被墙挡住，
-  // 要能顺次找到"最近且看得见"的那一个。
-  let candidates = [];
-  try {
-    candidates = bot.findBlocks({
-      matching: (b) => b && want.has(b.name) && b.diggable,
-      maxDistance: radius,
-      count: 16,
-    });
-  } catch {
-    const one = bot.findBlock({ matching: (b) => b && want.has(b.name) && b.diggable, maxDistance: radius });
-    candidates = one ? [one.position] : [];
-  }
-  for (const pos of candidates) {
-    // findBlock 返回的方块可能落在**未加载的区块**边界上，那时 blockAt 会读到 null，
-    // 后面 dig 就会报"附近没有加载区块"。这里先确认它真的可读。
-    const check = blockAt(bot, pos.x, pos.y, pos.z);
-    if (!check || !want.has(check.name) || !check.diggable) continue;
-    // **看得见才挖**：隔着墙挖是最明显的"不像人"的行为之一
-    if (!canSeeBlock(bot, check)) continue;
-    return { x: check.position.x, y: check.position.y, z: check.position.z, name: check.name };
+  const protection = require('./mining_return');
+  const available = (block) => !!block?.position && !protection.isProtectedHomePosition(bot, block.position) &&
+    canSeeBlock(bot, block) &&
+    require('./common').canHarvestBlockSafely(bot, block.position);
+  // Stone and cobblestone have the same requested drop. Prefer a natural stone
+  // source before nearby built cobblestone; separate queries also stop the first
+  // sixteen house blocks from hiding a slightly more distant stone outcrop.
+  const groups = names.includes('stone') && names.includes('cobblestone')
+    ? [['stone'], names.filter((name) => name !== 'stone')] : [names];
+  for (const group of groups) {
+    const want = new Set(group);
+    const options = { matching: (b) => b && want.has(b.name) && b.diggable,
+      // Mineflayer first matches positionless palette blocks, then reads the
+      // real blocks for visibility and safety before applying the candidate cap.
+      useExtraInfo: available, maxDistance: radius, count: 16 };
+    let candidates = [];
+    try { candidates = bot.findBlocks(options); }
+    catch {
+      const one = bot.findBlock(options);
+      candidates = one ? [one.position] : [];
+    }
+    for (const pos of candidates) {
+      // Recheck loaded blocks and the protected bounds even when a caller's
+      // findBlocks implementation did not apply useExtraInfo.
+      const check = blockAt(bot, pos.x, pos.y, pos.z);
+      if (!check || !want.has(check.name) || !check.diggable || !available(check)) continue;
+      return { x: check.position.x, y: check.position.y, z: check.position.z, name: check.name };
+    }
   }
   return null;
 }
 
 /** 找不到目标时移动位置：以"往下挖"为主，偶尔横向探索 */
 async function relocate({ actions, nav, ctx, attempt }) {
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: '移动并探索原料' });
   const bot = actions.bot;
   // **只在每 5 次里游荡 1 次，其余全部往下挖。**
   // 原因：石头/矿石必然在地下；沙漠/沙岩/安山岩地带的地表根本看不到石头，
@@ -987,22 +1129,25 @@ async function relocate({ actions, nav, ctx, attempt }) {
   const dug = await digDownStaircase({ actions, nav, ctx, steps: [], layers });
   if (dug) return true;
 
-  // 阶梯挖不动（陡坡上四方向都没有安全的下一层）→ 退回最简单的"原地直挖"。
-  // 直挖会形成竖井，但 climbToSurface 能把她挖回来，所以不担心困住。
+  // 阶梯挖不动时只允许逐层下降到已确认的实地，不能盲挖进洞穴或液体。
   let fell = 0;
   for (let i = 0; i < 4; i += 1) {
     ctx.checkAborted();
+    require('./preparation').assertPreparationSearch({ actions, ctx, operation: '逐层下降寻找原料' });
     const p = bot.entity.position;
     const bx = Math.floor(p.x);
     const by = Math.floor(p.y);
     const bz = Math.floor(p.z);
-    const below = blockAt(bot, bx, by - 1, bz);
-    if (!below || !below.diggable) break;
-    if (below.name === 'lava' || below.name === 'water' || below.name === 'bedrock') break;
+    if (!canDigDownSafely(bot, bx, by, bz)) break;
     try {
-      await actions.dig({ x: bx, y: by - 1, z: bz, signal: ctx.signal, collect: true });
+      await actions.dig({ x: bx, y: by - 1, z: bz, signal: ctx.signal, collect: false });
+      const deadline = Date.now() + 1500;
+      while (Math.floor(bot.entity.position.y) === by && Date.now() < deadline) {
+        ctx.checkAborted();
+        await delay(50, { signal: ctx.signal });
+      }
+      if (Math.floor(bot.entity.position.y) !== by - 1) break;
       fell += 1;
-      await delay(150, { signal: ctx.signal });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
       break;
@@ -1027,6 +1172,15 @@ function totalLogs(actions) {
   return LOG_NAMES.reduce((s, n) => s + actions.countItem(n), 0);
 }
 
+function findCraftingTable(actions) {
+  if (typeof actions._findStationBlock === 'function') return actions._findStationBlock(['crafting_table']);
+  const { executionContext } = require('../goals');
+  const home = executionContext.getStore()?.indoorHome;
+  const { isIndoorStation } = require('./preparation');
+  return actions.bot.findBlock({ matching: (b) => b?.name === 'crafting_table',
+    useExtraInfo: (b) => !home || isIndoorStation(b?.position, home), maxDistance: 24 });
+}
+
 function countPlanks(actions) {
   const map = actions.inventoryMap();
   return Object.entries(map)
@@ -1039,8 +1193,7 @@ function hasTool(actions, name) {
 }
 
 function hasBetterPickaxe(actions, minTier) {
-  const idx = TIERS.indexOf(minTier);
-  return TIERS.slice(idx).some((t) => actions.countItem(`${t}_pickaxe`) > 0);
+  return !!bestPickaxe(actions, minTier);
 }
 
 function tierMaterial(tier) {
@@ -1049,7 +1202,6 @@ function tierMaterial(tier) {
     stone: { cobblestone: 3, stick: 2 },
     iron: { iron_ingot: 3, stick: 2 },
     diamond: { diamond: 3, stick: 2 },
-    netherite: { netherite_ingot: 3, stick: 2 },
   };
   return map[tier] || null;
 }
@@ -1084,4 +1236,8 @@ module.exports = {
   diffOf,
   findNearestDiggable,
   relocate,
+  digToward,
+  ensurePickaxeDurability,
+  carriedPickaxeTier,
+  bestPickaxe,
 };

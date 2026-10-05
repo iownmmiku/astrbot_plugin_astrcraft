@@ -1,13 +1,13 @@
 {
   "engine_dir": {
     "type": "string",
-    "description": "【必填】Minecraft 引擎（bot 目录）的路径。留空则使用插件目录同级的 bot/",
+    "description": "【常用】Minecraft Node 引擎目录。留空优先使用插件内的 engine/；外置部署时填写绝对路径",
     "default": "",
-    "hint": "引擎是 Node 子进程，目录里需要有 index.js 和 node_modules（在 bot 目录执行过 npm install）"
+    "hint": "引擎是 Node 子进程，目录里需要有 index.js 和 node_modules（在 engine 目录执行 npm ci）"
   },
   "node_path": {
     "type": "string",
-    "description": "【必填】node 可执行文件路径。留空自动探测",
+    "description": "【常用】Node.js 22+ 可执行文件路径。留空自动探测",
     "default": "",
     "hint": "Windows 常见位置：C:\\\\Program Files\\\\nodejs\\\\node.exe"
   },

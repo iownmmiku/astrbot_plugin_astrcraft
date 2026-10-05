@@ -49,9 +49,9 @@ acts: list[float] = []
 _orig_act = L.LifeLoop._act
 
 
-async def _traced_act(self, decision):
+async def _traced_act(self, decision, **kwargs):
     acts.append(time.time())
-    return await _orig_act(self, decision)
+    return await _orig_act(self, decision, **kwargs)
 
 
 L.LifeLoop._act = _traced_act

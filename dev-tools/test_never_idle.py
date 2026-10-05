@@ -50,10 +50,15 @@ def make_loop():
     loop = LifeLoop.__new__(LifeLoop)
     loop._recent_outcomes = []
     loop._recent_failures = {}
+    loop._rule_supply_failures = {}
     loop._failure_window = 1800.0
     loop._last_death = None
     loop._plan = []
     loop._plan_source = ""
+    loop._mining_return = None
+    loop._return_task_attempt = None
+    loop._return_control_generation = 0
+    loop._return_boundary_state = {}
     loop._todos = []
     loop._intention = ""
     loop._has_shelter = False

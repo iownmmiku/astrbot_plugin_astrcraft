@@ -2,15 +2,13 @@
 /**
  * 身体层 S3 的测试：**抢占之后不白费**（见 docs/BODY_LAYER.md）。
  *
- * S3 的结论是：队列**本来就是"取消 + 重新排队"**（"回队头重排，不丢弃" +
- * 重建 AbortController），而技能**本来就是按"已经做到哪"算差值的**——
- * 所以"可续建"这件事**已经成立**，缺的是**验证**和**可见性**。
+ * 队列用"取消 + 重新排队"重跑技能；技能必须保留同一任务的原始目标，
+ * 才不会把恢复时的背包重新当作起点、多收集一整批。
  *
  * 这个测试钉住四件事：
  *   1. 被抢的任务**放回队头**（不是丢掉），而且**真的会重跑**
  *   2. 被抢的次数被记下来（preemptCount / preemptedBy）
- *   3. **重跑不白费**：技能的"还差多少"是按背包里的数量算的
- *      （chop_tree / mine_ores / collect 都是这个模式）
+ *   3. **重跑不白费**：真实技能被抢占后只完成原始剩余数量，产出如实报告
  *   4. blueprint 那种"逐格放"的技能会**跳过已经放好的**（可续建）
  *
  * 不需要服务器。
@@ -77,20 +75,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ok('抢占统计 +1', q.stats.preempted === 1, `stats.preempted=${q.stats.preempted}`);
 
     // 等本能做完，被抢的任务应该**重新跑起来**
-    await sleep(900);
+    await high.promise;
+    await low.promise;
+    await tick();
     ok(
       '被抢的长任务**重新跑起来了**（不是被丢掉）',
       lowRuns >= 2,
       `长任务一共跑了 ${lowRuns} 次（>=2 说明重跑了）`,
     );
-    // 它没被"丢弃"——历史里还在，而且跑过两次以上。
-    //
-    // 注意别断言 `status !== 'cancelled'`：我的测试桩在重跑时又撞上了
-    // 旧的 abort 信号、抛了一次错，于是状态变成 cancelled ✗
-    // 那是**桩的问题**，不是队列的问题（队列确实重建了 controller）。
-    // 真正要证明的是"没被丢掉、而且重跑了"，用下面两条就够。
-    const inHistory = (q.history || []).some((t) => t.id === low.id);
-    ok('它还在队列的历史里（没被丢弃）', inHistory || lowRuns >= 2, `history 命中=${inHistory}`);
+    const inHistory = (q.history || []).some((t) => t.task_id === low.id && t.status === 'done');
+    ok('重跑确实完成且记入历史，没有把中断记成失败', inHistory && low.status === 'done' && q.stats.cancelled === 0,
+      `history 命中=${inHistory}，status=${low.status}`);
     ok(
       '**重跑不白费的前提成立**：被抢的任务会重新执行同一段 run',
       lowRuns >= 2,
@@ -101,20 +96,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   console.log('\n=== 重跑不白费：技能按"已经做到哪"算差值 ===');
   {
-    // 这是技能层的模式，不是队列的。用真实代码确认它还在这个模式上：
-    //   chop_tree:  const startHave = have();  ... want: startHave + want
-    //   mine_ore:   数 raw + ingot 的当前数量
-    //   collect:    const already = countItem(want)
-    const fs = require('fs');
-    const checks = [
-      ['skills/wood.js', /const startHave = have\(\)/, 'chop_tree 从当前背包数量起算'],
-      ['skills/wood.js', /want: startHave \+ want/, 'chop_tree 的目标 = 已有 + 还差'],
-      ['skills/mining.js', /const raw = actions\.countItem\(spec\.item\)/, 'mine_ore 数当前矿石'],
-      ['skills/gathering.js', /const already = actions\.countItem\(want\)/, 'collect 数当前物品'],
+    // Execute McEngine.submitSkill -> TaskQueue -> actual skills with deterministic
+    // world I/O. Source spelling cannot prove that a replay keeps its original goal.
+    const { world } = require('./test_collection_progress');
+    const scenarios = [
+      { label: '砍树', skill: 'chop_tree', params: { count: 8 }, inventory: { oak_log: 3 },
+        block: 'oak_log', item: 'oak_log', expectedStock: 11, expectedDigs: 8, preemptAt: [2, 5] },
+      { label: '煤矿', skill: 'mine_ores', params: { ore: 'coal', count: 8 }, inventory: { stone_pickaxe: 1, coal: 4 },
+        block: 'coal_ore', item: 'coal', expectedStock: 12, expectedDigs: 8, preemptAt: [2, 5] },
+      { label: '铁矿', skill: 'mine_ores', params: { ore: 'iron', count: 8 }, inventory: { stone_pickaxe: 1, raw_iron: 5, iron_ingot: 7 },
+        block: 'iron_ore', item: 'raw_iron', expectedStock: 13, expectedDigs: 8, preemptAt: [2, 5] },
+      { label: '收集圆石', skill: 'collect', params: { item: 'cobblestone', count: 8 }, inventory: { stone_pickaxe: 1, cobblestone: 4 },
+        block: 'stone', item: 'cobblestone', expectedStock: 8, expectedDigs: 4, preemptAt: [2] },
     ];
-    for (const [file, re, label] of checks) {
-      const src = fs.readFileSync(path.join(__dirname, '..', 'engine', file), 'utf8');
-      ok(`${label}（${file}）`, re.test(src));
+    for (const scenario of scenarios) {
+      const w = world({ inventory: scenario.inventory, blocks: Array(16).fill(scenario.block), preemptAt: scenario.preemptAt });
+      const task = w.engine.submitSkill({ skill: scenario.skill, params: scenario.params });
+      const result = await task.promise;
+      ok(`${scenario.label}实际被抢占后完成，而不是丢弃`, task.status === 'done' && task.preemptCount === scenario.preemptAt.length);
+      ok(`${scenario.label}只补原始剩余量，不按恢复时背包重新加一批`, w.digs === scenario.expectedDigs && w.counts[scenario.item] === scenario.expectedStock,
+        `挖掘 ${w.digs} 次，库存 ${w.counts[scenario.item]}`);
+      if (scenario.skill !== 'collect') {
+        ok(`${scenario.label}报告包含抢占前后的完整实际产出`, result.produced[scenario.item] === scenario.expectedDigs);
+      }
     }
   }
 

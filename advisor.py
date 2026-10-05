@@ -21,6 +21,7 @@ LLM 只看到一段状态简报，它不知道
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 
 # ---------------------------------------------------------------- 物品分类
 
@@ -156,6 +157,8 @@ def advise(
     is_night: bool = False,
     inventory_slots_used: int = 0,
     nearby_entities: list | None = None,
+    home: dict | None = None,
+    home_status: dict | None = None,
 ) -> Advice:
     """核心入口：给出现状评估与下一步建议。
 
@@ -163,6 +166,14 @@ def advise(
     """
     inv = {k: int(v or 0) for k, v in (inventory or {}).items()}
     fails = recent_failures or {}
+    home_status = home_status or {}
+    home_condition = home_status.get("condition") or (home.get("condition") if home else None)
+    # Unloaded chunks cannot overturn a previously verified damaged structure.
+    if home and home.get("condition") == "missing" and home_condition == "unknown":
+        home_condition = "missing"
+    owns_home = bool(home and home_condition not in ("missing", "other_world"))
+    safe_home = bool(home_status.get("safe")) if home else has_shelter
+    has_shelter = has_shelter or owns_home
     adv = Advice()
 
     wood = count_any(inv, WOOD_NAMES)
@@ -193,6 +204,21 @@ def advise(
     # 早期一律建议 cook_food，可手上连一块生肉都没有时做饭必然失败，
     # 于是她卡在"想做吃的 → 做不了"的循环里，从来不会去打猎。
     def _food_advice() -> tuple[str, dict, str]:
+        furniture = ((home.get("furnished") or {}) if home and home_condition == "unknown"
+                     else home_status.get("furniture") or {})
+        distance = home_status.get("distance")
+        empty_at = home.get("food_stock_checked_at") if home else None
+        recently_empty = (home and home.get("food_stock_empty") is True
+                          and type(empty_at) in (int, float) and 0 <= time.time() - empty_at < 120)
+        # A short verified route is useful when no ingredients are already in
+        # hand. Inside the house, checking its shelves is cheaper than cooking.
+        has_ingredients = inv.get("wheat", 0) >= 3 or raw_food > 0
+        reach = 8 if food <= 4 or health <= 8 else 48
+        if (owns_home and isinstance(furniture, dict) and furniture.get("chest") and not recently_empty
+                and fails.get("resupply_food", 0) < 2
+                and (safe_home or type(distance) in (int, float) and 0 <= distance <= reach)
+                and (safe_home or not has_ingredients)):
+            return "resupply_food", {"home": dict(home), "count": 4}, "先利用当前世界近处基地的普通食物储备，真实取到后在屋内吃饭恢复"
         if inv.get("wheat", 0) >= 3:
             return "cook_food", {"count": min(4, inv["wheat"] // 3)}, "已有小麦，补齐工作台后做面包，不必外出打猎"
         if raw_food > 0:
@@ -323,6 +349,37 @@ def advise(
         adv.priority = "maintenance"
         adv.skill, adv.params = "store_items", {}
         adv.why = "先腾出背包空间，保留工具与食物，再继续采集"
+        home_distance = home_status.get("distance")
+        furniture = (home.get("furnished") or {}) if home and home_status.get("condition") == "unknown" else home_status.get("furniture") or {}
+        if (owns_home and isinstance(furniture, dict) and furniture.get("chest")
+                and type(home_distance) in (int, float) and 0 <= home_distance <= 128
+                and fails.get("store_items", 0) < 2):
+            adv.params["home"] = dict(home)
+            adv.params["resume_work"] = True
+            adv.why = "背包快满了，先回当前世界有箱子的基地，安全进屋关门后整理物资，再继续原任务"
+
+    if is_night and not needs_food and not (health <= 8 and food >= 18):
+        if home and safe_home and home_status.get("furniture", {}).get("bed") and str(home.get("dimension", "")).removeprefix("minecraft:") == "overworld":
+            adv.skill, adv.params = "sleep", {"timeout_seconds": 60}
+            bed_position = home_status.get("furniture", {}).get("bed_position")
+            if bed_position:
+                adv.params["bed_position"] = bed_position
+            adv.why = "已经在验收完整的基地内，床仍在，先睡过夜晚"
+            adv.priority, adv.hard = "survival", True
+        elif home and safe_home:
+            adv.skill, adv.params = "return_home", {"home": home, "sleep": False, "wait_seconds": 20}
+            adv.why = "基地暂无床，先留在完整的屋里暂避夜晚，天亮、饥饿或有威胁时再调整"
+            adv.priority, adv.hard = "survival", True
+        elif not safe_home:
+            if owns_home and fails.get("return_home", 0) < 2 and float(home_status.get("distance") or 0) <= 256:
+                adv.skill, adv.params = "return_home", {"home": home, "sleep": True, "timeout_seconds": 60}
+                adv.why = "天黑了，先回当前世界的基地，走近核验房屋再休息"
+            else:
+                adv.skill, adv.params = "build_shelter", {"size": 2}
+                adv.why = "基地被拆、太远或暂时走不回去，先在附近建小型临时住处过夜"
+            adv.priority, adv.hard = "survival", True
+        if home and home_status.get("condition") == "unknown":
+            adv.warnings.append("基地地形未加载，记得坐标但尚未确认安全；走近核验后再入住")
 
     # ---- 失败记忆：把"刚失败过"的事摆到明面上，并避免死循环
     if adv.skill and fails.get(adv.skill, 0) >= 2:

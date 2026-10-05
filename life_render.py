@@ -65,7 +65,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 import time as _t
 
-from .inbox import Inbox
+from .inbox import Inbox, type_of
 from .life_types import HOLD_RELEASE, HOLD_WHY, Hold, LifeDecision
 
 
@@ -82,12 +82,19 @@ class PromptRenderMixin:
         **取走即出队**：不重复注入同一条。
         """
         try:
+            # Capture permission before removing entries. This also handles an
+            # owner retry that arrives during prompt preparation.
+            if getattr(self, "_queued_owner_steer", lambda: False)():
+                getattr(self, "_should_back_off", lambda: None)()
             taken = self.inbox.take_steer()
         except Exception as exc:  # noqa: BLE001
             logger.info("取插话失败：%s", exc)
             return ""
         if not taken:
             return ""
+        if any(type_of(entry.type).from_owner for entry in taken):
+            self._decision_owner_pending = True
+            self._decision_owner_generation = getattr(self, "_decision_owner_generation", 0) + 1
         lines = Inbox.render(taken)
         note = self.inbox.take_dropped_note()
         body = "\n".join(lines)
@@ -246,7 +253,7 @@ class PromptRenderMixin:
             name = str(o.get("skill") or "（未知）")
             if o.get("ok"):
                 done[name] = done.get(name, 0) + 1
-            elif not o.get("decision"):
+            elif not o.get("decision") and not o.get("cancelled"):
                 # "想事情失败"不算"做事失败"，别混进来（见 W3）
                 failed[name] = failed.get(name, 0) + 1
         parts = []
@@ -283,12 +290,40 @@ class PromptRenderMixin:
                         f"    {when}  ⚠️ 上一轮{ o['detail'] }"
                         "——**那一轮什么都没做成**，别以为你做过什么"
                     )
+                elif o.get("cancelled"):
+                    detail = f"：{o['detail']}" if o.get("detail") else ""
+                    lines.append(f"    {when}  {o['skill']} → 中断{detail}")
                 elif o["ok"]:
                     lines.append(f"    {when}  {o['skill']} → 做成了")
                 else:
                     detail = f"：{o['detail']}" if o["detail"] else ""
                     lines.append(f"    {when}  {o['skill']} → 没做成{detail}")
         return "\n".join(lines)
+
+    def _contextual_memories(self, state: dict) -> str:
+        """Recall a few relevant experiences, scoped to the known current world."""
+        if not self.memory:
+            return ""
+        advice = getattr(self, "_last_advice", None)
+        skill = getattr(advice, "skill", "") or ""
+        parts = [self._intention or "", skill, getattr(advice, "why", "") or "",
+                 json.dumps(getattr(advice, "params", {}) or {}, ensure_ascii=False)]
+        if state.get("food") is not None and state["food"] <= 10 or skill in ("eat", "cook_food", "hunt"):
+            parts.append("食物 食材 粮食 粮仓 饥饿 做饭")
+        if skill in ("mine_ores", "mine_stone"):
+            parts.append("挖矿 矿洞 矿石")
+        if state.get("is_night"):
+            parts.append("夜晚 基地 住所 床")
+        if state.get("health") is not None and state["health"] <= 8:
+            parts.append("危险 受伤 后撤")
+        try:
+            entries = self.memory.recall(" ".join(parts), limit=3, relevant_only=True,
+                                         context={k: state[k] for k in ("server", "dimension") if state.get(k) is not None})
+            text = self.memory.render_for_prompt(entries)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("检索相关经历失败：%s", exc)
+            return ""
+        return f"【与你当前目标相关的经历】\n{text[:1200]}" if text else ""
 
     def _failure_counts(self) -> dict[str, int]:
         now = time.time()
@@ -330,6 +365,8 @@ class PromptRenderMixin:
         """
         if self._dead:
             return Hold.DEAD
+        if getattr(self, "_world_changing", False):
+            return Hold.WORLD_CHANGING
         if self._is_connected and not self._is_connected():
             return Hold.DISCONNECTED
         if not self._engine_up:
@@ -426,6 +463,10 @@ class PromptRenderMixin:
 
     def _decision_from_step(self, step: dict) -> LifeDecision:
         """把计划里的一步变成一次决定。"""
+        original = step.get("decision")
+        if (isinstance(original, LifeDecision) and original.skill == step["skill"]
+                and original.params == (step.get("params") or {})):
+            return original
         why = step.get("why") or ""
         return LifeDecision(
             activity=why or f"按计划做 {step['skill']}",
@@ -594,6 +635,7 @@ class PromptRenderMixin:
                 "intention_rounds": self._intention_rounds,
                 "intention_since": self._intention_since,
                 "has_shelter": self._has_shelter,
+                "homes": getattr(self, "_homes", []),
                 # LLM 自己写的任务清单也要存：重启后她接着自己的清单干
                 "todos": self._todos,
             }

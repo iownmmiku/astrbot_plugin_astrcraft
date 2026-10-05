@@ -14,18 +14,15 @@ const {
   positiveOnly,
   driveUntil,
   settle,
-  climbToSurface,
 } = require('./common');
 const wood = require('./wood');
 const mining = require('./mining');
 const building = require('./building');
 const gathering = require('./gathering');
+const supply = require('./supply');
 const blueprint = require('./blueprint');
 const traverse = require('./traverse');
-// **`vec3` 和 `log` 必须显式引入**——climb_out 里要用。
-// 我第一版直接用了这两个名字（以为在作用域里），实际没有 import：
-// `node --check` 抓不到（它们是合法标识符），只会在运行到那一行时 ReferenceError。
-const { vec3, delay } = require('../util');
+const { delay, CancelledError, describeFailure } = require('../util');
 const { MissingItemError } = require('../actions');
 const log = require('../log');
 
@@ -162,6 +159,7 @@ const SKILLS = {
       count: { type: 'number', min: 1, max: 256, def: 8 },
       radius: { type: 'number', min: 8, max: 96, def: 40 },
       max_attempts: { type: 'number', min: 1, max: 96, def: 40 },
+      allow_search: { type: 'boolean', def: true },
     },
     async run({ actions, nav, state, ctx, params }) {
       const ore = requireParam(params, 'ore', { type: 'string', def: 'iron' }).toLowerCase();
@@ -175,6 +173,7 @@ const SKILLS = {
         want: count,
         radius: requireParam(params, 'radius', { def: 40 }),
         maxAttempts: requireParam(params, 'max_attempts', { def: 40 }),
+        allowSearch: params.allow_search !== false,
       });
     },
   },
@@ -187,6 +186,7 @@ const SKILLS = {
       count: { type: 'number', min: 1, max: 256, def: 20 },
       radius: { type: 'number', min: 8, max: 96, def: 40 },
       max_attempts: { type: 'number', min: 1, max: 96, def: 30 },
+      allow_search: { type: 'boolean', def: true },
     },
     async run({ actions, nav, state, ctx, params }) {
       return mining.mineStone({
@@ -197,151 +197,30 @@ const SKILLS = {
         want: requireParam(params, 'count', { def: 20 }),
         radius: requireParam(params, 'radius', { def: 40 }),
         maxAttempts: requireParam(params, 'max_attempts', { def: 30 }),
+        allowSearch: params.allow_search !== false,
       });
     },
   },
 
   climb_out: {
     label: '爬出坑/矿道',
-    description:
-      '从坑里、竖井里、矿道里爬回地面：挖阶梯 + 垫脚上升 + 侧向开洞。' +
-      '掉进 2 格以上深的坑、或挖矿挖到地下出不来时用这个',
-    // **为什么要把它暴露出来**（A 批次，见 docs/ESCAPE_ABILITIES.md）：
-    // climbToSurface 早就写好了（含垫脚上升、开侧洞、挖阶梯，实测能从 20 格深的
-    // 竖井里爬出来），但**只被三处内部调用**：
-    //   wood.js:40（chop_tree 开头）、building.js:41（build_shelter 开头）、
-    //   bot.js:909（脱困反射第 4 次起）
-    // 也就是说**她自己调不到**——掉进 2 格深的坑里只能干等那个带 8 秒节流的反射。
-    // 实测：1 格深的坑能出来，2 格/3 格的出不来（MC 跳跃高度 1.25 格），
-    // 而"走路不改动世界"意味着普通移动永远不挖。所以她就被困住了。
-    params: {
-      max_steps: { type: 'number', min: 1, max: 96, def: 32 },
-    },
+    description: '从坑、竖井或矿道安全回到地面；记得入口时优先原路返回，再挖阶梯或垫脚，验收真实落点',
+    params: { max_steps: { type: 'number', min: 1, max: 96, def: 32 },
+      return_target: { type: 'object', def: null } },
     async run({ actions, nav, ctx, params }) {
-      const res = await climbToSurface({
-        actions,
-        nav,
-        ctx,
-        maxSteps: requireParam(params, 'max_steps', { def: 32 }),
-      });
-      const steps = (res && res.steps) || 0;
-
-      // **爬完还要"走出去"**（A 批次，实测踩到）。
-      //
-      // `climbToSurface` 的停止条件是 `isUnderground` 为假 —— 而"只剩 1 格"时
-      // 它判 false（1 格是跳得上去的，对 chop_tree 那种场景是对的）。
-      // 但对**独立调用它脱困**来说，那还不够：她可能还在一个 1x1 的坑里，
-      // 得**走到旁边的地面**上才算出来。
-      // 实测：2 格深的坑里，它把她从 -62 抬到 -61 就报告 done 了，人还在坑里。
-      //
-      // **注意别去调 `actions.dipBelowSurface`**：那个方法挂在 engine（bot.js）上，
-      // 而技能拿到的是 actions —— 我第一版这么写，于是它永远是 undefined、
-      // 这段逻辑**根本没跑**（而且不报错，因为写成了 `actions.x ? ... : null`）。
-      // 所以这里自己算，自包含。
-      const dipHere = () => {
-        try {
-          const bot = actions.bot;
-          const p = bot.entity.position;
-          const bx = Math.floor(p.x);
-          const by = Math.floor(p.y);
-          const bz = Math.floor(p.z);
-          const hs = [];
-          for (const [dx, dz] of [
-            [6, 0],
-            [-6, 0],
-            [0, 6],
-            [0, -6],
-          ]) {
-            for (let y = by + 40; y >= by - 8; y -= 1) {
-              const b = bot.blockAt(vec3(bx + dx, y, bz + dz));
-              if (!b) break;
-              if (b.boundingBox === 'block') {
-                hs.push(y + 1);
-                break;
-              }
-            }
-          }
-          if (hs.length < 3) return null;
-          hs.sort((a, b) => a - b);
-          const surfaceY = hs[Math.floor(hs.length / 2)];
-          const depth = surfaceY - by;
-          return depth > 0 ? { depth, surfaceY, myY: by } : null;
-        } catch {
-          return null;
-        }
-      };
-      let steppedOut = false;
-      try {
-        const dip0 = dipHere();
-        if (dip0 && dip0.depth >= 1) {
-          const p = actions.bot.entity.position;
-          const bx = Math.floor(p.x);
-          const bz = Math.floor(p.z);
-          for (const [dx, dz] of [
-            [1, 0],
-            [-1, 0],
-            [0, 1],
-            [0, -1],
-          ]) {
-            const tx = bx + dx;
-            const tz = bz + dz;
-            // 那一格要"站得上去"：下面是实心、脚和头是空气
-            const floor = actions.bot.blockAt(vec3(tx, dip0.surfaceY - 1, tz));
-            const feet = actions.bot.blockAt(vec3(tx, dip0.surfaceY, tz));
-            const head = actions.bot.blockAt(vec3(tx, dip0.surfaceY + 1, tz));
-            const open = (b) => !!b && (b.boundingBox === 'empty' || b.name === 'air');
-            if (!floor || floor.boundingBox !== 'block') continue;
-            if (!open(feet) || !open(head)) continue;
-            await nav.goTo({
-              x: tx,
-              y: dip0.surfaceY,
-              z: tz,
-              range: 0.9,
-              signal: ctx.signal,
-              timeoutMs: 8000,
-            });
-            if (Math.floor(actions.bot.entity.position.y) >= dip0.surfaceY) {
-              steppedOut = true;
-              break;
-            }
-          }
-        }
-      } catch (err) {
-        if (err && err.name === 'CancelledError') throw err;
-        log.info(`爬出来后走出去失败：${err.message}`);
+      const helper = require('./mining_return');
+      const target = params.return_target || null;
+      if (target && !['x', 'y', 'z'].every((axis) => Number.isFinite(target[axis]))) {
+        throw new Error('return_target 需要有效的 x、y、z 数值');
       }
-
-      // **`skillResult` 的第一个参数是布尔，第二个是对象** ——
-      // 我第一版写成了 `skillResult('文本', {climbed})`，
-      // 于是 ok 变成了那个字符串、note 永远是 null，
-      // **结果里什么提示都没有**（实测：她爬出来了但日志里看不到任何说明）。
-      // 签名：skillResult(ok, { steps, produced, consumed, note, reason, extra })
-      // 用上面那个自包含的 dipHere（**不是** actions.dipBelowSurface——
-      // 那个挂在 engine 上，技能拿不到，写成 `actions.x ? ... : null`
-      // 还会静默失效，实测踩过）
-      const dip = dipHere();
-      if (dip && dip.depth >= 1 && !steppedOut) {
-        // 还是没到地面 —— **如实说**，别报告成功
-        return skillResult(false, {
-          note: `爬了 ${steps} 格，但还比周围地面低 ${dip.depth} 格，没走出去`,
-          reason: '坑壁挖不动、或者旁边没有能站的地方',
-          extra: { climbed: steps, depth_left: dip.depth },
+      return helper.withMiningBody({ actions, ctx }, async (ctx) => {
+        const back = await helper.returnFromMining({ actions, nav, ctx, target,
+          maxSteps: requireParam(params, 'max_steps', { min: 1, max: 96, def: 32 }) });
+        return skillResult(back.return_status.ok, {
+          note: back.note || '她已经在安全地面上了，不用爬',
+          reason: back.return_status.reason,
+          extra: { climbed: back.climbed || 0, return_status: back.return_status },
         });
-      }
-      if (res && res.already && !steppedOut) {
-        return skillResult(true, { note: '她已经在地面上了，不用爬', extra: { climbed: 0 } });
-      }
-      if (!res || !res.ok) {
-        // **如实报告**，不假装爬出来了（她需要知道"这条路走不通"）
-        return skillResult(false, {
-          note: `没能爬出来（爬了 ${steps} 格）`,
-          reason: (res && res.reason) || '原因不明',
-          extra: { climbed: steps },
-        });
-      }
-      return skillResult(true, {
-        note: `爬出来了（挖了/垫了 ${steps} 格${steppedOut ? '，并走到了地面上' : ''}）`,
-        extra: { climbed: steps, stepped_out: steppedOut },
       });
     },
   },
@@ -519,7 +398,7 @@ const SKILLS = {
     async run({ actions, nav, state, ctx, params }) {
       const item = params.item ? requireParam(params, 'item', { type: 'string' }) : null;
       const count = params.count ? requireParam(params, 'count', { def: null }) : null;
-      return mining.smeltOres({ actions, nav, state, ctx, item, count });
+      return mining.smeltOres({ actions, nav, state, ctx, item, count, allowSearch: params.allow_search !== false });
     },
   },
 
@@ -527,12 +406,13 @@ const SKILLS = {
     label: '建庇护所',
     description: '选一块平地，盖一个有墙、有屋顶、有门、有火把的小屋（材料不够会自己去挖）',
     params: { size: { type: 'number', min: 2, max: 6, def: 3 }, roof: { type: 'boolean', def: true }, door: { type: 'boolean', def: true }, torch: { type: 'boolean', def: true } },
-    async run({ actions, nav, state, ctx, params }) {
+    async run({ actions, nav, state, ctx, config, params }) {
       return building.buildShelter({
         actions,
         nav,
         state,
         ctx,
+        config,
         size: requireParam(params, 'size', { def: 3 }),
         roof: params.roof !== false,
         door: params.door !== false,
@@ -541,16 +421,51 @@ const SKILLS = {
     },
   },
 
+  return_home: {
+    label: '回基地',
+    description: '回当前世界记录的基地，走近验证真实墙屋顶与家具，再视夜晚睡觉；最多旅行256格，不挖毁建筑',
+    params: { home: { type: 'object', required: true }, sleep: { type: 'boolean', def: true }, timeout_seconds: { type: 'number', min: 5, max: 60, def: 60 }, wait_seconds: { type: 'number', min: 0, max: 30, def: 0 } },
+    async run({ actions, nav, state, ctx, config, params }) {
+      return building.returnHome({ actions, nav, state, ctx, config, home: params.home,
+        sleep: params.sleep !== false, timeoutMs: requireParam(params, 'timeout_seconds', { min: 5, max: 60, def: 60 }) * 1000,
+        waitSeconds: requireParam(params, 'wait_seconds', { min: 0, max: 30, def: 0 }) });
+    },
+  },
+
+  resupply_food: {
+    label: '回基地取食物',
+    description: '回当前世界128格内的完整基地，实际进屋关门后从最多3个屋内箱子或木桶补齐普通即食食物；保留应急金苹果，取后留屋内，部分补给如实报告',
+    params: { home: { type: 'object', required: true }, count: { type: 'number', min: 1, max: 64, def: 4 } },
+    async run({ actions, nav, state, ctx, config, params }) {
+      return supply.resupplyFood({ actions, nav, state, ctx, config,
+        home: requireParam(params, 'home', { type: 'object' }), count: requireParam(params, 'count', { min: 1, max: 64, def: 4 }) });
+    },
+  },
+
+  leave_home: {
+    label: '出基地继续工作',
+    description: '从当前完整且关门的基地实际走到安全门外，再确认上下半门已关闭，之后继续原任务',
+    params: { home: { type: 'object', required: true }, timeout_seconds: { type: 'number', min: 1, max: 20, def: 20 } },
+    async run({ actions, nav, state, ctx, config, params }) {
+      return building.leaveHome({ actions, nav, state, ctx, config,
+        home: requireParam(params, 'home', { type: 'object' }),
+        timeoutMs: requireParam(params, 'timeout_seconds', { min: 1, max: 20, def: 20 }) * 1000 });
+    },
+  },
+
   store_items: {
     label: '存东西',
-    description: '把背包里的东西存进箱子（附近没有箱子就做一个）',
-    params: { items: { type: 'array', def: null }, keep: { type: 'array', def: null } },
-    async run({ actions, nav, state, ctx, params }) {
+    description: '把背包里的东西存进箱子；给 home 时先回当前世界128格内的完整基地、进屋关门后使用屋内真实箱子，resume_work=true 时再安全出门关门继续工作；否则寻找附近或记忆容器（没有箱子就做一个）',
+    params: { items: { type: 'array', def: null }, keep: { type: 'array', def: null }, home: { type: 'object', def: null }, resume_work: { type: 'boolean', def: false } },
+    async run({ actions, nav, state, ctx, config, params }) {
       return gathering.storeItems({
         actions,
         nav,
         state,
         ctx,
+        config,
+        home: params.home ?? null,
+        resumeWork: params.resume_work === true,
         items: params.items ? requireParam(params, 'items', { type: 'array' }) : null,
         keep: params.keep ? requireParam(params, 'keep', { type: 'array' }) : null,
       });
@@ -634,40 +549,61 @@ const SKILLS = {
 
   food_chain: {
     label: '生存补给',
-    description: '一次性把"食物 + 工具 + 火把"补齐，适合长时间离开基地前使用',
+    description: '离开基地前准备至少4份现成食物、一把可用镐和4根火把；优先现有材料，只补缺少的镐，缺料或部分产出如实报告',
     params: {},
     async run({ actions, nav, state, ctx }) {
+      ctx.checkAborted();
       const steps = [];
-      const produced = {};
-      const food = await gathering.cookFood({ actions, nav, state, ctx, count: 4 });
+      const before = actions.inventoryMap();
+      const child = (stage) => typeof ctx.child === 'function' ? ctx.child(['food_chain', stage]) : ctx;
+      const foodReady = () => gathering.READY_FOOD.reduce((sum, name) => sum + actions.countItem(name), 0);
+      const finish = (failure = null) => {
+        const food = foodReady(), pick = mining.bestPickaxeTier(actions), torches = actions.countItem('torch');
+        const missing = [...(food < 4 ? ['food'] : []), ...(!pick ? ['pickaxe'] : []), ...(torches < 4 ? ['torch'] : [])];
+        const after = actions.inventoryMap();
+        const ok = !failure && missing.length === 0;
+        return skillResult(ok, { steps, produced: positiveOnly(wood.diffOf(before, after)),
+          consumed: positiveOnly(wood.diffOf(after, before)),
+          note: `${ok ? '补给已备好' : '补给尚未齐全'}：食物 ${food}/4 份，镐 ${pick || '无'}，火把 ${torches}/4 根`,
+          reason: ok ? null : failure || `还缺 ${missing.join('、')}，补齐后再继续原任务`,
+          extra: { food_ready: food, pickaxe_tier: pick, torch_count: torches, missing } });
+      };
+      const food = await gathering.cookFood({ actions, nav, state, ctx: child('food'), count: 4 });
+      ctx.checkAborted();
       steps.push(...food.steps);
-      Object.assign(produced, food.produced);
-      const pick = mining.bestPickaxeTier(actions);
-      if (!pick) {
-        const tier = actions.countItem('cobblestone') >= 11 ? 'stone' : 'wooden';
-        const tools = await wood.makeTools({ actions, nav, state, ctx, tier });
+      if (!food.ok || foodReady() < 4) return finish(food.reason || '食物还不足 4 份，先补齐食物再准备工具');
+      if (!mining.bestPickaxeTier(actions)) {
+        const tier = actions.countItem('cobblestone') >= 3 ? 'stone' : 'wooden';
+        const tools = await wood.makeTools({ actions, nav, state, ctx: child('pickaxe'), tier, kinds: ['pickaxe'] });
+        ctx.checkAborted();
         steps.push(...tools.steps);
-        Object.assign(produced, tools.produced);
+        if (!tools.ok || !mining.bestPickaxeTier(actions)) return finish(tools.reason || '没有做出可用的镐');
       }
-      if (actions.countItem('torch') < 4 && (actions.countItem('coal') > 0 || actions.countItem('charcoal') > 0)) {
+      if (actions.countItem('torch') < 4) {
+        if (actions.countItem('coal') + actions.countItem('charcoal') <= 0) return finish('还缺火把与煤或木炭燃料，现有食物和镐已保留');
         try {
-          const torchR8 = await actions.craft({ item: 'torch', count: 8, signal: ctx.signal });
-          if (torchR8.ok) {
-
-            steps.push('合成火把');
-
-            produced.torch = (produced.torch || 0) + 8;
-
-          } else {
-
-            log.info('火把没做出来（craft 返回 ok=false，不致命）');
-
+          const deficit = 4 - actions.countItem('torch');
+          const sticksNeeded = Math.ceil(deficit / 4);
+          if (actions.countItem('stick') < sticksNeeded) {
+            const sticks = await wood.makeSticks({ actions, nav, state, ctx: child('torch_sticks'),
+              want: sticksNeeded - actions.countItem('stick') });
+            ctx.checkAborted();
+            steps.push(...sticks.steps);
+            if (!sticks.ok || actions.countItem('stick') < sticksNeeded) return finish(sticks.reason || '没有补齐合成火把的木棍');
           }
-        } catch {
-          /* 不致命 */
+          const torchResult = await actions.craft({ item: 'torch', count: deficit, signal: ctx.signal });
+          ctx.checkAborted();
+          if (!torchResult.ok || actions.countItem('torch') < 4) return finish(torchResult.note || '服务端未确认足够的火把');
+          steps.push('合成并确认火把');
+        } catch (err) {
+          ctx.checkAborted();
+          if (err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
+          if (actions._stopped) throw new CancelledError('补给被急停');
+          return finish(`火把准备失败：${describeFailure(err)}`);
         }
       }
-      return skillResult(true, { steps, produced, note: `补给完成：${Object.entries(produced).map(([k, v]) => `${k}×${v}`).join('、') || '无新增'}` });
+      ctx.checkAborted();
+      return finish();
     },
   },
 
@@ -720,10 +656,10 @@ const SKILLS = {
   sleep: {
     label: '睡觉',
     description: '找一张床睡到天亮（跳过夜晚、设重生点）。附近有怪或不是夜里会如实说原因',
-    params: { timeout_seconds: { type: 'number', min: 30, max: 600, def: 120 } },
+    params: { timeout_seconds: { type: 'number', min: 30, max: 600, def: 120 }, bed_position: { type: 'object', def: null } },
     async run({ actions, ctx, params }) {
       const secs = requireParam(params, 'timeout_seconds', { def: 120 });
-      const r = await actions.sleepInBed({ signal: ctx.signal, timeoutMs: secs * 1000 });
+      const r = await actions.sleepInBed({ signal: ctx.signal, timeoutMs: secs * 1000, bed_position: params.bed_position || null });
       return skillResult(!!r.ok, {
         steps: [{ action: 'sleep', ok: !!r.ok, detail: r.note }],
         note: r.note,
@@ -797,6 +733,32 @@ const SKILLS = {
   },
 
 };
+
+// The same preparation lease follows dependencies into wood/mining/gathering.
+// Ordinary owner requests keep their existing search behavior by default.
+for (const name of ['make_tools', 'cook_food', 'food_chain', 'smelt', 'craft']) {
+  const skill = SKILLS[name], run = skill.run;
+  skill.params = { ...skill.params, home: { type: 'object', def: null },
+    allow_search: { type: 'boolean', def: true }, safe_search: { type: 'boolean', def: false } };
+  skill.run = async (options) => {
+    const params = options.params || {};
+    if (!params.home && params.safe_search !== true && params.allow_search !== false) return run(options);
+    return require('./preparation').withPreparation({ ...options, home: params.home || null,
+      allowSearch: params.allow_search !== false, safeSearch: params.safe_search === true },
+    (ctx) => run({ ...options, ctx }));
+  };
+}
+
+// Autonomous material gathering must not turn an accepted base into its quarry.
+// This outer scope also protects digging performed by implicit tool, fuel and
+// return dependencies; explicit building/furniture maintenance keeps its scope.
+for (const name of ['chop_tree', 'mine_stone', 'mine_ores', 'collect', 'hunt',
+  'make_tools', 'cook_food', 'food_chain', 'smelt', 'craft', 'climb_out']) {
+  const skill = SKILLS[name], run = skill.run;
+  skill.params = { ...skill.params, protected_home: { type: 'object', def: null } };
+  skill.run = (options) => require('./mining_return').withProtectedHome(options,
+    (ctx) => run({ ...options, ctx }));
+}
 
 function get(name) {
   return SKILLS[String(name || '').trim()] || null;

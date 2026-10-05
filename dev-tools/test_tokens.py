@@ -19,6 +19,9 @@
 
 import sys
 import pathlib
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -149,11 +152,94 @@ mn = (root / "main.py").read_text(encoding="utf-8")
 ok("action_agent 记用量", "ledger().record(" in aa)
 ok("game_agent 记用量（玩家对话那条路不能是黑的）", "ledger().record(" in ga)
 ok("/mc状态 显示用量", "【用量】" in mn and "ledger().describe()" in mn)
-ok(
-    "action_agent 每一步都记（不是只记最后一步）",
-    aa.count("ledger().record(") >= 1 and "for _ in range(self.max_steps)" in aa,
-    "6 步 = 6 次往返，只记最后一步会严重低估",
-)
+
+print("\n=== ActionAgent 多轮调用实际记账 ===")
+if _paths.astrbot_available():
+    from astrbot.core.provider.func_tool_manager import FunctionToolManager
+    from astrcraft_plugin.action_agent import ActionAgent, ACTION_PROMPT
+    from astrcraft_plugin.llm_tools_core import McPerceptionTools
+
+    class UsageEngine:
+        async def call(self, method, params=None, **kwargs):
+            if method == "state.get":
+                return {
+                    "connected": True, "position": {"x": 0, "y": 64, "z": 0},
+                    "dimension": "overworld", "held_item": None,
+                    "inventory_summary": {"entries": [{"name": "bread", "count": 2}]},
+                }
+            if method == "inventory.get":
+                return {"items": {"bread": 2}, "held": None}
+            raise AssertionError(f"未预期 RPC：{method}")
+
+    class UsageProvider:
+        def __init__(self, before=None):
+            self.calls = 0
+            self.before = before
+
+        async def text_chat(self, **kwargs):
+            self.calls += 1
+            if self.before is not None:
+                self.before()
+            names = ["mc_inventory"] if self.calls <= 2 else []
+            return SimpleNamespace(
+                tools_call_name=names, tools_call_args=[{}] if names else [],
+                tools_call_ids=[f"usage-{self.calls}"] if names else [],
+                completion_text="已确认背包" if not names else "",
+                usage=Usage(input_other=10 * self.calls, input_cached=90, output=self.calls),
+                to_openai_tool_calls_model=lambda: [],
+            )
+
+    class UsagePlugin(McPerceptionTools):
+        def __init__(self, provider):
+            self.engine, self.connected, self.life = UsageEngine(), True, None
+            self._brief_revision = 0
+            manager = FunctionToolManager()
+            manager.add_func(
+                name="mc_inventory", func_args=[], desc="用量回归测试",
+                handler=McPerceptionTools.tool_mc_inventory,
+            )
+
+            async def get_provider():
+                return provider
+
+            self.context = SimpleNamespace(
+                get_using_provider_async=get_provider,
+                provider_manager=SimpleNamespace(llm_tools=manager),
+            )
+
+        async def _ensure_engine(self):
+            return True
+
+    provider = UsageProvider()
+    agent = ActionAgent(UsagePlugin(provider))
+    measured = TokenLedger()
+    with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+        asyncio.run(agent.act(prompt="确认背包后结束", system=ACTION_PROMPT))
+    ok(
+        "每次模型往返都记，包括最后总结",
+        provider.calls == measured.calls == 3 and measured.total.total == 336,
+        f"provider={provider.calls}, 台账={measured.calls}, total={measured.total.total}",
+    )
+    ok(
+        "工具缓存命中不减少模型用量，latest 仍是最后一次响应",
+        agent.last_timing["read_cache_hits"] == 1 and measured.latest == Usage(30, 90, 3),
+    )
+
+    provider = UsageProvider()
+    plugin = UsagePlugin(provider)
+    plugin.life = SimpleNamespace(_plan_revision=0, _pending_plan=None)
+    provider.before = lambda: setattr(plugin.life, "_plan_revision", 1)
+    agent = ActionAgent(plugin)
+    measured = TokenLedger()
+    with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+        _, used = asyncio.run(agent.act(prompt="重连时旧响应作废", system=ACTION_PROMPT))
+    ok(
+        "环境变化后丢弃的响应也记录已消耗的用量",
+        agent.last_timing["exit_reason"] == "state_changed" and used == []
+        and provider.calls == measured.calls == 1 and measured.total.total == 101,
+    )
+else:
+    print("  ⏭ SKIP：ActionAgent 实际记账测试需要 AstrBot 运行时；纯台账测试已执行")
 
 print(f"\n=== 结果：{passed} 通过，{failed} 失败 ===")
 sys.exit(1 if failed else 0)

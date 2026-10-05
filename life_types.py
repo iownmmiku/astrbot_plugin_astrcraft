@@ -72,6 +72,7 @@ class Hold(Enum):
 
     NONE = "none"  # 没有停牌：可以跑
     DEAD = "dead"  # 她死了
+    WORLD_CHANGING = "world_changing"  # 维度切换尚未完成
     DISCONNECTED = "disconnected"  # 没进服
     PAUSED_BY_OWNER = "paused_by_owner"  # 主人在用她 / 按了暂停
     BLOCKED = "blocked"  # 模型端点不可用
@@ -80,6 +81,7 @@ class Hold(Enum):
 HOLD_RELEASE: dict["Hold", str] = {
     Hold.NONE: "",
     Hold.DEAD: "恢复生命（收到进服或重生通知）",
+    Hold.WORLD_CHANGING: "当前维度加载完成",
     Hold.DISCONNECTED: "重新进服",
     Hold.PAUSED_BY_OWNER: "主人恢复，或暂停超时自动恢复",
     Hold.BLOCKED: "模型端点恢复（配好 provider 后自己解开）",
@@ -89,6 +91,7 @@ HOLD_RELEASE: dict["Hold", str] = {
 HOLD_WHY: dict["Hold", str] = {
     Hold.NONE: "她在正常过日子",
     Hold.DEAD: "她已经死了，在等复活",
+    Hold.WORLD_CHANGING: "她正在切换维度，等待新世界就绪",
     Hold.DISCONNECTED: "她还没进服",
     Hold.PAUSED_BY_OWNER: "自主行动被暂停了（主人在用她，或按了暂停）",
     Hold.BLOCKED: "拿不到模型（provider 没配好或调用失败）",

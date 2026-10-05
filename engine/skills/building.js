@@ -12,7 +12,7 @@
  */
 
 const log = require('../log');
-const { delay, distance, CancelledError, describeFailure, vec3 } = require('../util');
+const { delay, distance, CancelledError, TimeoutError, describeFailure, vec3 } = require('../util');
 const { skillResult, climbToSurface } = require('./common');
 const wood = require('./wood');
 const mining = require('./mining');
@@ -51,7 +51,7 @@ function recordPlacement(material, name) {
  * @param {boolean} [o.door] 是否装门（没有门就用留一个口子）
  * @param {boolean} [o.torch] 是否放火把
  */
-async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, door = true, torch = true }) {
+async function buildShelter({ actions, nav, state, ctx, config = null, size = 3, roof = true, door = true, torch = true }) {
   const bot = actions.bot;
   const steps = [];
   const inner = Math.max(2, Math.min(6, Math.floor(Number(size) || 3)));
@@ -186,7 +186,8 @@ async function buildShelter({ actions, nav, state, ctx, size = 3, roof = true, d
 
     checkBudget(ctx);
     inspection = inspect();
-    const shelter = { ...shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }), furnished };
+    const shelter = { ...shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }), furnished,
+      ...homeScope(bot, config), verified_at: Date.now() };
 
     const extras = [
       shelter.has_roof ? '有屋顶' : '',
@@ -245,6 +246,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
       const floorY = origin.y;
       await actions.place({ x: cx, y: floorY, z: cz, item: 'chest', signal: ctx.signal });
       out.chest = blockAt(bot, cx, floorY, cz)?.name === 'chest';
+      if (out.chest) out.chest_position = { x: cx, y: floorY, z: cz };
       steps.push({ action: 'place_chest', ok: out.chest });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
@@ -285,6 +287,7 @@ async function furnish({ actions, nav, state, ctx, origin, inner, steps, out }) 
     try {
       await actions.place({ x: cx + 1, y: origin.y, z: cz, item: bed, signal: ctx.signal });
       out.bed = blockAt(bot, cx + 1, origin.y, cz)?.name === bed;
+      if (out.bed) out.bed_position = { x: cx + 1, y: origin.y, z: cz };
       steps.push({ action: 'place_bed', ok: out.bed });
     } catch (err) {
       if (err instanceof CancelledError) throw err;
@@ -434,40 +437,328 @@ function isFlatEnough(bot, x, y, z, outer, tolerance = 2, groundAt = null) {
 
 function inspectShelter({ actions, origin, outer, wallHeight, roof, doorPos }) {
   const bot = actions.bot;
+  let unknown = 0;
+  const read = (x, y, z) => { const b = blockAt(bot, x, y, z); if (!b) unknown += 1; return b; };
   const missing_floor = [], missing_walls = [], missing_roof = [];
   for (let dx = 0; dx < outer; dx += 1) {
     for (let dz = 0; dz < outer; dz += 1) {
       const x = origin.x + dx, z = origin.z + dz;
       const floor = { x, y: origin.y - 1, z };
-      if (!solidSafe(blockAt(bot, x, floor.y, z))) missing_floor.push(floor);
+      if (!solidSafe(read(x, floor.y, z))) missing_floor.push(floor);
       if (dx === 0 || dz === 0 || dx === outer - 1 || dz === outer - 1) {
         if (!doorPos || x !== doorPos.x || z !== doorPos.z) {
           for (let dy = 0; dy < wallHeight; dy += 1) {
             const cell = { x, y: origin.y + dy, z };
-            if (!solidSafe(blockAt(bot, x, cell.y, z))) missing_walls.push(cell);
+            if (!solidSafe(read(x, cell.y, z))) missing_walls.push(cell);
           }
         }
       }
       if (roof) {
         const cell = { x, y: origin.y + wallHeight, z };
-        if (!solidSafe(blockAt(bot, x, cell.y, z))) missing_roof.push(cell);
+        if (!solidSafe(read(x, cell.y, z))) missing_roof.push(cell);
       }
     }
   }
   let has_door = false;
   if (doorPos) {
-    const lower = blockAt(bot, doorPos.x, doorPos.y, doorPos.z);
-    const upper = blockAt(bot, doorPos.x, doorPos.y + 1, doorPos.z);
+    const lower = read(doorPos.x, doorPos.y, doorPos.z);
+    const upper = read(doorPos.x, doorPos.y + 1, doorPos.z);
     const half = (b) => typeof b?.getProperties === 'function' ? b.getProperties().half : null;
     has_door = !!lower && !!upper && lower.name.endsWith('_door') && lower.name === upper.name &&
       (!half(lower) || half(lower) === 'lower') && (!half(upper) || half(upper) === 'upper');
   }
   return {
+    unknown,
     missing_floor, missing_walls, missing_roof,
     missing_blocks: [...missing_floor, ...missing_walls, ...missing_roof],
     has_roof: !!roof && missing_roof.length === 0, has_door,
     complete: missing_floor.length === 0 && missing_walls.length === 0 && missing_roof.length === 0 && (!doorPos || has_door),
   };
+}
+
+function homeScope(bot, config = null) {
+  const socket = bot?._client?.socket;
+  return { server: socket ? `${socket.remoteAddress}:${socket.remotePort}` :
+    config ? `${config.get('host')}:${config.get('port')}` : null,
+  dimension: bot?.game?.dimension ? String(bot.game.dimension).replace(/^minecraft:/, '') : null };
+}
+
+function validateHome(home) {
+  if (!home || !home.server || !home.dimension || !home.origin ||
+      !['x', 'y', 'z'].every((k) => Number.isInteger(home.origin[k])) ||
+      !Number.isInteger(home.size) || home.size < 4 || home.size > 8 ||
+      !Number.isInteger(home.wall_height) || home.wall_height < 2 || home.wall_height > 4) {
+    throw new Error('基地记录缺少有效世界、坐标或结构尺寸');
+  }
+  if (home.door_position && !['x', 'y', 'z'].every((k) => Number.isInteger(home.door_position[k]))) {
+    throw new Error('基地门坐标无效');
+  }
+  return home;
+}
+
+function inspectHome({ actions, state = null, config = null, home }) {
+  validateHome(home);
+  const scope = homeScope(actions.bot, config);
+  const sameWorld = home.server === scope.server && String(home.dimension).replace(/^minecraft:/, '') === scope.dimension;
+  if (!sameWorld) return { condition: 'other_world', safe: false, inside: false, loaded: false };
+  const inspection = inspectShelter({ actions, origin: home.origin, outer: home.size,
+    wallHeight: home.wall_height, roof: true, doorPos: home.door_position || null });
+  const p = actions.bot.entity.position;
+  const center = { x: home.origin.x + home.size / 2, y: home.origin.y, z: home.origin.z + home.size / 2 };
+  const inside = p.x >= home.origin.x + 1 && p.x < home.origin.x + home.size - 1 &&
+    p.z >= home.origin.z + 1 && p.z < home.origin.z + home.size - 1 && Math.abs(p.y - home.origin.y) < 1.2;
+  const condition = inspection.unknown ? 'unknown' : inspection.complete ? 'intact' : 'missing';
+  const doorPair = home.door_position ? [0, 1].map((dy) => blockAt(actions.bot,
+    home.door_position.x, home.door_position.y + dy, home.door_position.z)) : [];
+  const doorClosed = !home.door_position || doorPair.every((b, i) => b?.name?.endsWith('_door') &&
+    b.name === doorPair[0].name && typeof b.getProperties === 'function' &&
+    b.getProperties().half === (i ? 'upper' : 'lower') && b.getProperties().open === false);
+  const furniture = { bed: false, chest: false, crafting_table: false, furnace: false, smoker: false, blast_furnace: false,
+    furnace_lit: false, smoker_lit: false, blast_furnace_lit: false };
+  if (!inspection.unknown) {
+    for (let dx = 1; dx < home.size - 1; dx += 1) for (let dz = 1; dz < home.size - 1; dz += 1) {
+      const b = blockAt(actions.bot, home.origin.x + dx, home.origin.y, home.origin.z + dz);
+      if (b?.name?.endsWith('_bed')) { furniture.bed = true; furniture.bed_position = { x: b.position.x, y: b.position.y, z: b.position.z }; }
+      for (let dy = 0; dy < home.wall_height; dy += 1) {
+        const station = blockAt(actions.bot, home.origin.x + dx, home.origin.y + dy, home.origin.z + dz);
+        if (['chest', 'trapped_chest', 'barrel'].includes(station?.name)) {
+          furniture.chest = true;
+          furniture.chest_position = { x: station.position.x, y: station.position.y, z: station.position.z };
+        }
+        if (['crafting_table', 'furnace', 'smoker', 'blast_furnace'].includes(station?.name)) {
+          furniture[station.name] = true;
+          furniture[`${station.name}_position`] = { x: station.position.x, y: station.position.y, z: station.position.z };
+          if (['furnace', 'smoker', 'blast_furnace'].includes(station.name)) {
+            let lit = false;
+            try { lit = station.getProperties?.().lit === true; } catch { /* Unknown block properties prove no heat. */ }
+            furniture[`${station.name}_lit`] ||= lit;
+          }
+        }
+      }
+    }
+  }
+  const intruder = state && state.nearbyEntities({ radius: 12, limit: 12, hostileOnly: true }).some((e) =>
+    e.position.x > home.origin.x && e.position.x < home.origin.x + home.size &&
+    e.position.z > home.origin.z && e.position.z < home.origin.z + home.size && Math.abs(e.position.y - home.origin.y) < 3);
+  const hazard = actions.bot.entity.isInWater || actions.bot.entity.isInLava || actions.bot.entity.isOnFire;
+  return { condition, loaded: !inspection.unknown, complete: condition === 'intact', inside,
+    safe: inside && condition === 'intact' && doorClosed && !intruder && !hazard,
+    door_closed: doorClosed, distance: distance(p, center), furniture, unknown_blocks: inspection.unknown };
+}
+
+// Infer the two sides from the recorded footprint, not a stale facing/heading.
+function homeEntrance(home) {
+  const door = home.door_position, { origin, size } = home;
+  if (!door || door.y !== origin.y) return null;
+  const middleX = door.x > origin.x && door.x < origin.x + size - 1;
+  const middleZ = door.z > origin.z && door.z < origin.z + size - 1;
+  const inward = middleX && door.z === origin.z ? { x: 0, z: 1 } :
+    middleX && door.z === origin.z + size - 1 ? { x: 0, z: -1 } :
+    middleZ && door.x === origin.x ? { x: 1, z: 0 } :
+    middleZ && door.x === origin.x + size - 1 ? { x: -1, z: 0 } : null;
+  if (!inward) return null;
+  const side = (sign) => ({ x: door.x + inward.x * sign + 0.5, y: door.y,
+    z: door.z + inward.z * sign + 0.5 });
+  return { outside: side(-1), inside: side(1), inward };
+}
+
+function safeHomeLanding(bot, position) {
+  return solidSafe(blockAt(bot, position.x, position.y - 1, position.z)) && [0, 1].every((dy) => {
+    const b = blockAt(bot, position.x, position.y + dy, position.z);
+    return b?.boundingBox === 'empty' && !mining.isDangerous(b.name) && !['water', 'flowing_water'].includes(b.name);
+  });
+}
+
+async function returnHome({ actions, nav, state, ctx, config, home, sleep = true, timeoutMs = 60000, waitSeconds = 0 }) {
+  validateHome(home);
+  let status = inspectHome({ actions, state, config, home });
+  if (status.condition === 'other_world') return skillResult(false, { reason: '基地属于其他服务器或维度', extra: { home, home_status: status } });
+  if (status.distance > 256) return skillResult(false, { reason: '基地超过 256 格，当前先安排附近临时住处或分段旅行', extra: { home, home_status: status } });
+  const { executionContext } = require('../goals');
+  return executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false }, async () => {
+    const entryDeadline = Math.min(Date.now() + Math.min(60000, Math.max(1, Number(timeoutMs) || 60000)), ctx.deadline || Infinity);
+    const remaining = () => {
+      ctx.checkAborted();
+      if (actions._stopped) throw new CancelledError('引擎已急停');
+      const ms = entryDeadline - Date.now();
+      if (ms <= 0) throw new TimeoutError('回基地进屋超时');
+      return ms;
+    };
+    const travel = async (target) => {
+      await nav.goTo({ ...target, range: 0.5, signal: ctx.signal, timeoutMs: remaining(), segmented: false });
+      remaining();
+    };
+    if (!status.inside) {
+      ctx.progress('回基地，走近后检查房屋');
+      try {
+        const entrance = homeEntrance(home);
+        if (!entrance) throw new Error('基地记录没有位于墙边的有效入口');
+        if (status.loaded && !safeHomeLanding(actions.bot, entrance.outside)) throw new Error('基地门外没有安全落脚点');
+        await travel(entrance.outside);
+        status = inspectHome({ actions, state, config, home });
+        if (distance(actions.bot.entity.position, entrance.outside) > 1 || !safeHomeLanding(actions.bot, entrance.outside)) {
+          throw new Error('尚未实际到达基地门外安全落脚点');
+        }
+        if (status.condition !== 'intact') throw new Error(status.condition === 'unknown' ? '基地地形仍未加载' : '基地结构被改变或拆除');
+        if (!safeHomeLanding(actions.bot, entrance.inside)) throw new Error('基地门内入口被挡住或不安全');
+        const door = blockAt(actions.bot, home.door_position.x, home.door_position.y, home.door_position.z);
+        if (door?.name === 'iron_door') throw new Error('铁门不能手动打开并关闭，当前不能安全进屋');
+        ctx.progress('在基地门外确认木门，打开后再进屋');
+        const opened = await actions.openDoor({ ...home.door_position, signal: ctx.signal, timeoutMs: remaining() });
+        remaining();
+        if (!opened.ok) throw new Error(opened.note);
+        ctx.progress('基地门已确认打开，正在从入口进屋');
+        // Pathfinder postProcessPath targets the top of a door shape even when
+        // it is open. Cross only this verified two-block opening with real physics.
+        const entered = await actions.enterDoor({ ...home.door_position, target: entrance.inside,
+          signal: ctx.signal, timeoutMs: remaining() });
+        remaining();
+        if (!entered.ok) throw new Error(entered.note);
+      } catch (err) {
+        if (err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
+        status = inspectHome({ actions, state, config, home });
+        return skillResult(false, { reason: `暂时走不到基地：${describeFailure(err)}`, extra: { home, home_status: status } });
+      }
+    }
+    remaining();
+    status = inspectHome({ actions, state, config, home });
+    if (status.inside && status.condition === 'intact' && !status.door_closed && home.door_position) {
+      try {
+        const closed = await actions.closeDoor({ ...home.door_position, signal: ctx.signal, timeoutMs: remaining() });
+        remaining();
+        status = inspectHome({ actions, state, config, home });
+        if (!closed.ok) return skillResult(false, { reason: closed.note, extra: { home, home_status: status } });
+      } catch (err) {
+        if (err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
+        status = inspectHome({ actions, state, config, home });
+        return skillResult(false, { reason: `无法安全关上基地门：${describeFailure(err)}`, extra: { home, home_status: status } });
+      }
+    }
+    if (!status.safe) return skillResult(false, { reason: status.condition === 'unknown' ? '基地地形仍未加载，位置保留，暂不能确认安全' :
+      status.condition === 'missing' ? '基地结构被改变或拆除，当前不能安全居住' : '尚未安全进入基地', extra: { home, home_status: status } });
+    if (actions.stations) for (const kind of ['bed', 'chest']) {
+      if (status.furniture[`${kind}_position`]) actions.stations.remember(kind, status.furniture[`${kind}_position`]);
+    }
+    const tod = Number(actions.bot.time?.timeOfDay || 0);
+    let slept = false;
+    let sleepResult = null;
+    let note = '已回到基地并确认房屋完整';
+    if (sleep && status.furniture.bed && String(home.dimension).replace(/^minecraft:/, '') === 'overworld' && tod >= 12541 && tod <= 23458) {
+      sleepResult = await actions.sleepInBed({ signal: ctx.signal, timeoutMs: remaining(), bed_position: status.furniture.bed_position });
+      ctx.checkAborted();
+      if (actions._stopped) throw new CancelledError('引擎已急停');
+      slept = !!sleepResult.ok && sleepResult.day_confirmed === true;
+      note += `；${sleepResult.note || (slept ? '已确认睡到天亮' : '暂时不能睡到天亮')}`;
+    }
+    // 没有床时有限留家避夜；计划在下一次生存检查之前不应立刻带她又出门。
+    const waitUntil = Math.min(entryDeadline, Date.now() + Math.min(30000, Math.max(0, waitSeconds * 1000)));
+    let waitedMs = 0;
+    let waitingThreat = false;
+    const startedWaiting = Date.now();
+    if (!status.furniture.bed && String(home.dimension).replace(/^minecraft:/, '') === 'overworld') {
+      while (Date.now() < waitUntil) {
+        ctx.checkAborted();
+        const nowTime = Number(actions.bot.time?.timeOfDay || 0);
+        waitingThreat = !!state?.nearbyEntities({ radius: 6, limit: 1, hostileOnly: true }).length;
+        if (nowTime < 12541 || nowTime > 23458 || typeof actions.bot.food === 'number' && actions.bot.food <= 10 || waitingThreat) break;
+        await delay(Math.min(500, waitUntil - Date.now()), { signal: ctx.signal });
+      }
+      waitedMs = Date.now() - startedWaiting;
+      ctx.checkAborted();
+      status = inspectHome({ actions, state, config, home });
+      if (!status.safe) return skillResult(false, { reason: '留家期间基地不再安全', extra: { home, home_status: status, waited_ms: waitedMs } });
+      if (waitingThreat) return skillResult(false, { reason: '屋旁有威胁，先处理危险再决定如何过夜', extra: { home, home_status: status, waited_ms: waitedMs } });
+      if (waitedMs) note += '；在屋里暂避夜晚';
+    }
+    ctx.checkAborted();
+    if (actions._stopped) throw new CancelledError('引擎已急停');
+    status = inspectHome({ actions, state, config, home });
+    if (!status.safe) return skillResult(false, { reason: '休息后基地不再安全', extra: { home, home_status: status, slept, sleep_result: sleepResult, waited_ms: waitedMs } });
+    return skillResult(true, { note, extra: { home, home_status: status, slept, sleep_result: sleepResult, waited_ms: waitedMs } });
+  });
+}
+
+/** Leave a verified home through its real doorway, then confirm it is closed. */
+async function leaveHome({ actions, nav, state, ctx, config = null, home, timeoutMs = 20000 }) {
+  const parentSignal = ctx.signal, controller = new AbortController(), parentCtx = ctx;
+  const cancel = () => controller.abort();
+  if (parentSignal?.aborted) cancel();
+  parentSignal?.addEventListener('abort', cancel, { once: true });
+  for (const event of ['respawn', 'end']) actions.bot.on?.(event, cancel);
+  ctx = Object.create(parentCtx);
+  ctx.signal = controller.signal;
+  try {
+    return await leaveHomeInWorld({ actions, nav, state, ctx, config, home, timeoutMs });
+  } finally {
+    parentSignal?.removeEventListener('abort', cancel);
+    for (const event of ['respawn', 'end']) actions.bot.removeListener?.(event, cancel);
+  }
+}
+
+async function leaveHomeInWorld({ actions, nav, state, ctx, config, home, timeoutMs }) {
+  ctx.checkAborted();
+  validateHome(home);
+  let status = inspectHome({ actions, state, config, home });
+  if (!status.safe) return skillResult(false, { reason: '尚未在完整且关门的基地内，不能安全继续工作',
+    extra: { home, home_status: status } });
+  const scope = JSON.stringify(homeScope(actions.bot, config));
+  const { executionContext } = require('../goals');
+  return executionContext.run({ ...executionContext.getStore(), signal: ctx.signal, allowTerrainDig: false }, async () => {
+    const deadline = Math.min(Date.now() + Math.min(60000, Math.max(1, Number(timeoutMs) || 20000)), ctx.deadline || Infinity);
+    const remaining = () => {
+      ctx.checkAborted();
+      if (actions._stopped) throw new CancelledError('引擎已急停');
+      if (JSON.stringify(homeScope(actions.bot, config)) !== scope) throw new CancelledError('出基地期间世界已切换');
+      const ms = deadline - Date.now();
+      if (ms <= 0) throw new TimeoutError('出基地继续工作超时');
+      return ms;
+    };
+    try {
+      remaining();
+      const entrance = homeEntrance(home);
+      if (!entrance) throw new Error('基地记录没有位于墙边的有效入口');
+      if (!safeHomeLanding(actions.bot, entrance.inside) || !safeHomeLanding(actions.bot, entrance.outside)) {
+        throw new Error('基地门内或门外没有安全落脚点');
+      }
+      ctx.progress('存物后走到基地门内，检查出门路线');
+      await nav.goTo({ ...entrance.inside, range: 0.5, signal: ctx.signal, timeoutMs: remaining(), segmented: false });
+      remaining();
+      status = inspectHome({ actions, state, config, home });
+      if (!status.safe || distance(actions.bot.entity.position, entrance.inside) > 1 ||
+          !safeHomeLanding(actions.bot, entrance.inside) || !safeHomeLanding(actions.bot, entrance.outside)) {
+        throw new Error('尚未实际到达基地门内安全落脚点');
+      }
+      const opened = await actions.openDoor({ ...home.door_position, signal: ctx.signal, timeoutMs: remaining() });
+      remaining();
+      if (!opened.ok) throw new Error(opened.note || '服务器未确认基地门打开');
+      // enterDoor checks a two-block doorway symmetrically: the opposite target
+      // makes its starting side the inside and its verified target the outside.
+      const crossed = await actions.enterDoor({ ...home.door_position, target: entrance.outside,
+        signal: ctx.signal, timeoutMs: remaining() });
+      remaining();
+      if (!crossed.ok || distance(actions.bot.entity.position, entrance.outside) > 1 ||
+          !safeHomeLanding(actions.bot, entrance.outside)) throw new Error(crossed.note || '尚未实际走出基地');
+      status = inspectHome({ actions, state, config, home });
+      if (status.inside || status.condition !== 'intact') throw new Error('出门期间基地结构被改变，不能继续工作');
+      const closed = await actions.closeDoor({ ...home.door_position, signal: ctx.signal, timeoutMs: remaining() });
+      remaining();
+      status = inspectHome({ actions, state, config, home });
+      if (!closed.ok || status.inside || status.condition !== 'intact' || !status.door_closed ||
+          distance(actions.bot.entity.position, entrance.outside) > 1 || !safeHomeLanding(actions.bot, entrance.outside)) {
+        throw new Error(closed.note || '尚未确认安全出门并关上基地门');
+      }
+      return skillResult(true, { note: '已从基地实际出门并确认门已关闭，可以继续工作',
+        extra: { home, home_status: status, left_home: true } });
+    } catch (err) {
+      if (err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
+      if (ctx.signal?.aborted || actions._stopped || JSON.stringify(homeScope(actions.bot, config)) !== scope) {
+        throw new CancelledError('出基地被取消或世界已切换');
+      }
+      status = inspectHome({ actions, state, config, home });
+      return skillResult(false, { reason: `暂时无法安全出基地：${describeFailure(err)}`,
+        extra: { home, home_status: status, left_home: false } });
+    }
+  });
 }
 
 function shelterReport({ origin, inner, outer, wallHeight, material, doorPos, inspection }) {
@@ -1000,4 +1291,4 @@ function blockAt(bot, x, y, z) {
   }
 }
 
-module.exports = { buildShelter, pickFlatSpot, groundHeightAt, BUILD_MATERIALS };
+module.exports = { buildShelter, pickFlatSpot, groundHeightAt, BUILD_MATERIALS, inspectHome, returnHome, leaveHome };

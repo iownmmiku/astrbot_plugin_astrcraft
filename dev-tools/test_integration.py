@@ -15,6 +15,7 @@
   MC_TEST_PORT=25566   连哪个服务器（默认不连，只测引擎通道）
   MC_TEST_CONNECT=1    是否真的进服
   MC_TEST_DEATH=1      在项目测试服验证死亡/重生与急停（会杀死测试机器人）
+  MC_TEST_WORLD=1      在项目测试服往返下界，验证维度事件与旧计划失效
   MC_ENGINE_DIR=...    指定引擎目录（默认用仓库里的 engine/）
 """
 
@@ -211,6 +212,56 @@ async def _main() -> int:
                 ts = await plugin.engine.task_status(r.get("task_id"))
                 ok(f"任务可查询：{ts.get('name')} / {ts.get('status')}")
                 await plugin.engine.cancel_task(r.get("task_id"))
+                if os.environ.get("MC_TEST_WORLD") == "1":
+                    from lib.rcon import Rcon
+
+                    # Keep the test quiet while exercising real dimension packets;
+                    # owner pause and model outage must survive either transfer.
+                    await plugin._emergency_stop()
+                    snapshot = await plugin.engine.state()
+                    origin = snapshot["position"]
+                    origin_dimension = str(snapshot["dimension"]).removeprefix("minecraft:")
+                    destination_dimension = "overworld" if origin_dimension == "the_nether" else "the_nether"
+                    plugin.life.note_blocked("维度集成测试", retry_after=120)
+                    retry_at = plugin.life._decision_retry_at
+                    rcon = Rcon.from_dir(_paths.REPO / ".testserver", int(os.environ.get("MC_RCON_PORT", "25576")))
+                    try:
+                        await asyncio.to_thread(rcon.command, f"gamemode creative {config['bot_username']}")
+                        for dimension, destination in ((destination_dimension, {"x": 16.5, "y": 130, "z": 16.5}),
+                                                       (origin_dimension, origin)):
+                            plugin.life._set_plan([{"skill": "mine_stone", "params": {"count": 8}}])
+                            revision = plugin.life._plan_revision
+                            since = time.time()
+                            await asyncio.to_thread(rcon.command,
+                                f"execute in minecraft:{dimension} run tp {config['bot_username']} "
+                                f"{destination['x']} {destination['y']} {destination['z']}")
+                            for _ in range(100):
+                                notices = [e for e in plugin._event_buffer if e["at"] >= since]
+                                changed = [e for e in notices if e["event"] == "bot.world_changed"]
+                                ready = [e for e in notices if e["event"] == "bot.world_ready"]
+                                state = await plugin.engine.status()
+                                snapshot = await plugin.engine.state()
+                                if (changed and ready and not plugin.life._world_changing
+                                        and str(snapshot.get("dimension", "")).removeprefix("minecraft:") == dimension):
+                                    break
+                                await asyncio.sleep(0.1)
+                            else:
+                                raise AssertionError(f"真实维度切换未完成：目标{dimension}，当前{snapshot.get('dimension')}，"
+                                    f"等待={plugin.life._world_changing}，事件={[e['event'] for e in notices]}")
+                            if plugin.life._plan or plugin.life._plan_revision <= revision:
+                                raise AssertionError("旧世界计划没有作废")
+                            if (not plugin.life.paused or not state.get("emergency_stopped")
+                                    or plugin.life._blocked_reason != "维度集成测试"
+                                    or plugin.life._decision_retry_at != retry_at):
+                                raise AssertionError("维度切换意外解除主人暂停或模型故障")
+                            if any(e["event"] == "bot.respawn" for e in notices):
+                                raise AssertionError("正常维度传送错误地触发了复活通知")
+                            ok(f"真实进入 {dimension}：旧计划失效，世界就绪，暂停与模型故障保留")
+                    finally:
+                        try:
+                            await asyncio.to_thread(rcon.command, f"gamemode survival {config['bot_username']}")
+                        finally:
+                            rcon.close()
                 if os.environ.get("MC_TEST_DEATH") == "1":
                     from lib.rcon import Rcon
 

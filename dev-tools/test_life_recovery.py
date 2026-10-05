@@ -71,6 +71,917 @@ def make_loop():
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_but_unchanged_food_preserves_return_and_resumes_exact_followup(self):
+        import copy
+        import test_mining_return as M
+        for skill in ("eat", "recover"):
+            with self.subTest(skill=skill):
+                state = M.snapshot(food=0 if skill == "eat" else 20, health=6)
+                state["inventory"].update(iron_ingot=3, stick=2, crafting_table=1)
+                loop, _ = make_loop()
+                async def snapshot():
+                    return copy.deepcopy(state)
+                async def no_model(*args, **kwargs):
+                    raise AssertionError("no-progress food must still reach the established escape and plan")
+                loop._state_provider, loop._llm = snapshot, no_model
+                loop.note_blocked("模型离线", retry_after=120)
+                follow = {"skill": "make_tools", "params": {"tier": "iron", "kinds": ["pickaxe"]}, "why": "原定补镐"}
+                loop._set_plan([follow])
+                M.MiningReturnTests.arm(self, loop, state)
+                pending = loop._mining_return
+                submitted, finished = [], asyncio.Event()
+
+                async def engine(method, params=None, **kwargs):
+                    if method == "task.list":
+                        return {"current": None, "queued": 0}
+                    submitted.append(copy.deepcopy(params))
+                    task_id = f"completed-{len(submitted)}"
+                    if params["skill"] == skill:
+                        self.assertIs(loop._mining_return, pending)
+                        self.assertEqual(loop._plan, [follow])
+                        loop.note_task_result(skill, True, task_id=task_id)
+                    elif params["skill"] == "climb_out":
+                        self.assertIs(loop._mining_return, pending)
+                        self.assertEqual(loop._plan, [follow])
+                        self.assertEqual(loop._rule_supply_stalls[skill]["count"], 2)
+                        self.assertEqual(loop._failure_counts()[skill], 1)
+                        self.assertFalse(loop.skill_retry_ready(skill))
+                        self.assertTrue(pending["awaiting"])
+                        state["position"]["y"] = 64
+                        state["mining_return_safety"].update(safe=True, underground=False)
+                        # The next fresh body observation has recovered too;
+                        # completing escape alone never authorizes hungry work.
+                        state.update(food=20, health=20)
+                        loop.note_task_result("climb_out", True, result=M.report(state, ok=True), task_id=task_id)
+                    else:
+                        self.assertEqual(params["skill"], follow["skill"])
+                        self.assertEqual(params["params"], {**follow["params"], "safe_search": True})
+                        self.assertIsNone(loop._mining_return)
+                        finished.set()
+                        loop._stopped = True
+                    loop.wake()
+                    return {"task_id": task_id}
+
+                loop._call = engine
+                loop._wake.set()
+                loop.start()
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=1)
+                    self.assertEqual([item["skill"] for item in submitted], [skill, skill, "climb_out", "make_tools"])
+                finally:
+                    await loop.stop()
+
+    async def test_old_completed_food_proof_cannot_affect_owner_world_or_new_return(self):
+        import copy
+        import test_mining_return as M
+        for change in ("owner", "world", "new_return"):
+            with self.subTest(change=change):
+                state = M.snapshot(food=0, health=6)
+                loop, _ = make_loop()
+                async def snapshot():
+                    return copy.deepcopy(state)
+                loop._state_provider = snapshot
+                M.MiningReturnTests.arm(self, loop, state)
+                old_pending = loop._mining_return
+
+                async def engine(method, params=None, **kwargs):
+                    loop.note_task_result("eat", True, task_id="old-completed-meal")
+                    return {"task_id": "old-completed-meal"}
+
+                loop._call = engine
+                step = await loop._survival_step()
+                await loop._act(loop._decision_from_step(step), allow_model_block=True)
+                self.assertIs(loop._rule_supply_attempt["return_proof"]["supply_return"], old_pending)
+                if change == "owner":
+                    loop.note_owner_said("按新计划等我")
+                elif change == "world":
+                    loop.on_world_change()
+                    state["dimension"] = "the_nether"
+                    loop.on_world_ready()
+                follow = {"skill": "chop_tree", "params": {"count": 7}, "why": "新的安排"}
+                loop._set_plan([follow])
+                if change == "new_return":
+                    M.MiningReturnTests.arm(self, loop, state, task_id="new-mining")
+                current_pending = loop._mining_return
+                loop.note_task_result("eat", True, task_id="old-completed-meal")
+                loop._return_boundary_state = dict(state)
+                loop._observe_rule_supply(loop._supply_observation(state))
+                self.assertIs(loop._mining_return, current_pending)
+                self.assertIsNot(loop._mining_return, old_pending)
+                self.assertEqual(loop._plan, [follow])
+                self.assertNotIn("eat", loop._rule_supply_stalls)
+                self.assertNotIn("eat", loop._failure_cooldowns)
+
+    async def test_failed_urgent_meal_keeps_physical_return_and_real_loop_submits_rescue(self):
+        import copy
+        import test_mining_return as M
+        for skill in ("eat", "recover"):
+            for rpc_failure in (False, True):
+                with self.subTest(skill=skill, rpc_failure=rpc_failure):
+                    state = M.snapshot(food=0 if skill == "eat" else 20, health=6)
+                    loop, _ = make_loop()
+                    async def snapshot():
+                        return copy.deepcopy(state)
+                    async def no_model(*args, **kwargs):
+                        raise AssertionError("uncompleted physical return must not need a model")
+                    loop._state_provider, loop._llm = snapshot, no_model
+                    loop.note_blocked("模型离线", retry_after=120)
+                    follow = {"skill": "make_tools", "params": {"tier": "iron", "kinds": ["pickaxe"]}, "why": "保留原任务"}
+                    loop._set_plan([follow])
+                    M.MiningReturnTests.arm(self, loop, state)
+                    pending = loop._mining_return
+                    submitted, rescued = [], asyncio.Event()
+
+                    async def engine(method, params=None, **kwargs):
+                        if method == "task.list":
+                            return {"current": None, "queued": 0}
+                        submitted.append(params["skill"])
+                        task_id = f"current-{len(submitted)}"
+                        self.assertIs(loop._mining_return, pending)
+                        self.assertEqual(loop._plan, [follow])
+                        if params["skill"] == skill:
+                            self.assertIs(loop._return_task_attempt["supply_return"], pending)
+                            if rpc_failure:
+                                raise RuntimeError("meal RPC unavailable")
+                            loop.note_task_result(skill, False, "meal could not complete", task_id=task_id)
+                            loop.wake()
+                        else:
+                            self.assertEqual(params["skill"], "climb_out")
+                            self.assertEqual(loop._failure_counts()[skill], 2)
+                            self.assertFalse(loop.skill_retry_ready(skill))
+                            self.assertTrue(pending["awaiting"])
+                            self.assertEqual(pending["attempts"], 1)
+                            rescued.set()
+                        return {"task_id": task_id}
+
+                    loop._call = engine
+                    loop._wake.set()
+                    loop.start()
+                    try:
+                        await asyncio.wait_for(rescued.wait(), timeout=1)
+                        self.assertEqual(submitted, [skill, skill, "climb_out"])
+                        self.assertIs(loop._mining_return, pending)
+                        self.assertEqual(loop._plan, [follow])
+                        self.assertEqual(loop._return_task_attempt["skill"], "climb_out")
+                        self.assertEqual(loop._return_task_attempt["task_id"], "current-3")
+                    finally:
+                        await loop.stop()
+
+    async def test_late_meal_failure_after_owner_or_world_change_never_revives_old_return(self):
+        import test_mining_return as M
+        for change in ("owner", "world"):
+            with self.subTest(change=change):
+                state = M.snapshot(food=0, health=6)
+                loop, _ = make_loop()
+                loop._set_plan([{"skill": "make_tools", "params": {"tier": "iron"}}])
+                M.MiningReturnTests.arm(self, loop, state)
+                old_pending = loop._mining_return
+                token = loop.register_task_submission("eat", state)
+                loop.bind_task_submission(token, {"task_id": "old-meal"})
+                if change == "owner":
+                    loop.note_owner_said("先不要继续旧采矿任务")
+                else:
+                    loop.on_world_change()
+                    state["dimension"] = "the_nether"
+                    loop.on_world_ready()
+                loop.note_task_result("eat", False, "late failed meal", task_id="old-meal")
+                self.assertIsNone(loop._mining_return)
+                self.assertIsNone(loop._return_task_attempt)
+                self.assertEqual(loop._plan, [])
+                self.assertIsNot(loop._mining_return, old_pending)
+
+    async def test_old_meal_failure_cannot_clear_a_new_world_rescue_or_meal_submission(self):
+        import test_mining_return as M
+        for new_skill in ("eat", "climb_out"):
+            with self.subTest(new_skill=new_skill):
+                state = M.snapshot(food=0, health=6)
+                loop, _ = make_loop()
+                M.MiningReturnTests.arm(self, loop, state)
+                old = loop.register_task_submission("eat", state)
+                loop.bind_task_submission(old, {"task_id": "old-meal"})
+                loop.on_world_change()
+                state["dimension"] = "the_nether"
+                loop.on_world_ready()
+                follow = {"skill": "mine_stone", "params": {"count": 4}, "why": "新世界计划"}
+                loop._set_plan([follow])
+                M.MiningReturnTests.arm(self, loop, state, task_id="new-mining")
+                pending = loop._mining_return
+                current = loop.register_task_submission(new_skill, state)
+                loop.bind_task_submission(current, {"task_id": "new-action"})
+                loop.note_task_result("eat", False, "old-world timeout", task_id="old-meal")
+                self.assertIs(loop._mining_return, pending)
+                self.assertIs(loop._return_task_attempt, current)
+                self.assertEqual(loop._plan, [follow])
+                self.assertNotIn("eat", loop._recent_failures)
+
+        # The real completion entry forwards old successful skill events too.
+        # They must retain the food failure budget while climb_out is running.
+        import copy
+        import test_plugin_control as P
+        for skill in ("eat", "recover"):
+            with self.subTest(late_success=skill):
+                state = M.snapshot(food=0 if skill == "eat" else 20, health=6)
+                loop, _ = make_loop()
+                async def snapshot():
+                    return copy.deepcopy(state)
+                loop._state_provider = snapshot
+                follow = {"skill": "make_tools", "params": {"tier": "iron"}, "why": "原定任务"}
+                loop._set_plan([follow])
+                M.MiningReturnTests.arm(self, loop, state)
+
+                async def engine(method, params=None, **kwargs):
+                    task_id = f"failed-{len(loop._recent_failures.get(skill, []))}"
+                    loop.note_task_result(skill, False, "food unavailable", task_id=task_id)
+                    return {"task_id": task_id}
+
+                loop._call = engine
+                for _ in range(2):
+                    step = await loop._survival_step()
+                    await loop._act(loop._decision_from_step(step), allow_model_block=True)
+                self.assertEqual((await loop._survival_step())["skill"], "climb_out")
+                current = loop.register_task_submission("climb_out", state)
+                loop.bind_task_submission(current, {"task_id": "active-rescue"})
+                pending = loop._mining_return
+                budget = copy.deepcopy(loop._rule_supply_failures[skill])
+                cooldown = loop._failure_cooldowns[skill]
+                plugin = P.plugin()
+                plugin.life = loop
+                plugin.config["announce_task_done"] = False
+                await plugin._on_task_finished({"kind": "skill", "name": "旧补给任务", "meta": {"skill": skill},
+                    "status": "done", "task_id": "old-meal-success", "result": {"ok": True}})
+                self.assertEqual(loop._rule_supply_failures[skill], budget)
+                self.assertEqual(loop._failure_cooldowns[skill], cooldown)
+                self.assertEqual(loop._failure_counts()[skill], 2)
+                self.assertIs(loop._return_task_attempt, current)
+                self.assertIs(loop._mining_return, pending)
+                self.assertEqual(loop._plan, [follow])
+                self.assertIsNone(await loop._survival_step())
+                self.assertIn("脱困任务仍等待", loop._rule_supply_wait_reason)
+
+    async def test_owner_input_survives_provider_failure_and_blocks_rule_supply(self):
+        loop, calls = make_loop()
+
+        async def snapshot():
+            return {"health": 20, "food": 0, "inventory": {"bread": 4}}
+
+        class Agent:
+            async def act(self, **kwargs):
+                raise RuntimeError("provider offline")
+
+        loop._state_provider = snapshot
+        loop.action_agent = Agent()
+        loop.note_owner_said("这些面包留着给我，不许吃")
+        self.assertIsNone(await loop._survival_step())
+        with self.assertRaises(RuntimeError):
+            await loop._act_via_agent()
+        loop._note_decision_failure("provider offline")
+        self.assertEqual(len(loop.inbox), 0)
+        self.assertTrue(loop._owner_steer_pending())
+        self.assertIn("不许吃", loop._decision_input_text)
+        self.assertIsNone(await loop._survival_step())
+        await loop._act(L.LifeDecision(activity="吃面包", drive=None, skill="eat"), allow_model_block=True)
+        self.assertFalse(any(method == "skill.run" for method, _ in calls))
+
+    async def test_owner_input_prevents_legacy_fallback_after_invalid_response(self):
+        loop, calls = make_loop()
+
+        async def no_decision(prompt, system):
+            return None
+
+        loop._llm = no_decision
+        loop.note_owner_said("原地等我，别采集")
+        self.assertIsNone(await loop.decide())
+        self.assertFalse(loop._decision_model_ok)
+        self.assertTrue(loop._owner_steer_pending())
+        self.assertFalse(any(method == "skill.run" for method, _ in calls))
+
+    async def test_world_steer_does_not_acquire_pending_owner_barrier(self):
+        loop, _ = make_loop()
+
+        async def snapshot():
+            return {"health": 6, "food": 0, "inventory": {"bread": 4}}
+
+        loop._state_provider = snapshot
+        loop.note_world_event("hurt", "挨打了", urgent=True)
+        loop._decision_inputs()
+        loop.note_blocked("provider offline")
+        self.assertFalse(loop._owner_steer_pending())
+        self.assertEqual((await loop._survival_step())["skill"], "eat")
+
+    def test_consumed_owner_retry_is_not_a_permanent_cooldown_override(self):
+        loop, _ = make_loop()
+        with patch.object(L.time, "time", return_value=1000):
+            for _ in range(3):
+                loop.note_task_result("mine_stone", False, "没有镐")
+            self.assertFalse(loop.skill_retry_ready("mine_stone"))
+            # The owner arrives during preparation, after the loop's initial check.
+            loop.note_owner_said("工具补好了，再试一次")
+            loop._decision_inputs()
+            self.assertTrue(loop.skill_retry_ready("mine_stone"))
+            loop.note_task_result("mine_stone", False, "仍然没有镐")
+            self.assertFalse(loop.skill_retry_ready("mine_stone"))
+            self.assertTrue(loop._owner_steer_pending())
+
+    async def test_new_owner_during_agent_failure_cannot_be_acknowledged_by_old_action(self):
+        loop, _ = make_loop()
+        count = 0
+
+        class Provider:
+            async def text_chat(self, **kwargs):
+                nonlocal count
+                count += 1
+                if count == 1:
+                    return SimpleNamespace(tools_call_name=["mc_equip"], tools_call_args=[{}],
+                        tools_call_ids=["one"], to_openai_tool_calls_model=lambda: [])
+                if count == 2:
+                    loop.note_owner_said("留着面包，别吃")
+                    return SimpleNamespace(tools_call_name=[], completion_text="旧总结")
+                raise RuntimeError("provider offline")
+
+        async def get_provider():
+            return Provider()
+
+        plugin = SimpleNamespace(life=loop, context=SimpleNamespace(get_using_provider_async=get_provider))
+        agent = ActionAgent(plugin)
+        agent._toolset = lambda: "test"
+
+        async def execute(name, args, event):
+            return "装备完成"
+
+        agent._execute = execute
+        loop.action_agent = agent
+        self.assertTrue(await loop._act_via_agent())
+        self.assertEqual(agent.last_timing["exit_reason"], "provider_failed_after_action")
+        self.assertIn("别吃", loop._decision_input_text)
+        self.assertFalse(loop._decision_model_ok)
+        self.assertFalse(loop._acknowledge_decision_inputs(agent.last_timing["owner_generation"]))
+        self.assertTrue(loop._owner_steer_pending())
+
+    async def test_successful_owner_decision_releases_only_its_input_barrier(self):
+        loop, _ = make_loop()
+        loop.note_owner_said("先等一下")
+        decision = await loop.decide()
+        self.assertIsNotNone(decision)
+        self.assertTrue(loop._decision_model_ok)
+        self.assertTrue(loop._acknowledge_decision_inputs(loop._decision_model_owner_generation))
+        self.assertFalse(loop._owner_steer_pending())
+        self.assertEqual(loop._decision_input_text, "")
+
+    async def test_world_change_discards_inflight_agent_action_and_preserves_holds(self):
+        loop, _ = make_loop()
+        called = []
+        loop._todos = [{"text": "捡回死亡物品", "done": False}]
+        loop.pause(reason="主人暂停", max_seconds=0)
+        loop.note_blocked("模型离线", retry_after=120)
+        retry_at = loop._decision_retry_at
+        for _ in range(3):
+            loop.note_task_result("mine_stone", False, "没有镐")
+        loop.skill_retry_ready("mine_stone")
+        cooldowns = dict(loop._failure_cooldowns)
+        loop._set_plan([{"skill": "mine_stone"}])
+        old_revision = loop._plan_revision
+        loop.on_world_change()
+        self.assertGreater(loop._plan_revision, old_revision)
+        self.assertEqual(loop._plan, [])
+        self.assertFalse(loop.may_act(allow_model_block=True))
+        loop.on_world_ready()
+        self.assertTrue(loop.paused)
+        self.assertEqual(loop._blocked_reason, "模型离线")
+        self.assertEqual(loop._decision_retry_at, retry_at)
+        self.assertEqual(loop._failure_cooldowns, cooldowns)
+        self.assertEqual(loop._todos[0]["text"], "捡回死亡物品")
+        loop.resume()
+        loop.note_unblocked()
+
+        class Provider:
+            async def text_chat(self, **kwargs):
+                loop.on_world_change()
+                loop.on_world_ready()
+                return SimpleNamespace(tools_call_name=["mc_mine"], tools_call_args=[{"x": 20, "y": 64, "z": 20}])
+
+        async def get_provider():
+            return Provider()
+
+        plugin = SimpleNamespace(life=loop, context=SimpleNamespace(get_using_provider_async=get_provider))
+        agent = ActionAgent(plugin)
+        agent._toolset = lambda: "test"
+
+        async def execute(name, args, event):
+            called.append(args)
+            return "task_id=old-world"
+
+        agent._execute = execute
+        await agent.act(prompt="挖主世界旧坐标", system="玩家")
+        self.assertEqual(called, [])
+        self.assertEqual(agent.last_timing["exit_reason"], "state_changed")
+
+    async def test_empty_plan_still_supplies_food_without_model(self):
+        loop, calls = make_loop()
+
+        async def snapshot():
+            return {"health": 20, "food": 0, "inventory": {"wheat": 9, "oak_log": 2}}
+
+        loop._state_provider = snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        deadline = loop._decision_retry_at
+        self.assertEqual((await loop._survival_step())["skill"], "cook_food")
+        self.assertEqual(loop._plan, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(loop.current_hold(), L.Hold.BLOCKED)
+        self.assertEqual(loop._decision_retry_at, deadline)
+
+    async def test_survival_same_skill_refreshes_animal_and_quantity(self):
+        loop, _ = make_loop()
+
+        async def snapshot():
+            return {"health": 20, "food": 0, "inventory": {},
+                    "nearby_entities": [{"name": "pig", "distance": 3, "hostile": False}]}
+
+        loop._state_provider = snapshot
+        loop._set_plan([{"skill": "hunt", "params": {"mob": "cow", "count": 4}},
+                        {"skill": "mine_stone", "params": {"count": 4}}])
+        self.assertIsNone(await loop._survival_step())
+        self.assertEqual(loop._pop_plan_step()["params"], {"mob": "pig", "count": 1})
+        self.assertEqual(loop._plan[0]["skill"], "mine_stone")
+
+    async def test_survival_same_skill_raises_eating_target(self):
+        loop, _ = make_loop()
+
+        async def snapshot():
+            return {"health": 8, "food": 4, "inventory": {"bread": 4}}
+
+        loop._state_provider = snapshot
+        loop._set_plan([{"skill": "eat", "params": {"target_food": 8}}])
+        self.assertIsNone(await loop._survival_step())
+        self.assertEqual(loop._pop_plan_step()["params"], {"target_food": 20})
+
+    async def _run_food_then_plan(self, *, model_blocked=False, failures=False):
+        loop, calls = make_loop()
+        state = {"health": 20, "food": 0, "inventory": {"wheat": 9, "oak_log": 2}}
+        skills = []
+        complete = asyncio.Event()
+
+        async def snapshot():
+            return state
+
+        async def engine(method, params=None, **kwargs):
+            calls.append((method, params))
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            skill = params["skill"]
+            skills.append(skill)
+            if skill == "cook_food":
+                state["inventory"] = {"bread": 3, "oak_log": 2}
+            elif skill == "eat":
+                state["food"] = 20
+                state["inventory"]["bread"] = 1
+            elif skill == "mine_stone":
+                complete.set()
+                loop._stopped = True
+            else:
+                raise AssertionError(f"unexpected skill: {skill}")
+            loop.note_task_result(skill, True)
+            loop.wake()
+            return {"task_id": "t1"}
+
+        async def no_model(*args, **kwargs):
+            raise AssertionError("known survival and plan must not call a model")
+
+        loop._call = engine
+        loop._state_provider = snapshot
+        loop._llm = no_model
+        if failures:
+            for _ in range(3):
+                loop.note_task_result("mine_ores", False, "没有矿脉")
+        if model_blocked:
+            loop.note_blocked("模型离线", retry_after=120)
+        deadline, blocked = loop._decision_retry_at, loop._blocked_reason
+        loop._set_plan([{"skill": "mine_stone", "params": {"count": 4}}])
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(complete.wait(), timeout=1)
+            await asyncio.sleep(0)
+            self.assertEqual(skills, ["cook_food", "eat", "mine_stone"])
+            self.assertEqual(loop._decision_retry_at, deadline)
+            self.assertEqual(loop._blocked_reason, blocked)
+            if failures:
+                self.assertFalse(loop.skill_retry_ready("mine_ores"))
+                self.assertTrue(loop.skill_retry_ready("mine_stone"))
+        finally:
+            await loop.stop()
+
+    async def test_model_outage_keeps_food_supply_and_existing_plan_moving(self):
+        await self._run_food_then_plan(model_blocked=True)
+
+    async def test_repaired_pick_break_keeps_completed_collection_followup_during_outage(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"stone_pickaxe": 1, "cobblestone": 4},
+                 "is_night": False, "position": {"x": 0, "y": 64, "z": 0}}
+        completed = asyncio.Event()
+        submitted = []
+
+        async def snapshot():
+            return state
+
+        async def engine(method, params=None, **kwargs):
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            submitted.append(params["skill"])
+            completed.set()
+            loop._stopped = True
+            return {"task_id": "next"}
+
+        loop._call, loop._state_provider = engine, snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        loop._set_plan([{"skill": "build_shelter", "params": {"style": "small"}}])
+        token = loop.register_task_submission("mine_stone", state)
+        loop.bind_task_submission(token, {"task_id": "collect"})
+        loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+        loop.note_task_result("mine_stone", True, result={"collection_ok": True,
+            "return_status": {"required": False, "ok": True, "server": state["server"],
+                              "dimension": state["dimension"]}}, task_id="collect")
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(completed.wait(), timeout=1)
+            self.assertEqual(submitted, ["build_shelter"])
+            self.assertIn("wooden_pickaxe", loop._decision_input_text)
+            self.assertTrue(loop._blocked_reason)
+        finally:
+            await loop.stop()
+
+    async def test_pick_break_does_not_discard_required_mining_escape(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"coal": 2}, "is_night": False,
+                 "position": {"x": 0, "y": 40, "z": 0},
+                 "mining_return_safety": {"safe": False, "loaded": True, "on_ground": True,
+                                          "underground": True}}
+        completed = asyncio.Event()
+        submitted = []
+
+        async def snapshot():
+            return state
+
+        async def engine(method, params=None, **kwargs):
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            submitted.append(params["skill"])
+            completed.set()
+            loop._stopped = True
+            return {"task_id": "escape"}
+
+        loop._call, loop._state_provider = engine, snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        follow = {"skill": "craft", "params": {"item": "torch", "count": 4}, "why": "照明"}
+        loop._set_plan([follow])
+        token = loop.register_task_submission("mine_ores", state)
+        loop.bind_task_submission(token, {"task_id": "collect"})
+        loop.note_world_event("player_near", "有人经过矿洞")
+        loop.note_world_event("tool_broken", "我的stone_pickaxe用坏了")
+        loop.note_world_event("hungry", "刚才采矿时饿了")
+        loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+        loop.note_task_result("mine_ores", False, "返程失败", result={"collection_ok": True,
+            "return_status": {"required": True, "ok": False, "server": state["server"],
+                "dimension": state["dimension"], "position": dict(state["position"]),
+                "target": {"x": 0, "y": 64, "z": 0}}}, task_id="collect")
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(completed.wait(), timeout=1)
+            self.assertEqual(submitted, ["climb_out"])
+            self.assertEqual(loop._plan, [follow])
+            self.assertIn("stone_pickaxe", loop._decision_input_text)
+            self.assertIn("wooden_pickaxe", loop._decision_input_text)
+            self.assertIn("有人经过矿洞", loop._decision_input_text)
+        finally:
+            await loop.stop()
+
+    async def test_partial_collection_and_later_pick_break_still_preserve_escape(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"coal": 1}, "is_night": False,
+                 "position": {"x": 0, "y": 40, "z": 0},
+                 "mining_return_safety": {"safe": False, "loaded": True, "on_ground": True,
+                                          "underground": True}}
+
+        async def snapshot():
+            return state
+
+        loop._state_provider = snapshot
+        loop._set_plan([{"skill": "craft", "params": {"item": "torch", "count": 4}}])
+        token = loop.register_task_submission("mine_ores", state)
+        loop.bind_task_submission(token, {"task_id": "partial"})
+        loop.note_task_result("mine_ores", False, "工具损坏且返程失败", result={"collection_ok": False,
+            "return_status": {"required": True, "ok": False, "server": state["server"],
+                "dimension": state["dimension"], "position": dict(state["position"]),
+                "target": {"x": 0, "y": 64, "z": 0}}}, task_id="partial")
+        loop.note_world_event("tool_broken", "我的stone_pickaxe用坏了")
+        self.assertTrue(await loop._resolve_completed_tool_breaks())
+        self.assertEqual(loop._plan, [], "partial material must still invalidate dependent work")
+        self.assertEqual((await loop._survival_step())["skill"], "climb_out")
+
+    async def test_tool_break_resolution_requires_current_completion_and_new_tool(self):
+        for invalid in ("missing_pick", "late_break", "partial", "other_world", "owner", "hurt", "sword"):
+            with self.subTest(invalid=invalid):
+                loop, _ = make_loop()
+                state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                         "food": 20, "inventory": {"stone_pickaxe": 1}, "is_night": False}
+
+                async def snapshot():
+                    return state
+
+                loop._state_provider = snapshot
+                loop._set_plan([{"skill": "build_shelter"}])
+                token = loop.register_task_submission("mine_stone", state)
+                loop.bind_task_submission(token, {"task_id": "collect"})
+                if invalid != "late_break":
+                    loop.note_world_event("tool_broken", "我的iron_sword用坏了" if invalid == "sword"
+                                          else "我的wooden_pickaxe用坏了")
+                loop.note_task_result("mine_stone", invalid != "partial", result={"collection_ok": invalid != "partial",
+                    "return_status": {"required": False, "ok": True, "server": state["server"],
+                                      "dimension": state["dimension"]}}, task_id="collect")
+                if invalid == "missing_pick":
+                    state["inventory"] = {}
+                elif invalid == "late_break":
+                    loop.note_world_event("tool_broken", "我的stone_pickaxe用坏了")
+                elif invalid == "other_world":
+                    state["dimension"] = "the_nether"
+                elif invalid == "owner":
+                    loop.note_owner_said("别盖房子，等我")
+                elif invalid == "hurt":
+                    loop.note_world_event("hurt", "被僵尸攻击")
+                before = loop.inbox.entries
+                self.assertFalse(await loop._resolve_completed_tool_breaks())
+                self.assertEqual(loop.inbox.entries, before)
+
+    async def test_owner_arriving_during_pick_verification_keeps_input_barrier(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"stone_pickaxe": 1}, "is_night": False}
+
+        async def snapshot():
+            loop.note_owner_said("不要继续采矿，等我")
+            return state
+
+        loop._state_provider = snapshot
+        token = loop.register_task_submission("mine_stone", state)
+        loop.bind_task_submission(token, {"task_id": "collect"})
+        loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+        loop.note_task_result("mine_stone", True, result={"collection_ok": True,
+            "return_status": {"required": False, "ok": True, "server": state["server"],
+                              "dimension": state["dimension"]}}, task_id="collect")
+        self.assertFalse(await loop._resolve_completed_tool_breaks())
+        self.assertTrue(loop._owner_steer_pending())
+        self.assertTrue(loop.inbox.has_delivery(L.Delivery.STEER))
+
+    async def test_mixed_fifo_notifications_preserve_repaired_collection_followup(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"iron_pickaxe": 1, "cobblestone": 4},
+                 "is_night": False, "position": {"x": 0, "y": 64, "z": 0}}
+        done = asyncio.Event()
+        submitted = []
+
+        async def snapshot():
+            return state
+
+        async def engine(method, params=None, **kwargs):
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            submitted.append(params["skill"])
+            done.set()
+            loop._stopped = True
+            return {"task_id": "next"}
+
+        loop._call, loop._state_provider = engine, snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        loop._set_plan([{"skill": "build_shelter"}])
+        token = loop.register_task_submission("mine_stone", state)
+        loop.bind_task_submission(token, {"task_id": "collect"})
+        loop.note_world_event("player_near", "附近有人经过")
+        loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+        loop.note_world_event("hungry", "刚才挖矿时饿了")
+        loop.note_world_event("tool_broken", "我的stone_pickaxe用坏了")
+        loop.note_task_result("mine_stone", True, result={"collection_ok": True,
+            "return_status": {"required": False, "ok": True, "server": state["server"],
+                              "dimension": state["dimension"]}}, task_id="collect")
+        loop.note_world_event("task_done", "采石完成")
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(done.wait(), timeout=1)
+            self.assertEqual(submitted, ["build_shelter"])
+            for text in ("附近有人经过", "wooden_pickaxe", "刚才挖矿时饿了", "stone_pickaxe", "采石完成"):
+                self.assertIn(text, loop._decision_input_text)
+            self.assertEqual(loop.inbox.entries, [])
+        finally:
+            await loop.stop()
+
+    async def test_mixed_fifo_does_not_hide_fresh_break_or_later_owner(self):
+        for later in ("tool_broken", "owner"):
+            with self.subTest(later=later):
+                loop, _ = make_loop()
+                state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                         "food": 20, "inventory": {"stone_pickaxe": 1}, "is_night": False}
+
+                async def snapshot():
+                    return state
+
+                loop._state_provider = snapshot
+                loop._set_plan([{"skill": "build_shelter"}])
+                token = loop.register_task_submission("mine_stone", state)
+                loop.bind_task_submission(token, {"task_id": "collect"})
+                loop.note_world_event("player_near", "附近有人经过")
+                loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+                loop.note_task_result("mine_stone", True, result={"collection_ok": True,
+                    "return_status": {"required": False, "ok": True, "server": state["server"],
+                                      "dimension": state["dimension"]}}, task_id="collect")
+                loop.note_world_event("task_done", "采石完成")
+                if later == "owner":
+                    loop.note_owner_said("不要盖房子，等我")
+                else:
+                    loop.note_world_event("tool_broken", "我的stone_pickaxe用坏了")
+                before = loop.inbox.entries
+                self.assertFalse(await loop._resolve_completed_tool_breaks())
+                self.assertEqual(loop.inbox.entries, before)
+                self.assertEqual(loop._decision_input_text, "")
+                if later == "owner":
+                    self.assertTrue(loop._owner_steer_pending())
+
+    async def test_resolved_fifo_exposes_control_before_followup_action(self):
+        loop, _ = make_loop()
+        state = {"server": "recovery-fixture", "dimension": "overworld", "health": 20,
+                 "food": 20, "inventory": {"stone_pickaxe": 1}, "is_night": False}
+        order = []
+        done = asyncio.Event()
+        run_control = loop._run_control
+
+        async def snapshot():
+            return state
+
+        def control():
+            order.append("compact")
+            return run_control()
+
+        async def engine(method, params=None, **kwargs):
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            order.append(params["skill"])
+            done.set()
+            loop._stopped = True
+            return {"task_id": "next"}
+
+        loop._call, loop._state_provider, loop._run_control = engine, snapshot, control
+        loop.note_blocked("模型离线", retry_after=120)
+        loop._set_plan([{"skill": "build_shelter"}])
+        token = loop.register_task_submission("mine_stone", state)
+        loop.bind_task_submission(token, {"task_id": "collect"})
+        loop.note_world_event("tool_broken", "我的wooden_pickaxe用坏了")
+        loop.note_task_result("mine_stone", True, result={"collection_ok": True,
+            "return_status": {"required": False, "ok": True, "server": state["server"],
+                              "dimension": state["dimension"]}}, task_id="collect")
+        loop.inbox.push("compact", "整理记忆")
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(done.wait(), timeout=1)
+            self.assertEqual(order, ["compact", "build_shelter"])
+        finally:
+            await loop.stop()
+
+    async def test_other_skill_failure_cooldown_cannot_block_food_or_plan(self):
+        await self._run_food_then_plan(failures=True)
+
+    async def test_model_outage_empty_plan_stops_repeating_failed_supply(self):
+        loop, calls = make_loop()
+        attempts = 0
+
+        async def snapshot():
+            return {"health": 20, "food": 0, "is_night": False, "inventory": {"wheat": 9}}
+
+        async def engine(method, params=None, **kwargs):
+            nonlocal attempts
+            calls.append((method, params))
+            if method == "task.list":
+                return {"current": None, "queued": 0}
+            attempts += 1
+            raise RuntimeError("没有可用工作台")
+
+        loop._call = engine
+        loop._state_provider = snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.sleep(0.12)
+            self.assertEqual(attempts, 2)
+            self.assertEqual(loop._failure_counts(), {"cook_food": 2})
+            self.assertEqual(loop.current_hold(), L.Hold.BLOCKED)
+        finally:
+            await loop.stop()
+
+    async def test_rule_actions_keep_owner_dead_disconnect_and_engine_guards(self):
+        for hold in ("pause", "dead", "disconnect", "engine"):
+            with self.subTest(hold=hold):
+                loop, calls = make_loop()
+                loop.note_blocked("模型离线", retry_after=120)
+                if hold == "pause":
+                    loop.pause(reason="主人急停", max_seconds=0)
+                elif hold == "dead":
+                    loop.note_dead(True)
+                elif hold == "disconnect":
+                    loop._is_connected = lambda: False
+                else:
+                    loop.note_engine_up(False)
+                await loop._act(L.LifeDecision(activity="补给", drive=None, skill="cook_food"), allow_model_block=True)
+                self.assertEqual(calls, [])
+
+    async def test_pause_during_rule_action_callback_prevents_submission(self):
+        loop, calls = make_loop()
+        loop.note_blocked("模型离线", retry_after=120)
+
+        async def callback(decision):
+            loop.pause(reason="主人急停", max_seconds=0)
+
+        loop._on_activity = callback
+        await loop._act(L.LifeDecision(activity="补给", drive=None, skill="cook_food"), allow_model_block=True)
+        self.assertFalse(any(method == "skill.run" for method, _ in calls))
+        self.assertTrue(loop.paused)
+
+    async def test_hurt_input_supplies_before_model_but_preserves_event(self):
+        loop, calls = make_loop()
+        submitted = asyncio.Event()
+
+        async def snapshot():
+            return {"health": 8, "food": 0, "inventory": {"wheat": 9, "crafting_table": 1}}
+
+        async def engine(method, params=None, **kwargs):
+            calls.append((method, params))
+            if method == "skill.run":
+                submitted.set()
+                loop._stopped = True
+                return {"task_id": "t1"}
+            return {"current": None, "queued": 0}
+
+        loop._call = engine
+        loop._state_provider = snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        loop.note_world_event("hurt", "被僵尸打了，剩8血", urgent=True)
+        loop._wake.set()
+        loop.start()
+        try:
+            await asyncio.wait_for(submitted.wait(), timeout=1)
+            self.assertEqual([p["skill"] for m, p in calls if m == "skill.run"], ["cook_food"])
+            self.assertIn("被僵尸打了", loop._decision_input_text)
+            self.assertEqual(loop.current_hold(), L.Hold.BLOCKED)
+        finally:
+            await loop.stop()
+
+    async def test_owner_input_remains_barrier_during_model_outage(self):
+        loop, calls = make_loop()
+
+        async def snapshot():
+            return {"health": 20, "food": 0, "inventory": {"wheat": 9}}
+
+        loop._state_provider = snapshot
+        loop.note_blocked("模型离线", retry_after=120)
+        loop.note_owner_said("Alice：先停下，回来")
+        loop.start()
+        try:
+            await asyncio.sleep(0.04)
+            self.assertFalse(any(method == "skill.run" for method, _ in calls))
+            self.assertTrue(loop._owner_steer_pending())
+        finally:
+            await loop.stop()
+
+    def test_skill_cooldown_restricts_only_failed_skill(self):
+        loop, _ = make_loop()
+        with patch.object(L.time, "time", return_value=1000):
+            for _ in range(3):
+                loop.note_task_result("mine_stone", False, "缺镐")
+            self.assertFalse(loop.skill_retry_ready("mine_stone"))
+            self.assertTrue(loop.skill_retry_ready("chop_tree"))
+            self.assertTrue(loop.skill_retry_ready("cook_food"))
+        with patch.object(L.time, "time", return_value=1031):
+            self.assertTrue(loop.skill_retry_ready("mine_stone"))
+
+    def test_world_urgency_does_not_reset_skill_cooldown(self):
+        loop, _ = make_loop()
+        with patch.object(L.time, "time", return_value=1000):
+            for _ in range(3):
+                loop.note_task_result("mine_stone", False, "缺镐")
+            self.assertFalse(loop.skill_retry_ready("mine_stone"))
+            for kind in ("hurt", "danger", "hungry", "tool_broken"):
+                loop.note_world_event(kind, "世界情况变了", urgent=True)
+                self.assertFalse(loop.skill_retry_ready("mine_stone"))
+                self.assertTrue(loop.skill_retry_ready("cook_food"))
+                self.assertEqual(loop._failure_cooldowns["mine_stone"], 1030)
+            loop.note_owner_said("Alice：工具换好了，再挖一次")
+            self.assertTrue(loop.skill_retry_ready("mine_stone"))
+
     async def test_survival_step_preserves_plan_and_resumes_after_eating(self):
         loop, calls = make_loop()
         state = {"inventory": {"bread": 3}, "food": 4, "health": 20}
@@ -104,7 +1015,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         loop._set_plan([{"skill": "mine_stone"}])
         self.assertEqual((await loop._survival_step())["skill"], "store_items")
         self.assertEqual(loop._plan[0]["skill"], "mine_stone")
-        loop._set_plan([{"skill": "make_tools", "params": {"tier": "stone"}}])
+        loop._set_plan([{"skill": "make_tools", "params": {"tier": "stone", "kinds": ["pickaxe"]}}])
         self.assertIsNone(await loop._survival_step())
 
     async def test_missing_snapshot_does_not_invent_survival_tasks(self):
@@ -195,6 +1106,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             if count <= 2:
                 raise RuntimeError("端点暂时失败")
             self.assertTrue(loop.may_act())
+            loop._decision_model_ok = True
             recovered.set()
             loop._stopped = True
             return True
@@ -252,7 +1164,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 loop._stopped = True
                 return True
 
-            async def act(decision):
+            async def act(decision, **kwargs):
                 executed.append(decision.skill)
                 done.set()
                 loop._stopped = True

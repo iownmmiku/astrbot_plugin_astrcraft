@@ -52,6 +52,10 @@ def make_loop(*, connected=True, engine_up=True):
     """
     loop = LifeLoop.__new__(LifeLoop)
     loop._dead = False
+    loop._mining_return = None
+    loop._return_task_attempt = None
+    loop._return_control_generation = 0
+    loop._return_boundary_state = {}
     loop._engine_up = engine_up
     loop._blocked_reason = ""
     loop._paused = False

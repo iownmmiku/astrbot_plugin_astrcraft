@@ -25,8 +25,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -78,6 +80,19 @@ EXCLUDED_TOOLS = (
 # 步数不再被浪费——多出来的两步留给"先查看再决定"这种正常情况。
 # 而且每一步都是一次模型往返（几秒），上限仍然不能大。
 MAX_STEPS = 6
+
+# 观察只为补足下一步的事实。预算包含重复请求；命中缓存也不能无限问模型。
+MAX_OBSERVATIONS = 2
+READ_ONLY_TOOLS = {
+    "mc_status", "mc_inventory", "mc_scan", "mc_plan_route", "mc_inspect_block",
+    "mc_scan_entities", "mc_check_danger", "mc_world_info", "mc_players", "mc_skills",
+    "mc_her_memories", "mc_goal_status", "mc_todo_read", "mc_load_skill",
+    "mc_knowledge_search", "mc_her_persona", "mc_persona_list", "mc_her_wish",
+    "mc_whats_she_doing",
+}
+# 背包可由真实快照完整核对；地形、远处实体、笔记等没有完备更新版本，
+# 因此其余观察只在同一批调用内复用，不能跨模型往返沿用旧结果。
+CROSS_ROUND_READS = {"mc_inventory"}
 
 # 提示词里要提到"最多几步"。**用一个占位符，不要硬编码数字。**
 #
@@ -146,8 +161,9 @@ ACTION_PROMPT = """你现在正在 Minecraft 里自己过日子，没有人在�
 而且技能内部会自己处理"材料不够 → 先去拿"这种依赖。
 你只有 {{MAX_STEPS}} 步，拿原语拼是拼不完一件完整的事的——**结果是忙了半天什么都没做成。**
 
-**最重要的规则：查看不要超过 2 次，然后必须动手。**
+**查看通常不超过 2 次；相同状态下重复查看会复用结果，观察预算用完就必须收尾。**
 （每一步都是一次模型往返，你要站着等好几秒。看一眼就够，别把时间花在反复确认上。）
+已有事实足够时安排下一步；事实不足或没有安全做法时说明缺少什么，不要为了动手而猜。
 
 其他规则：
 - 需要事实就先看（mc_status / mc_inventory / mc_scan / mc_scan_entities），不要凭印象猜。
@@ -207,6 +223,7 @@ class _ActionEvent:
 
     def __init__(self, umo: str = ""):
         self.unified_msg_origin = umo or "mc-autonomy"
+        self.astrcraft_autonomous = True
 
     def get_plain_text(self) -> str:
         return ""
@@ -221,6 +238,8 @@ class ActionAgent:
     def __init__(self, plugin):
         self.plugin = plugin
         self.max_steps = MAX_STEPS
+        self.max_observations = MAX_OBSERVATIONS
+        self.last_timing: dict[str, Any] = {}
 
     # ------------------------------------------------------------ 工具集
 
@@ -288,6 +307,92 @@ class ActionAgent:
     # ------------------------------------------------------------ 主入口
 
     async def act(self, *, prompt: str, system: str, umo: str = "") -> tuple[str | None, list[str]]:
+        """执行一轮，并留下包含取消/异常路径的独立模型、工具和状态检查计时。"""
+        timing = {
+            "provider_seconds": 0.0, "tool_seconds": 0.0,
+            "state_check_seconds": 0.0, "preparation_seconds": 0.0,
+            "total_seconds": 0.0, "other_seconds": 0.0,
+            "provider_calls": 0, "tool_calls": 0, "tool_requests": 0,
+            "read_cache_hits": 0, "observation_requests": 0,
+            "observation_budget_rejections": 0, "duplicate_actions_blocked": 0,
+            "body_attempts": 0, "exit_reason": "running",
+        }
+        started = time.perf_counter()
+        try:
+            return await self._act_round(prompt=prompt, system=system, umo=umo, timing=timing)
+        except asyncio.CancelledError:
+            timing["exit_reason"] = "cancelled"
+            raise
+        except Exception:
+            timing["exit_reason"] = "error"
+            raise
+        finally:
+            timing["total_seconds"] = time.perf_counter() - started
+            measured = sum(timing[key] for key in (
+                "provider_seconds", "tool_seconds", "state_check_seconds", "preparation_seconds",
+            ))
+            timing["other_seconds"] = max(0.0, timing["total_seconds"] - measured)
+            self.last_timing = timing
+
+    def _read_key(self, name: str, args: dict) -> str | None:
+        """使用实际 handler 的默认参数归一化，不把不同坐标/数量混成一次观察。"""
+        try:
+            manager = self._manager()
+            func = manager.get_func(name) if manager is not None else None
+            handler = getattr(func, "handler", None)
+            normalized = args
+            if handler is not None:
+                signature = inspect.signature(_bind_if_needed(handler, self.plugin))
+                bound = signature.bind(_ActionEvent(), **args)
+                bound.apply_defaults()
+                normalized = dict(bound.arguments)
+                normalized.pop(next(iter(signature.parameters)), None)
+            def canonical(value):
+                if isinstance(value, dict):
+                    return {key: canonical(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [canonical(item) for item in value]
+                if isinstance(value, float) and value.is_integer():
+                    return int(value)
+                return value
+            return json.dumps([name, canonical(normalized)], sort_keys=True, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, StopIteration):
+            # 参数不符合 handler 签名时交给原执行路径报告；不能沿用另一次调用的结果。
+            return None
+
+    async def _observation_state(self, timing: dict, name: str) -> str | None:
+        """缓存命中前确认真实状态；不可读取时不复用旧观察。"""
+        engine = getattr(self.plugin, "engine", None)
+        if engine is None or not callable(getattr(engine, "call", None)):
+            return None
+        started = time.perf_counter()
+        try:
+            state = await engine.call("state.get", {"detail": "normal"}, timeout=2.0)
+            if not isinstance(state, dict) or not state.get("connected"):
+                return None
+            if name in CROSS_ROUND_READS:
+                inventory = state.get("inventory_summary")
+                if not isinstance(inventory, dict) or not isinstance(inventory.get("entries"), list):
+                    return None
+                # 背包结果不依赖不断前进的世界时钟；保留物品、手持、地点与会话。
+                # 摘要 entries 覆盖 36 格主背包的物品种类，不能只比较总物品数。
+                state = {key: state.get(key) for key in (
+                    "connected", "position", "dimension", "server", "version",
+                    "inventory_summary", "held_item",
+                )}
+            life = getattr(self.plugin, "life", None)
+            return json.dumps(
+                [id(engine), getattr(self.plugin, "_brief_revision", 0),
+                 getattr(life, "_plan_revision", 0), state],
+                sort_keys=True, ensure_ascii=False, allow_nan=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("无法确认观察缓存状态，重新读取：%s", exc)
+            return None
+        finally:
+            timing["state_check_seconds"] += time.perf_counter() - started
+
+    async def _act_round(self, *, prompt: str, system: str, umo: str, timing: dict) -> tuple[str | None, list[str]]:
         """跑一轮自主行动。
 
         @return (模型最后的总结文本, 调用过的工具名列表)
@@ -297,30 +402,48 @@ class ActionAgent:
         plugin = self.plugin
         life = getattr(plugin, "life", None)
         initial_revision = getattr(life, "_plan_revision", 0)
+        preparation_started = time.perf_counter()
         try:
             provider = await plugin.context.get_using_provider_async()
         except Exception as exc:  # noqa: BLE001
             logger.info("取 provider 失败：%s", exc)
             provider = None
+        finally:
+            timing["preparation_seconds"] += time.perf_counter() - preparation_started
         if provider is None:
+            timing["exit_reason"] = "unavailable"
             return None, []
         if initial_revision != getattr(life, "_plan_revision", 0):
+            timing["exit_reason"] = "state_changed"
             return "（环境已改变，重新观察后再安排）", []
 
-        toolset = self._toolset()
+        preparation_started = time.perf_counter()
+        try:
+            toolset = self._toolset()
+        finally:
+            timing["preparation_seconds"] += time.perf_counter() - preparation_started
         if toolset is None:
+            timing["exit_reason"] = "unavailable"
             return None, []
 
         contexts: list[Message] = [Message(role="user", content=prompt)]
         event = _ActionEvent(umo)
         used: list[str] = []
+        read_cache: dict[tuple, str] = {}
+        attempted_actions: set[str] = set()
+        observations = 0
+        budget = max(1, int(getattr(self, "max_observations", MAX_OBSERVATIONS)))
 
-        for _ in range(self.max_steps):
+        for round_index in range(self.max_steps):
             life = getattr(plugin, "life", None)
             plan_revision = getattr(life, "_plan_revision", 0)
             pending_before = getattr(life, "_pending_plan", None)
             if pending_before:
+                timing["exit_reason"] = "plan_ready"
                 return "（收到新的计划，先按最新安排做）", used
+            provider_started = time.perf_counter()
+            owner_generation = getattr(life, "_decision_owner_generation", 0)
+            timing["provider_calls"] += 1
             try:
                 resp = await provider.text_chat(
                     contexts=list(contexts),
@@ -331,32 +454,15 @@ class ActionAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自主行动的模型调用失败：%s", exc)
                 # 调用失败要传给恢复回路，不能伪装成代理不可用后再烧一次模型请求。
-                if not any(tool_changes_body(name, {}) for name in used):
+                if not timing["body_attempts"]:
                     raise RuntimeError(f"自主行动模型调用失败：{exc}") from exc
+                timing["exit_reason"] = "provider_failed_after_action"
                 return "（模型调用失败，已执行的动作先保留）", used
+            finally:
+                timing["provider_seconds"] += time.perf_counter() - provider_started
 
-            life = getattr(plugin, "life", None)
-            if plan_revision != getattr(life, "_plan_revision", 0):
-                # 重连或计划被撤销后，旧模型响应不属于现在的会话。
-                return "（环境已改变，重新观察后再安排）", used
-            if (life is not None and getattr(life, "_pending_plan", None)
-                    and life._pending_plan is not pending_before):
-                # 玩家在模型思考期间写了计划，旧响应不能再覆盖它或提交旧动作。
-                return "（收到新的计划，先按最新安排做）", used
-            if life is not None and life.inbox.has_delivery(Delivery.STEER):
-                fresh = life._drain_steer_text()
-                if fresh:
-                    life.clear_plan("模型思考期间收到新输入")
-                    life._decision_input_text = "\n".join(
-                        text for text in (getattr(life, "_decision_input_text", ""), fresh) if text
-                    )
-                    # 这次响应还没执行工具，可安全丢弃旧决定并重新读最新情况。
-                    contexts.append(Message(role="user", content=fresh))
-                    continue
-
-            # **记一次用量**（W6）。每一步都是一次模型往返，所以每一轮都要记——
-            # 只记最后一步的话，"一次决策花多少 token"会严重低估
-            # （6 步就是 6 次往返）。
+            # 收到响应就记费用；环境变化后丢弃的决定也已经消耗 token。
+            # 每一步都记，不能只记本轮最后的总结或真正执行了工具的响应。
             try:
                 from .tokens import ledger
 
@@ -373,12 +479,51 @@ class ActionAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("记录用量失败（不影响主流程）：%s", exc)
 
+            life = getattr(plugin, "life", None)
+            if plan_revision != getattr(life, "_plan_revision", 0):
+                # 重连或计划被撤销后，旧模型响应不属于现在的会话。
+                timing["exit_reason"] = "state_changed"
+                return "（环境已改变，重新观察后再安排）", used
+            if (life is not None and getattr(life, "_pending_plan", None)
+                    and life._pending_plan is not pending_before):
+                # 玩家在模型思考期间写了计划，旧响应不能再覆盖它或提交旧动作。
+                timing["exit_reason"] = "plan_ready"
+                return "（收到新的计划，先按最新安排做）", used
+            if life is not None and life.inbox.has_delivery(Delivery.STEER):
+                # 与生活循环的边界处理一致：主人可以要求重新尝试失败技能。
+                # 先消费这次覆盖，再取走输入，否则提交工具时已看不到主人指令。
+                owner_pending = getattr(life, "_owner_steer_pending", None)
+                consume_retry_override = getattr(life, "_should_back_off", None)
+                if callable(owner_pending) and owner_pending() and callable(consume_retry_override):
+                    consume_retry_override()
+                fresh = life._drain_steer_text()
+                if fresh:
+                    retain = getattr(life, "_retain_decision_input", None)
+                    if callable(retain):
+                        retain(fresh)
+                    else:
+                        life._decision_input_text = "\n".join(
+                            text for text in (getattr(life, "_decision_input_text", ""), fresh) if text
+                        )
+                    life.clear_plan("模型思考期间收到新输入")
+                    # 这次响应还没执行工具，可安全丢弃旧决定并重新读最新情况。
+                    contexts.append(Message(role="user", content=fresh))
+                    read_cache.clear()
+                    observations = 0
+                    continue
+
+            # Only an accepted response can acknowledge the owner input it saw.
+            # Later failed/discarded replies retain the last accepted generation.
+            timing["decision_revision"] = plan_revision
+            timing["owner_generation"] = owner_generation
+
             names = list(getattr(resp, "tools_call_name", None) or [])
             args_list = list(getattr(resp, "tools_call_args", None) or [])
             ids = list(getattr(resp, "tools_call_ids", None) or [])
 
             if not names:
                 text = getattr(resp, "completion_text", None) or ""
+                timing["exit_reason"] = "completed"
                 return (str(text).strip() or None), used
 
             # 回显工具调用（字段名照 game_agent 的正确写法）
@@ -393,8 +538,11 @@ class ActionAgent:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("回显工具调用失败（不影响执行）：%s", exc)
 
+            budget_rejected = False
+            wrote_in_batch = False
             for idx, nm in enumerate(names):
                 if plan_revision != getattr(life, "_plan_revision", 0):
+                    timing["exit_reason"] = "state_changed"
                     return "（环境已改变，重新观察后再安排）", used
                 a = args_list[idx] if idx < len(args_list) else {}
                 if not isinstance(a, dict):
@@ -404,13 +552,74 @@ class ActionAgent:
                         a = {}
                 call_id = ids[idx] if idx < len(ids) else f"call_{idx}"
                 used.append(nm)
-                logger.info("她自己动手：%s(%s)", nm, json.dumps(a, ensure_ascii=False)[:80])
-                out = await self._execute(nm, a, event)
+                timing["tool_requests"] += 1
+                if not isinstance(a, dict):
+                    contexts.append(ToolCallMessageSegment(
+                        role="tool", tool_call_id=call_id, content="error: 工具参数必须是 JSON 对象",
+                    ))
+                    continue
+                is_read = nm in READ_ONLY_TOOLS or (nm == "mc_chest" and a.get("action") == "list")
+                changes_body = tool_changes_body(nm, a)
+                key = self._read_key(nm, a)
+                if is_read:
+                    timing["observation_requests"] += 1
+                    if observations >= budget:
+                        timing["observation_budget_rejections"] += 1
+                        budget_rejected = True
+                        contexts.append(ToolCallMessageSegment(
+                            role="tool", tool_call_id=call_id,
+                            content="观察预算已用完；请根据已有事实安排安全的下一步，或说明缺少什么并结束。本次没有再次查询世界。",
+                        ))
+                        continue
+                    observations += 1
+                    state_before = await self._observation_state(timing, nm) if key is not None else None
+                    if plan_revision != getattr(life, "_plan_revision", 0):
+                        timing["exit_reason"] = "state_changed"
+                        return "（环境已改变，重新观察后再安排）", used
+                    cache_key = (key, state_before, None if nm in CROSS_ROUND_READS else round_index)
+                    if state_before is not None and cache_key in read_cache:
+                        timing["read_cache_hits"] += 1
+                        out = read_cache[cache_key]
+                        logger.debug("复用本轮相同状态下的观察：%s", nm)
+                    else:
+                        started = time.perf_counter()
+                        timing["tool_calls"] += 1
+                        try:
+                            out = await self._execute(nm, a, event)
+                        finally:
+                            timing["tool_seconds"] += time.perf_counter() - started
+                        state_after = await self._observation_state(timing, nm) if state_before is not None else None
+                        if state_before is not None and state_before == state_after and not str(out).startswith("error:"):
+                            read_cache[cache_key] = str(out)
+                else:
+                    # 清单/知识写入也会让旧观察失效，不能误当作只读工具缓存。
+                    read_cache.clear()
+                    action_key = key or json.dumps([nm, a], sort_keys=True, ensure_ascii=False)
+                    if changes_body and action_key in attempted_actions:
+                        timing["duplicate_actions_blocked"] += 1
+                        contexts.append(ToolCallMessageSegment(
+                            role="tool", tool_call_id=call_id,
+                            content="error: 本轮已经尝试过这个动作，不会再次执行。请读取已有结果并换一种做法。",
+                        ))
+                        continue
+                    if changes_body:
+                        timing["body_attempts"] += 1
+                        attempted_actions.add(action_key)
+                    observations = 0
+                    wrote_in_batch = True
+                    logger.info("她自己动手：%s(%s)", nm, json.dumps(a, ensure_ascii=False)[:80])
+                    started = time.perf_counter()
+                    timing["tool_calls"] += 1
+                    try:
+                        out = await self._execute(nm, a, event)
+                    finally:
+                        timing["tool_seconds"] += time.perf_counter() - started
                 contexts.append(
                     ToolCallMessageSegment(role="tool", tool_call_id=call_id, content=str(out))
                 )
-                if nm == "mc_plan_do" and life is not None and getattr(life, "_pending_plan", []):
+                if life is not None and getattr(life, "_pending_plan", []):
                     logger.info("她已经交代完整计划，立即交给生活循环连续执行")
+                    timing["exit_reason"] = "plan_ready"
                     return "（安排好了，按顺序开始做）", used
                 # **提交了长任务就立刻结束这一轮——在代码里强制，不能只写在提示词里。**
                 #
@@ -425,7 +634,18 @@ class ActionAgent:
                 # 于是这个提前结束**永远不会触发**。
                 if "任务号" in str(out) or "task_id" in str(out):
                     logger.info("她提交了长任务（%s），这一轮到此为止", nm)
+                    timing["exit_reason"] = "task_submitted"
                     return "（已经交代下去了，等它跑完）", used
 
+            if budget_rejected and not wrote_in_batch:
+                timing["exit_reason"] = "observation_budget"
+                return "（观察预算已用完；本轮未再查询或猜测动作，等待补足事实后重新安排）", used
+            if observations >= budget:
+                # 放在整批 tool 消息之后，保持 assistant/tool 调用配对完整。
+                contexts.append(Message(
+                    role="user", content="本轮观察预算已用完。已有事实足够就安排安全的下一步；不足就说明缺少什么并结束，不要继续重复查询。",
+                ))
+
         logger.warning("自主行动超过 %s 步，收尾", self.max_steps)
+        timing["exit_reason"] = "step_limit"
         return "（这一轮做了不少事，先停一下）", used

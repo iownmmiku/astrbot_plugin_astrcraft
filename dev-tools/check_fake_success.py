@@ -32,7 +32,7 @@
 
 **不许把没看过的嫌疑塞进 EXEMPT。** 每条理由都要能说出
 「为什么这里不判返回值」或「true 是在哪判出来的」。
-以下 22 条是**逐条读了上下文/契约**后写的（含 actions.craft 的
+以下条目是**逐条读了上下文/契约**后写的（含 actions.craft 的
 `{ok: produced>0}` 契约、deposit 的「失败必抛」契约、各函数的 false 分支条件）。
 """
 
@@ -51,15 +51,19 @@ KEEP = 92
 # (规则, 文件名, 块内须含子串, 块内须不含子串或空) → 复核理由
 # 「块」= 命中行 + 其后 3 行（多行 skillResult 的 note/param 都在这个范围里）
 EXEMPT: dict[tuple[str, str, str, str], str] = {
-    # ============ 规则 A：动作返回值没人接（2 条，都是「故意不接、用状态判」的正例） ============
+    # ============ 规则 A：动作返回值没人接（3 条，都是「故意不接、用状态判」的正例） ============
     ("A", "building.js", "item: 'chest', count: 1", ""):
         "下一行 chestCount=countItem('chest') 验产出、steps.ok=chestCount>0 —— 判据是实际状态，故意不接返回值",
     ("A", "building.js", "_bed`", ""):
         "下一行 bed=BEDS.find(countItem>0) 验产出、steps.ok=!!bed —— 同上，状态判据",
+    ("A", "mining.js", "item: 'crafting_table', count: 1", ""):
+        "本分支先确认背包无工作台，合成后用实际 countItem('crafting_table')>0 验产出，随后 _ensureCraftingTable 核验放置。test_smelt_control 覆盖不产出及放台失败，Paper collection 验证实际台炉铁锭链",
 
-    # ============ 规则 B：skillResult(true)（20 条） ============
-    ("B", "building.js", "庇护所建好了", ""):
-        "逐项失败在前面各自 return false / 记入 out.skipped；extras 由 door/chest/bed 的实际状态拼出 —— note 如实列「有什么」",
+    # ============ 规则 B：skillResult(true) ============
+    ("B", "building.js", "home_status: status, slept, sleep_result: sleepResult, waited_ms: waitedMs", ""):
+        "returnHome 末次 inspectHome 后先以 !status.safe 返回失败；safe 要求真实人在完整房内、门关闭且无室内敌人/水火危险。导航假到达、未确认关门、休息中屋顶被拆均不能到达 true；test_home_control 验证这些失败分支，slept/waited_ms 如实描述可选休息结果",
+    ("B", "building.js", "已从基地实际出门并确认门已关闭，可以继续工作", ""):
+        "leaveHome 实际穿门后核验身体位于安全门外、房屋完整且上下半门关闭；导航假到达、落脚点变化、预算或关门失败均不能到达 true。test_storage_memory 验证失败边界，Paper test_home_live 验证出屋后继续实际采石",
 
     ("B", "gathering.js", "背包里已经有", ""):
         "上 3 行 if (already >= target) 才 return —— countItem 实数 >= 目标",
@@ -67,8 +71,8 @@ EXEMPT: dict[tuple[str, str, str, str], str] = {
         "死分支：planFor 从不返回 type=have（只有 chop/mine/craft/smelt/hunt/mine_any/unknown）—— unreachable，不是谎报（可顺手删）",
     ("B", "gathering.js", "[item]: r.produced", ""):
         "上一块是本轮加的 if (!r.ok) return false —— craft 静默不产出（ok:false）时到不了这",
-    ("B", "gathering.js", "已把 ${r.total} 个物品存进箱子", ""):
-        "deposit 契约：失败必抛（catch→false）；actions.js:1965 只有 return {ok:true,stored,total} —— note/consumed 是它报的真实数字（存 0 个也如实写 0）",
+    ("B", "gathering.js", "steps, consumed: stored", ""):
+        "只有stored正数总和>0才成功；Actions.deposit用重新打开的服务端容器快照核验背包减少与容器增加，并裁剪部分转移。test_storage_memory覆盖无操作、单边变化、迟到拒绝和部分存入；Paper实际箱子/桶验收",
     ("B", "gathering.js", "已经有 ${cookedHave} 份熟食", ""):
         "上一行 cookedHave=countItem 求和后 >= count 才 return",
 
@@ -84,8 +88,6 @@ EXEMPT: dict[tuple[str, str, str, str], str] = {
         "gained:{} + arrived:true 如实说明「走到了但没捡到」",
     ("B", "index.js", "捡回来了：", ""):
         "produced=got 来自实际拾取计数（空集合走上一条「走到了但没捡到」分支）",
-    ("B", "index.js", "补给完成", ""):
-        "produced 的每个数字都来自已验证的子流程：makeTools 自验产出、火把本轮加了 if (!torchR8.ok) 判据",
     ("B", "index.js", "action: 'interact'", ""):
         "actions.interactEntity 失败必抛 ActionError（无目标/距离>3/中断，actions.js:1830）—— true 只在正常返回后；note 是真实结果",
     ("B", "index.js", "action: 'shield'", ""):

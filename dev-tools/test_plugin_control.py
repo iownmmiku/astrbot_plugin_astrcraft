@@ -129,6 +129,38 @@ async def results(generator):
 
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_skill_is_interruption_without_failure_backoff(self):
+        from test_life_recovery import make_loop
+        p = plugin()
+        loop, _ = make_loop()
+        p.life = loop
+        p.config["announce_task_done"] = False
+        loop._set_plan([{"skill": "mine_stone"}, {"skill": "make_tools"}])
+        for reason in ("主人叫停了", "紧急后撤抢占", "新目标替换旧动作"):
+            await p._on_task_finished({"kind": "skill", "name": "挖石头", "status": "cancelled",
+                                       "error": reason, "meta": {"skill": "mine_stone"}})
+        self.assertEqual(loop._failure_counts(), {})
+        self.assertFalse(loop._should_back_off())
+        self.assertEqual(loop._plan, [])
+        self.assertTrue(all(e.get("cancelled") for e in loop._recent_outcomes))
+        self.assertTrue(all(e.type == "task_cancelled" for e in loop.inbox.entries))
+        self.assertIn("→ 中断", loop._render_recent())
+        self.assertNotIn("→ 没做成", loop._render_recent())
+        self.assertEqual(loop._render_progress_since(time.time() - 60), "")
+
+    async def test_true_failed_skill_still_builds_failure_memory(self):
+        from test_life_recovery import make_loop
+        p = plugin()
+        loop, _ = make_loop()
+        p.life = loop
+        p.config["announce_task_done"] = False
+        for _ in range(3):
+            await p._on_task_finished({"kind": "skill", "name": "挖石头", "status": "failed",
+                                       "error": "没有镐子", "meta": {"skill": "mine_stone"}})
+        self.assertEqual(loop._failure_counts(), {"mine_stone": 3})
+        self.assertFalse(loop.skill_retry_ready("mine_stone"))
+        self.assertTrue(loop.skill_retry_ready("cook_food"))
+
     async def test_survival_snapshot_preserves_zero_and_observed_animals(self):
         p = plugin()
 
@@ -151,6 +183,47 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         p.config["announce_task_done"] = False
         await p._on_task_finished({"kind": "skill", "name": "吃饱", "status": "done", "meta": {"skill": "eat"}})
         self.assertEqual(p.life.task_results[-1][0], "eat")
+
+    async def test_mining_physical_return_result_and_task_id_reach_real_loop(self):
+        from test_life_recovery import make_loop
+        p = plugin()
+        loop, _ = make_loop()
+        p.life = loop
+        p.config["announce_task_done"] = False
+        received = []
+        loop.note_task_result = lambda *args, **kwargs: received.append((args, kwargs))
+        status = {"required": True, "ok": False, "target": None, "position": {"x": 0, "y": 60, "z": 0},
+                  "server": "127.0.0.1:25566", "dimension": "overworld", "reason": "井壁不可挖"}
+        result = {"ok": False, "collection_ok": True, "produced": {"coal": 2}, "return_status": status}
+        await p._on_task_finished({"kind": "skill", "task_id": "mine-return-1", "name": "挖矿", "status": "failed",
+                                   "meta": {"skill": "mine_ores"}, "result": result, "error": status["reason"]})
+        self.assertEqual(received[0][0][0], "mine_ores")
+        self.assertIs(received[0][1]["result"], result)
+        self.assertEqual(received[0][1]["task_id"], "mine-return-1")
+
+    async def test_survival_snapshot_forwards_fresh_return_safety(self):
+        p = plugin()
+        safety = {"safe": False, "loaded": True, "on_ground": True, "underground": True}
+
+        async def call(method, params=None, **kwargs):
+            return {"mining_return_safety": safety, "position": {"x": 0, "y": 60, "z": 0}} if method == "state.get" else {"items": {"coal": 2}}
+
+        p.engine.call = call
+        state = await p._life_state_snapshot()
+        self.assertIs(state["mining_return_safety"], safety)
+        self.assertEqual(state["position"]["y"], 60)
+
+    async def test_disconnected_cached_terrain_is_not_fresh_return_evidence(self):
+        p = plugin()
+        for field in ("connected", "ready"):
+            async def call(method, params=None, **kwargs):
+                return {field: False, "health": 20, "food": 20, "position": {"x": 0, "y": 64, "z": 0},
+                        "mining_return_safety": {"safe": True, "loaded": True, "on_ground": True, "underground": False}}
+
+            p.engine.call = call
+            state = await p._life_state_snapshot()
+            self.assertNotIn("position", state)
+            self.assertNotIn("mining_return_safety", state)
 
     async def test_respawn_releases_dead_before_delayed_death_notice_finishes(self):
         p = plugin()
@@ -179,6 +252,39 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(p.life._dead, "晚到死亡通知不能重新锁住已经重生的机器人")
         self.assertEqual(len(p.life.deaths), 1)
         self.assertTrue(p.life.wakes)
+
+    async def test_world_lifecycle_rejects_stale_ready_respawn_and_death(self):
+        from test_life_recovery import make_loop
+
+        p = plugin()
+        p.life, _ = make_loop()
+        p.life._todos = [{"text": "补回死亡物品", "done": False}]
+        p.life.pause(reason="主人暂停", max_seconds=0)
+        p.life.note_blocked("模型离线", retry_after=120)
+        p.life._set_plan([{"skill": "mine_ores", "params": {"ore": "iron"}}])
+        old_revision = p.life._plan_revision
+        await p._on_bot_world_changed({"lifecycle_id": 2, "from_dimension": "overworld", "dimension": "the_nether"})
+        self.assertGreater(p.life._plan_revision, old_revision)
+        self.assertEqual(p.life._plan, [])
+        self.assertTrue(p.life._world_changing)
+        self.assertFalse(p.life.may_act(allow_model_block=True))
+        await p._on_bot_world_ready({"lifecycle_id": 1, "dimension": "overworld"})
+        self.assertTrue(p.life._world_changing)
+        await p._on_bot_respawn({"lifecycle_id": 1})
+        self.assertTrue(p.life._world_changing)
+        await p._on_bot_world_ready({"lifecycle_id": 2, "dimension": "the_nether"})
+        self.assertFalse(p.life._world_changing)
+        self.assertTrue(p.life.paused)
+        self.assertEqual(p.life._blocked_reason, "模型离线")
+        self.assertEqual(p.life._todos[0]["text"], "补回死亡物品")
+        self.assertFalse(p.life._dead)
+        await p._on_bot_death({"lifecycle_id": 1})
+        self.assertFalse(p.life._dead)
+        p.life.note_dead(True)
+        await p._on_bot_respawn({"lifecycle_id": 1})
+        self.assertTrue(p.life._dead)
+        await p._on_bot_respawn({"lifecycle_id": 3})
+        self.assertFalse(p.life._dead)
 
     async def test_brief_cache_refreshes_on_respawn_and_disconnect(self):
         p = plugin()

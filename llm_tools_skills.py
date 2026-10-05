@@ -623,12 +623,67 @@ class McSkillTools:
             return event.plain_result("机器人还没进服，先让它进服再安排它干活。")
         if getattr(self, "_emergency_stopped", False):
             return event.plain_result("机器人处于急停状态，请先由主人用 /mc继续 恢复。")
+        life = getattr(self, "life", None)
+        protection_state = getattr(life, "_return_boundary_state", {}) if life is not None else {}
+        if getattr(event, "astrcraft_autonomous", False) and life is not None:
+            if not life.may_act():
+                return event.plain_result(f"error: 当前不能自主行动：{life.hold_explain()}")
+            if not life.skill_retry_ready(skill):
+                return event.plain_result(f"error: {skill} 仍在失败冷却中，请根据已有结果换一种做法。")
+            boundary = getattr(life, "_needs_work_boundary", None)
+            if (boundary(skill) if callable(boundary) else skill in ("chop_tree", "mine_stone", "mine_ores", "collect", "hunt")) and getattr(life, "_homes", []):
+                # A direct agent tool is also a plan's first step. A verified
+                # closed home must be exited through the same fresh boundary
+                # rules as mc_plan_do, rather than mining behind its door.
+                revision = life._plan_revision
+                if life._plan or life._pending_plan or life._owner_steer_pending():
+                    return event.plain_result("error: 已有计划或主人新指令，先按最新安排处理。")
+                try:
+                    snapshot = await life._gather_state()
+                except Exception as exc:  # noqa: BLE001
+                    return event.plain_result(f"error: 无法核验基地与当前状态：{exc}")
+                if (revision != life._plan_revision or not life.may_act()
+                        or life._owner_steer_pending() or not self.connected
+                        or getattr(self, "_emergency_stopped", False)):
+                    return event.plain_result("error: 核验期间状态或主人指令已变化，重新观察后再安排。")
+                if life._plan or life._pending_plan:
+                    return event.plain_result("error: 核验期间已有新计划，先按最新安排处理。")
+                protection_state = snapshot
+                home = life._home_for_state(snapshot)
+                if home and (snapshot.get("home_status") or {}).get("safe") is True:
+                    accepted = life.note_plan_from_agent([
+                        {"skill": skill, "params": dict(params), "why": label}
+                    ])
+                    if accepted.get("ok") is not True:
+                        return event.plain_result(f"error: 无法保留屋外任务：{accepted.get('reason') or '技能计划无效'}")
+                    life.wake()
+                    return event.plain_result(
+                        f"已保留「{label}」的原任务参数；当前仍在基地内，下一步先按真实状态补给、休息或安全出门，再继续。"
+                    )
+            if skill in getattr(life, "PREPARATION_SKILLS", ()):
+                params = {**params, "safe_search": True}
+            protect = getattr(life, "_protected_work_params", None)
+            if callable(protect):
+                params = protect(skill, params, protection_state)
+        submission = None
+        if getattr(event, "astrcraft_autonomous", False) and life is not None:
+            register = getattr(life, "register_task_submission", None)
+            if callable(register):
+                submission = register(skill, state=protection_state)
         try:
             r = await self.engine.run_skill(skill, params)
+            if submission is not None:
+                life.bind_task_submission(submission, r)
         except EngineError as exc:
+            if submission is not None:
+                life.bind_task_submission(submission, None)
             if exc.is_not_connected:
                 return event.plain_result("机器人掉线了，正在重连，稍后再试。")
             return event.plain_result(f"没能开始「{label}」：{exc}")
+        except BaseException:
+            if submission is not None:
+                life.bind_task_submission(submission, None)
+            raise
         return event.plain_result(
             f"已让机器人开始「{label}」，任务号 {r.get('task_id')}。\n"
             f"这会持续一段时间——**你这一轮就到此为止，不用再调别的工具**。\n"

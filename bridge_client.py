@@ -120,7 +120,7 @@ class EngineConfig:
                 return str(guess)
 
         raise EngineUnavailable(
-            "找不到 node 可执行文件。请安装 Node.js 18+，"
+            "找不到 node 可执行文件。请安装 Node.js 22+，"
             "或在插件配置里填入 node_path（例如 C:\\Program Files\\nodejs\\node.exe）"
         )
 

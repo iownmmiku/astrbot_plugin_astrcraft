@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -13,7 +14,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _paths  # noqa: E402
@@ -27,6 +29,7 @@ from astrcraft_plugin.drives import DriveSystem  # noqa: E402
 from astrcraft_plugin.life import LifeDecision, LifeLoop  # noqa: E402
 from astrcraft_plugin.llm_tools_core import McPerceptionTools  # noqa: E402
 from astrcraft_plugin.llm_tools_life import McLifeTools  # noqa: E402
+from astrcraft_plugin.llm_tools_skills import McSkillTools  # noqa: E402
 from astrcraft_plugin.memory import MemoryStore  # noqa: E402
 from astrbot.core.star.register.star_handler import llm_tools  # noqa: E402
 
@@ -42,6 +45,8 @@ class FixtureEngine {
   constructor() {
     this.queue = new TaskQueue();
     this.config = { get: () => true, update: () => {} };
+    this.fixtureInventory = { bread: 0 };
+    this.fixtureContainers = new Map();
     this.bot = {
       entity: { position: vec3(0, 64, 0), onGround: true },
       players: { Alice: { entity: { position: vec3(4, 64, 6) } } },
@@ -55,10 +60,18 @@ class FixtureEngine {
       },
       openContainer: async (block) => {
         this.lastOpened = block.position;
+        const key = `${block.position.x},${block.position.y},${block.position.z}`;
+        if (!this.fixtureContainers.has(key)) this.fixtureContainers.set(key, 5);
         const window = {
-          containerItems: () => [{ name: 'bread', count: 5, type: 1 }],
-          withdraw: async (type, metadata, count) => { this.lastWithdraw = { type, count }; },
-          close: () => { this.bot.currentWindow = null; },
+          containerItems: () => this.fixtureContainers.get(key) > 0 ? [{ name: 'bread', count: this.fixtureContainers.get(key), type: 1 }] : [],
+          items: () => this.fixtureInventory.bread > 0 ? [{ name: 'bread', count: this.fixtureInventory.bread, type: 1 }] : [],
+          withdraw: async (type, metadata, count) => {
+            if (this.fixtureContainers.get(key) < count) throw new Error('模拟容器库存不足');
+            this.lastWithdraw = { type, count };
+            this.fixtureContainers.set(key, this.fixtureContainers.get(key) - count);
+            this.fixtureInventory.bread += count;
+          },
+          close: () => { if (this.bot.currentWindow === window) this.bot.currentWindow = null; },
         };
         this.bot.currentWindow = window;
         return window;
@@ -112,7 +125,7 @@ class Event:
         return text
 
 
-class ToolHost(McPerceptionTools, McLifeTools):
+class ToolHost(McPerceptionTools, McLifeTools, McSkillTools):
     def __init__(self, engine=None, knowledge=None):
         self.engine = engine
         self.knowledge = knowledge
@@ -272,8 +285,12 @@ class PlanContracts(unittest.IsolatedAsyncioTestCase):
             ))
         self.assertIsNone(self.loop._pop_plan_step())
         self.assertEqual(self.calls, [
-            ("skill.run", {"skill": step["skill"], "params": step["params"]}) for step in steps
+            ("skill.run", {"skill": step["skill"], "params": {
+                **step["params"], **({"safe_search": True} if step["skill"] == "make_tools" else {}),
+            }}) for step in steps
         ])
+        self.assertEqual(steps[1]["params"], {"tier": "stone", "kinds": ["pickaxe", "axe"]},
+                         "the autonomous boundary adds safety to its dispatched copy, not the original goal")
 
     async def test_plain_skill_names_still_accept_commas_and_newlines(self):
         output = await tool_text(self.host.tool_plan_do(Event(), steps=" chop_tree, \n make_tools\nmine_stone "))
@@ -302,6 +319,70 @@ class PlanContracts(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.dumps(self.loop._plan, sort_keys=True), active_before)
                 self.assertEqual(json.dumps(self.loop._pending_plan, sort_keys=True), pending_before)
         self.assertEqual(self.calls, [])
+
+
+class DirectSkillContracts(unittest.IsolatedAsyncioTestCase):
+    def make_host(self, state):
+        import test_supply_resume as S
+        loop = S.SupplyResumeTests.make_loop(self, state)
+        loop.note_unblocked()
+        engine = SimpleNamespace(running=True, run_skill=AsyncMock(return_value={"task_id": "direct-work"}))
+        host = ToolHost(engine)
+        host.life = loop
+        return host
+
+    async def test_autonomous_outdoor_tool_uses_fresh_home_and_task_world_without_mutating_goal(self):
+        import test_base_food as B
+        home = B.record()
+        state = {"server": home["server"], "dimension": home["dimension"], "health": 20, "food": 20,
+                 "inventory": {"bread": 4, "stone_pickaxe": 1}, "position": {"x": 40, "y": 64, "z": 40},
+                 "is_night": False, "home_status": {"condition": "missing", "safe": False, "loaded": True, "inside": False}}
+        host = self.make_host(state)
+        host.life.remember_home(home)
+        host.life._return_boundary_state = {"server": "stale-cache", "dimension": "the_nether"}
+        params = {"count": 8, "radius": 9}
+        original = copy.deepcopy(params)
+        plan_before, pending_before = copy.deepcopy(host.life._plan), copy.deepcopy(host.life._pending_plan)
+        fresh = {"is_night": False, **copy.deepcopy(state)}
+        with patch.object(host.life, "_gather_state", wraps=host.life._gather_state) as gather, \
+                patch.object(host.life, "register_task_submission", wraps=host.life.register_task_submission) as register:
+            event = SimpleNamespace(astrcraft_autonomous=True, plain_result=lambda text: text)
+            output = await host._submit_skill(event, "mine_stone", params, "挖圆石")
+        self.assertIn("任务号 direct-work", output)
+        self.assertGreaterEqual(gather.await_count, 1)
+        register.assert_called_once()
+        self.assertEqual(register.call_args.kwargs["state"], fresh)
+        self.assertEqual(host.life._return_task_attempt["world"], (home["server"], home["dimension"]))
+        skill, dispatched = host.engine.run_skill.await_args.args
+        self.assertEqual(skill, "mine_stone")
+        protected = dispatched["protected_home"]
+        self.assertEqual(protected["origin"], home["origin"])
+        self.assertEqual(protected["server"], home["server"])
+        self.assertEqual({key: value for key, value in dispatched.items() if key != "protected_home"}, original)
+        self.assertEqual(params, original)
+        self.assertEqual(host.life._plan, plan_before)
+        self.assertEqual(host.life._pending_plan, pending_before)
+
+    async def test_manual_skill_does_not_add_autonomous_protection_or_submission_ownership(self):
+        import test_base_food as B
+        home = B.record()
+        state = {"server": home["server"], "dimension": home["dimension"], "health": 20, "food": 20,
+                 "inventory": {"bread": 4}, "position": {"x": 40, "y": 64, "z": 40}}
+        host = self.make_host(state)
+        host.life.remember_home(home)
+        host.life._set_plan([{"skill": "mine_stone", "params": {"count": 6}, "why": "previous plan"}])
+        host.life.note_plan_from_agent([{"skill": "chop_tree", "params": {"count": 2}}])
+        plan_before, pending_before = copy.deepcopy(host.life._plan), copy.deepcopy(host.life._pending_plan)
+        params = {"count": 3}
+        with patch.object(host.life, "_gather_state", new=AsyncMock(side_effect=AssertionError("manual command must not add an autonomous check"))), \
+                patch.object(host.life, "register_task_submission", wraps=host.life.register_task_submission) as register:
+            output = await host._submit_skill(Event(), "mine_stone", params, "手动挖圆石")
+        self.assertIn("任务号 direct-work", output)
+        host.engine.run_skill.assert_awaited_once_with("mine_stone", {"count": 3})
+        register.assert_not_called()
+        self.assertEqual(params, {"count": 3})
+        self.assertEqual(host.life._plan, plan_before)
+        self.assertEqual(host.life._pending_plan, pending_before)
 
 
 class KnowledgeContracts(unittest.IsolatedAsyncioTestCase):
@@ -399,6 +480,14 @@ class RunnerContracts(unittest.TestCase):
             with self.subTest(status=expected), patch.object(self.runner.subprocess, "run", side_effect=exception):
                 result = self.runner.run_one(Path("test_fixture.py"), timeout=1)
                 self.assertEqual(result["status"], expected)
+
+    def test_skip_status_requires_an_explicit_environment_marker(self):
+        for output in ("⏭  SKIP：需要实际配置", "[fixture] SKIP unavailable", "跳过：需要 AstrBot",
+                       "[5] 已跳过进服测试（设 MC_TEST_CONNECT=1 启用）"):
+            with self.subTest(output=output):
+                self.assertEqual(self.runner.parse_result(output, 0)[0], "SKIP")
+        self.assertEqual(self.runner.parse_result("跳过手动补位\n38/38 passed", 0)[0], "38/38 passed")
+        self.assertNotEqual(self.runner.parse_result("PASS 已跳过危险方向", 0)[0], "SKIP")
 
 
 if __name__ == "__main__":

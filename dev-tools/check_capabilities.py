@@ -62,8 +62,6 @@ PROMISES: list[tuple[str, str, str, str]] = [
     ("看路线要挖哪几格（mc_plan_route 的描述能力）", "_describeRouteNeeds", "engine/movement.js", "只描述，不改世界"),
     ("挖台阶/垫脚从坑里出来", "climbToSurface", "engine/skills/common.js", "代码已有"),
     ("垫脚上升（跳起来往脚下放方块）", "pillarUpOne", "engine/skills/common.js", "climbToSurface 内部"),
-    # 下面这几条**故意留成失败**，等 B 批次做完再打开——
-    # 它们就是当前"她做不到但提示词说能做"的证据。
     ("她能不能主动调'爬出坑'（工具入口）", "mc_climb_out", "llm_tools_skills.py", "A 批次 ✅"),
     ("她能不能主动'走回去捡掉落物'", "mc_recover_drops", "llm_tools_skills.py", "C 批次 ✅"),
     ("死亡时写入恢复清单", "_death_recovery_todos", "life.py", "C 批次 ✅"),
@@ -80,6 +78,18 @@ PROMISES: list[tuple[str, str, str, str]] = [
 
     # 挖阶梯（用户实测"有镐却爬不出来"的修复）
     ("挖一级台阶上去（有镐没方块时唯一的路）", "digStepUp", "engine/skills/common.js", "本轮补"),
+
+    # 基地：历史拥有房子不能代替「现在确实在安全房屋内」的世界状态。
+    ("回基地技能已注册，可放入连续计划", "return_home: {", "engine/skills/index.js", "技能目录入口"),
+    ("走回基地后确认真实房屋，再睡觉或有限避夜", "returnHome", "engine/skills/building.js", "实际导航、验收与休息流程"),
+    ("检查当前人是否在完整基地内且门已关闭", "inspectHome", "engine/skills/building.js", "真实方块、位置、危险判据"),
+    ("插件能通过 RPC 检查基地实况", "home.inspect", "engine/index.js", "只读世界核验入口"),
+    ("完成验收的基地记录会保存", "remember_home", "life.py", "未完整验收的报告不能注册基地"),
+    ("不同服务器和维度分别选择基地", "home_for_world", "life.py", "不跨世界复用坐标"),
+    ("基地普通食物补给技能已注册", "resupply_food: {", "engine/skills/index.js", "普通食物、实际产出与屋内停留"),
+    ("自主补给使用真实屋内容器", "resupplyFood", "engine/skills/supply.js", "真实进屋关门和双侧取物验收"),
+    ("睡醒与补给后实际出门才能继续屋外工作", "leave_home: {", "engine/skills/index.js", "实际穿门、关门与身体验收"),
+    ("空粮仓的负面观察按世界保存并短暂回退", "note_home_food", "life.py", "完整真实检查，120秒后可再次探测"),
 
 ]
 
@@ -291,7 +301,7 @@ def main() -> int:
         print(f"  ❌ {len(fails)} 项承诺没兑现：")
         for f in fails:
             print(f"     - {f}")
-        print("\n  （这批正在做：A=climb_out / B=pave+dig_path / C=死亡恢复）")
+        print("\n  请核对上面的工具、能力实现和 README 数字，修复后重跑检查。")
         return 1
     print("  ✅ 所有承诺都兑现了")
     return 0

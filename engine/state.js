@@ -245,6 +245,9 @@ class StateTracker {
       return snap;
     }
 
+    // Rescue completion needs a fresh physical check, independent of task text.
+    snap.mining_return_safety = require('./skills/mining_return').inspectReturnSafety(bot);
+
     // 附近实体（按距离排序，最多 12 个，按类型聚合）
     snap.nearby_entities = this.nearbyEntities({ radius: 24, limit: 12 });
 

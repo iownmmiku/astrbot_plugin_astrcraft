@@ -76,6 +76,8 @@ function setupPathfinder(bot, config) {
   movements.canDig = allowSoftDig ? true : !!config.get('allowDigInPath');
   movements.canOpenDoors = true;
   movements.allow1by1towers = !!config.get('allowPlaceInPath');
+  // Disabling towers alone still lets native pathfinder build bridges.
+  if (!config.get('allowPlaceInPath')) movements.scafoldingBlocks = [];
   movements.allowParkour = !config.get('slowMode'); // 慢速模式关掉跑酷，反作弊更容易接受
   movements.allowSprinting = !config.get('slowMode');
   movements.allowFreeMotion = false;
@@ -571,6 +573,10 @@ class Navigator {
     const pathfinder = bot.pathfinder;
     // Mineflayer 事件在发射事件的上下文执行，需显式传递当前操作的地形限制。
     const allowTerrainDig = require('./goals').executionContext.getStore()?.allowTerrainDig !== false;
+    // A new path owns navigation immediately; settle its predecessor before installing it.
+    if (this._activeResolve) this._activeResolve(new CancelledError('寻路被新的目标替代'));
+    const pathOwner = {};
+    this._activePathOwner = pathOwner;
 
     await new Promise((resolve, reject) => {
       let settled = false;
@@ -581,12 +587,48 @@ class Navigator {
       let dugOutTried = false;
       let recovering = false;
       const recoveryController = new AbortController();
+      // Native pathfinder also needs the per-operation terrain restriction.
+      const movements = pathfinder.movements || this.movements;
+      const guardKey = '_astrcraftNoDigGuard';
+      let digGuard = null;
+      if (!allowTerrainDig && movements) {
+        digGuard = movements[guardKey] || { users: 0, original: movements.canDig,
+          towers: movements.allow1by1towers, scaffolding: movements.scafoldingBlocks, guardedScaffolding: [] };
+        movements[guardKey] = digGuard;
+        digGuard.users += 1;
+        movements.canDig = false;
+        movements.allow1by1towers = false;
+        movements.scafoldingBlocks = digGuard.guardedScaffolding;
+      }
 
       const cleanup = () => {
         if (settled) return;
         settled = true;
+        const ownsPath = this._activePathOwner === pathOwner;
+        const ownsNativePath = ownsPath && (!('goal' in pathfinder) || pathfinder.goal === goal || pathfinder.goal === null);
+        // noPath does not clear Mineflayer's goal. Stop it before restoring canDig,
+        // or a later chunk/block update can revive the old unrestricted path.
+        if (ownsNativePath) {
+          try { pathfinder.setGoal(null); } catch { /* disconnected */ }
+          // Native path_update writes its result after emitting the event. Clear any
+          // residual path once the emitter returns, without touching a newer goal.
+          if ('goal' in pathfinder) queueMicrotask(() => {
+            if (this._activePathOwner !== null || pathfinder.goal !== null) return;
+            try { pathfinder.setGoal(null); } catch { /* disconnected */ }
+          });
+        }
+        if (ownsPath) {
+          this._activePathOwner = null;
+          this._activeResolve = null;
+        }
+        if (digGuard && --digGuard.users === 0 && movements[guardKey] === digGuard) {
+          if (movements.canDig === false) movements.canDig = digGuard.original;
+          if (movements.allow1by1towers === false) movements.allow1by1towers = digGuard.towers;
+          if (movements.scafoldingBlocks === digGuard.guardedScaffolding) movements.scafoldingBlocks = digGuard.scaffolding;
+          delete movements[guardKey];
+        }
         recoveryController.abort();
-        if (recovering) {
+        if (recovering && ownsNativePath) {
           try { bot.clearControlStates(); }
           catch { /* 当前路径退出时尽力停止自救留下的方向键 */ }
         }
@@ -596,7 +638,6 @@ class Navigator {
         bot.removeListener('path_update', onPathUpdate);
         bot.removeListener('physicsTick', onPosition);
         if (signal) signal.removeEventListener('abort', onAbort);
-        this._activeResolve = null;
       };
 
       const finish = (err, value) => {
@@ -605,13 +646,16 @@ class Navigator {
         if (err) reject(err);
         else resolve(value);
       };
+      this._activeResolve = finish;
 
-      const onReached = () => finish(null, buildResult(true, '已到达'));
+      const onReached = (reachedGoal) => {
+        if (reachedGoal && reachedGoal !== goal) return;
+        finish(null, buildResult(true, '已到达'));
+      };
       const onPosition = () => {
         if (settled || recovering) return;
         const p = bot.entity.position;
         if (distanceXZ(p, { x, z }) > range || (y !== null && y !== undefined && Math.abs(p.y - y) > 0.75)) return;
-        try { pathfinder.setGoal(null); } catch { /* 已到位时尽力清掉路径 */ }
         finish(null, buildResult(true, '已在请求的目标范围内'));
       };
       // 注意：**不能**把 goal_updated 当成"到达"。
@@ -649,11 +693,6 @@ class Navigator {
         }
       };
       const onAbort = () => {
-        try {
-          pathfinder.setGoal(null);
-        } catch {
-          /* ignore */
-        }
         finish(new CancelledError('移动被取消'));
       };
 
@@ -677,11 +716,6 @@ class Navigator {
       }
 
       timeoutTimer = setTimeout(() => {
-        try {
-          pathfinder.setGoal(null);
-        } catch {
-          /* ignore */
-        }
         const pos = bot.entity.position;
         finish(
           new PathError(
@@ -1261,7 +1295,9 @@ class Navigator {
     for (const cell of blocked) {
       try {
         log.info(`脱困：先挖开卡住自己的 ${cell.name}(${cell.x},${cell.y},${cell.z})`);
-        await actions.dig({ x: cell.x, y: cell.y, z: cell.z, signal, collect: true });
+        // Recovery runs inside an active path. Collecting or approaching here
+        // would start another path and cancel the one being recovered.
+        await actions.dig({ x: cell.x, y: cell.y, z: cell.z, signal, collect: false, reach: false });
         return true;
       } catch (err) {
         if (err instanceof CancelledError) throw err;
@@ -1287,7 +1323,7 @@ class Navigator {
         if (!b.diggable) continue;
         if (['lava', 'water', 'flowing_lava', 'flowing_water', 'bedrock', 'barrier'].includes(b.name)) continue;
         try {
-          await actions.dig({ x: tx, y: ty, z: tz, signal, collect: true });
+          await actions.dig({ x: tx, y: ty, z: tz, signal, collect: false, reach: false });
           return true;
         } catch (err) {
           if (err instanceof CancelledError) throw err;

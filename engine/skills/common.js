@@ -26,13 +26,45 @@ function blockAt(bot, x, y, z) {
 
 /** 技能执行上下文：统一处理取消、进度、预算 */
 class SkillContext {
-  constructor({ signal, onProgress = null, deadline = null, deps = {} }) {
+  constructor({ signal, onProgress = null, deadline = null, deps = {}, checkpoints = null, checkpointScope = [], checkpointCalls = null }) {
     this.signal = signal;
     this._onProgress = onProgress;
     this.deadline = deadline;
     this.deps = deps;
     this._lastReport = 0;
     this.notes = [];
+    // Keep a Task's collection target when preemption creates a new context.
+    this._checkpoints = checkpoints || new Map();
+    this._checkpointScope = checkpointScope;
+    this._checkpointCalls = checkpointCalls || new Map();
+  }
+
+  collectionCheckpoint(key, { have, want, inventory }) {
+    this.checkAborted();
+    const identity = JSON.stringify([this._checkpointScope, key]);
+    const call = this._checkpointCalls.get(identity) || 0;
+    this._checkpointCalls.set(identity, call + 1);
+    const id = JSON.stringify([identity, call]);
+    if (!this._checkpoints.has(id)) {
+      this._checkpoints.set(id, { initialHave: have(), before: { ...inventory() }, want });
+    }
+    return this._checkpoints.get(id);
+  }
+
+  // Dependency gathering must not borrow the outer skill's checkpoint.
+  child(scope) {
+    this.checkAborted();
+    const identity = JSON.stringify(['child', this._checkpointScope, scope]);
+    const call = this._checkpointCalls.get(identity) || 0;
+    this._checkpointCalls.set(identity, call + 1);
+    const child = new SkillContext({
+      signal: this.signal, onProgress: this._onProgress, deadline: this.deadline,
+      deps: this.deps, checkpoints: this._checkpoints,
+      checkpointScope: [...this._checkpointScope, [scope, call]],
+      checkpointCalls: this._checkpointCalls,
+    });
+    child.ensureChunks = this.ensureChunks;
+    return child;
   }
 
   /** 进度上报（节流：同一秒内只发一次，避免刷屏） */
@@ -61,6 +93,14 @@ class SkillContext {
   get aborted() {
     return !!(this.signal && this.signal.aborted);
   }
+}
+
+// Keep standalone callers with a minimal context compatible with the skills.
+function collectionCheckpoint(ctx, key, { have, want, inventory }) {
+  if (ctx && typeof ctx.collectionCheckpoint === 'function') {
+    return ctx.collectionCheckpoint(key, { have, want, inventory });
+  }
+  return { initialHave: have(), before: { ...inventory() }, want };
 }
 
 /** 技能返回值的统一形状 */
@@ -96,11 +136,12 @@ function positiveOnly(delta) {
  * 通用"收集某物品到指定数量"的驱动器。
  * 传入一个 fetchOne 回调（返回 true 表示这一轮有进展），循环到数量达标或重试耗尽。
  */
-async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label = '收集' }) {
+async function driveUntil({ have, want, fetchOne, ctx, checkpoint = null, maxAttempts = 12, label = '收集' }) {
   let attempts = 0;
   let fails = 0;
   let lastError = null;
-  const before = have();
+  const before = checkpoint ? checkpoint.initialHave : have();
+  if (checkpoint) want = checkpoint.initialHave + checkpoint.want;
   while (have() < want) {
     ctx.checkAborted();
     if (attempts >= maxAttempts) break;
@@ -117,7 +158,10 @@ async function driveUntil({ have, want, fetchOne, ctx, maxAttempts = 12, label =
         }
       }
     } catch (err) {
-      if (err instanceof CancelledError) throw err;
+      if (err instanceof CancelledError || ['PreparationBlockedError', 'ProtectedBlockError', 'ProtectedHomeError'].includes(err?.name)) throw err;
+      // A missing tool cannot improve by retrying the same dig or opening a
+      // different tunnel. Preserve accepted drops and let the caller return.
+      if (err?.name === 'NoToolError') { lastError = describeFailure(err); break; }
       fails += 1;
       lastError = describeFailure(err);
       log.info(`${label} 第 ${attempts} 次尝试失败：${lastError}`);
@@ -420,11 +464,83 @@ async function settle({ actions, nav, ctx, maxWaitMs = 6000 }) {
 /** 危险方块（掉进去会死、挖了会淹/会烧） */
 const DANGEROUS = new Set([
   'lava', 'flowing_lava', 'water', 'flowing_water', 'fire', 'magma_block',
-  'cactus', 'powder_snow', 'bedrock', 'barrier',
+  'cactus', 'powder_snow', 'bedrock', 'barrier', 'bubble_column', 'soul_fire',
+  'campfire', 'soul_campfire', 'sweet_berry_bush', 'wither_rose',
 ]);
 
 function isDangerousBlock(name) {
   return DANGEROUS.has(String(name || '').replace(/^minecraft:/, ''));
+}
+
+function hasFluid(block) {
+  return /^(?:flowing_)?(?:lava|water)$/.test(String(block?.name || '').replace(/^minecraft:/, '')) ||
+    !!(typeof block?.getProperties === 'function' && (block.getProperties() || {}).waterlogged);
+}
+
+function isStableSupport(block) {
+  if (!block || block.boundingBox !== 'block' || hasFluid(block)) return false;
+  const name = String(block.name || '').replace(/^minecraft:/, '');
+  return (name === 'bedrock' || !isDangerousBlock(name)) &&
+    !['sand', 'red_sand', 'gravel', 'anvil', 'chipped_anvil', 'damaged_anvil'].includes(name) &&
+    !name.endsWith('_concrete_powder');
+}
+
+function safeStepLanding(bot, x, feetY, z) {
+  const feet = blockAt(bot, x, feetY, z), head = blockAt(bot, x, feetY + 1, z);
+  return isStableSupport(blockAt(bot, x, feetY - 1, z)) &&
+    [feet, head].every((b) => b && b.boundingBox === 'empty' && !hasFluid(b) && !isDangerousBlock(b.name)) &&
+    canOpenCellSafely(bot, x, feetY, z) && canOpenCellSafely(bot, x, feetY + 1, z);
+}
+
+function botAtSafeStep(bot, minimumY) {
+  const p = bot.entity.position;
+  return bot.entity.onGround === true && Math.floor(p.y) >= minimumY &&
+    safeStepLanding(bot, Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
+}
+
+/** Clearing this cell must not open a fluid channel or a falling ceiling. */
+function canOpenCellSafely(bot, x, y, z) {
+  const cell = blockAt(bot, x, y, z);
+  if (!cell || hasFluid(cell) || isDangerousBlock(cell.name)) return false;
+  for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]) {
+    const side = blockAt(bot, x + dx, y + dy, z + dz);
+    if (!side || hasFluid(side)) return false;
+    if (dy === 1 && (['sand', 'red_sand', 'gravel', 'anvil', 'chipped_anvil', 'damaged_anvil'].includes(side.name) ||
+        side.name.endsWith('_concrete_powder'))) return false;
+  }
+  return true;
+}
+
+/** A one-block descent needs a known, stable floor after the support is removed. */
+function canDigDownSafely(bot, x, feetY, z) {
+  const support = blockAt(bot, x, feetY - 1, z);
+  const landing = blockAt(bot, x, feetY - 2, z);
+  if (!support || !support.diggable || support.boundingBox !== 'block' || isDangerousBlock(support.name)) return false;
+  if (!canOpenCellSafely(bot, x, feetY - 1, z)) return false;
+  if (!landing || landing.boundingBox !== 'block') return false;
+  const name = String(landing.name || '').replace(/^minecraft:/, '');
+  // Bedrock is safe to stand on, although it cannot be mined.
+  if ((name !== 'bedrock' && isDangerousBlock(name)) ||
+      ['sand', 'red_sand', 'gravel', 'anvil', 'chipped_anvil', 'damaged_anvil',
+        'campfire', 'soul_campfire', 'sweet_berry_bush', 'wither_rose'].includes(name) ||
+      name.endsWith('_concrete_powder')) return false;
+  if (typeof landing.getProperties === 'function' && (landing.getProperties() || {}).waterlogged) return false;
+  // Removing the support must not open a side channel for water or lava.
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const side = blockAt(bot, x + dx, feetY - 1, z + dz);
+    if (!side || (side.name !== 'bedrock' && isDangerousBlock(side.name))) return false;
+    if (typeof side.getProperties === 'function' && (side.getProperties() || {}).waterlogged) return false;
+  }
+  return true;
+}
+
+function canHarvestBlockSafely(bot, point) {
+  if (!point || !canOpenCellSafely(bot, point.x, point.y, point.z)) return false;
+  const p = bot.entity?.position;
+  if (!p) return false;
+  return Math.floor(point.x) !== Math.floor(p.x) || Math.floor(point.z) !== Math.floor(p.z) ||
+    Math.floor(point.y) !== Math.floor(p.y) - 1 ||
+    canDigDownSafely(bot, Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
 }
 
 /**
@@ -619,7 +735,7 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
   // 落地后再读 —— 跳跃/走跳的弧线中段 floor 会虚高 1 格（g10 现场：
   // 引擎读 -50 判"出来了"，测试一量是 -51.0 —— 全是没落地时读的位置）
   const afterY = await settleFloorY(actions.bot, ctx, 800);
-  if (afterY >= by + 1) {
+  if (botAtSafeStep(actions.bot, by + 1)) {
     log.info(`${tag}：升上去了（现在 y=${afterY}）`);
     return true;
   }
@@ -655,6 +771,8 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
     // 不转头时 forward 朝着她原来面对的方向推，多半撞墙/原地跳 ——
     // 这就是「手动走跳也没上去」的直接原因（f6 现场）。
     await bot.lookAt(vec3(nx + 0.5, by + 0.5, nz + 0.5), true);
+    ctx.checkAborted();
+    if (!safeStepLanding(bot, nx, by + 1, nz)) return false;
     bot.setControlState('forward', true);
     bot.setControlState('jump', true);
     await delay(600, { signal: ctx.signal });
@@ -663,7 +781,7 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
     // **等落地再读** —— 300ms 后往往还在弧线里，floor 虚高 1 格会谎报成功
     // （g10 现场：「-52 → -50」实际落地 -51 → 后续轮次和测试读数全对不上）
     const afterY2 = await settleFloorY(bot, ctx, 1500);
-    if (afterY2 >= by + 1) {
+    if (botAtSafeStep(bot, by + 1)) {
       log.info(`${tag}：手动走跳补位成功（y ${afterY} → ${afterY2}）`);
       return true;
     }
@@ -677,6 +795,9 @@ async function stepUpOneGoTo({ actions, nav, ctx, tag, nx, by, nz }) {
       /* 复位失败不挡日志 */
     }
     log.info(`${tag}：手动走跳出错：${String(err.message).slice(0, 70)}`);
+  } finally {
+    // Abort can occur while walking/jumping; release only this original body.
+    try { bot.setControlState('forward', false); bot.setControlState('jump', false); } catch { /* ended body */ }
   }
 
   // **失败日志必须带 goTo 的 arrived/距离/note/用时** ——
@@ -726,7 +847,7 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
       log.info(`挖台阶：(${nx}, ${nz}) 那两格挖不动（${need.map((b) => b.name).join('/')}）`);
       continue;
     }
-    if (need.some((b) => isDangerousBlock(b.name))) {
+    if (!canOpenCellSafely(bot, nx, by + 1, nz) || !canOpenCellSafely(bot, nx, by + 2, nz)) {
       log.info(`挖台阶：(${nx}, ${nz}) 是危险方块，跳过`);
       continue;
     }
@@ -745,8 +866,9 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
     // 不需要跳、不需要赶时间。放好之后它就成了一个新的落脚点，
     // 再挖它上面两格、跳上去 —— 一级台阶就成了。
     let support = blockAt(bot, nx, by, nz);
-    if (!support || support.boundingBox !== 'block') {
-      const filler = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand'].find(
+    if (!support) continue;
+    if (!isStableSupport(support)) {
+      const filler = ['cobblestone', 'stone', 'dirt', 'oak_planks'].find(
         (n) => actions.countItem(n) > (reserveItems[n] || 0),
       );
       if (!filler) {
@@ -754,7 +876,7 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
         continue;
       }
       // 那一格必须真的是空的（不然放不下去）
-      if (support && support.boundingBox !== 'empty' && support.name !== 'air') {
+      if (hasFluid(support) || isDangerousBlock(support.name) || support.boundingBox !== 'empty') {
         log.info(`挖台阶：(${nx}, ${nz}) 落脚点被 ${support.name} 占着，跳过`);
         continue;
       }
@@ -768,7 +890,7 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
       }
       await delay(200, { signal: ctx.signal });
       support = blockAt(bot, nx, by, nz);
-      if (!support || support.boundingBox !== 'block') {
+      if (!isStableSupport(support)) {
         log.info(`挖台阶：垫了但读不到（(${nx}, ${by}, ${nz}) = ${support ? support.name : 'null'}）`);
         continue;
       }
@@ -779,6 +901,7 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
     for (const y of [by + 1, by + 2]) {
       const b = blockAt(bot, nx, y, nz);
       if (!b || b.boundingBox !== 'block') continue;
+      if (!canOpenCellSafely(bot, nx, y, nz)) break;
       try {
         // 开台阶时保持站位；追逐掉落物会走离支撑块并掉回井底。
         await actions.dig({ x: nx, y, z: nz, signal: ctx.signal, collect: false });
@@ -788,7 +911,8 @@ async function digStepUpImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} 
       }
     }
     // 走过去并验证 —— goTo/range/判据都收在 stepUpOneGoTo（见那里的三条教训）
-    if (await stepUpOneGoTo({ actions, nav, ctx, tag: '挖台阶', nx, by, nz })) return true;
+    if (safeStepLanding(bot, nx, by + 1, nz) &&
+        await stepUpOneGoTo({ actions, nav, ctx, tag: '挖台阶', nx, by, nz })) return true;
   }
   return false;
 }
@@ -847,7 +971,7 @@ function isOpenSky(bot, need = 3) {
  */
 async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {} }) {
   const bot = actions.bot;
-  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
+  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'netherrack'];
   const filler = CANDIDATES.find((n) => actions.countItem(n) > (reserveItems[n] || 0));
   if (!filler) return false;
 
@@ -869,6 +993,7 @@ async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {}
     const stand = blockAt(bot, nx, by + 1, nz); // 跳上去之后站的位置
     const above = blockAt(bot, nx, by + 2, nz); // 头顶
     if (!foot || !stand || !above) continue;
+    if (hasFluid(foot) || isDangerousBlock(foot.name) && foot.name !== 'bedrock') continue;
     // 那一格得是空的才能放；站的位置和头顶也得是空的
     const empty = (b) => b.boundingBox === 'empty' || b.name === 'air';
     if (!empty(stand) || !empty(above)) continue;
@@ -898,7 +1023,8 @@ async function stairUpOneImpl({ actions, nav, ctx, bx, by, bz, reserveItems = {}
     // 跳上去并验证（共用 stepUpOneGoTo —— 顺带把判据从「相对高了」
     // 统一成 dig 注释里论证过的「绝对层 >= by+1」：上一个方向可能已经把她送上去，
     // 相对判据会把「已经到了」判成「没动」→ 四个方向全失败）
-    if (await stepUpOneGoTo({ actions, nav, ctx, tag: '螺旋阶梯', nx, by, nz })) return true;
+    if (safeStepLanding(bot, nx, by + 1, nz) &&
+        await stepUpOneGoTo({ actions, nav, ctx, tag: '螺旋阶梯', nx, by, nz })) return true;
   }
   return false;
 }
@@ -1017,7 +1143,8 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
       const tz = bz + dz;
       const feet = blockAt(bot, tx, by + 1, tz);
       const head = blockAt(bot, tx, by + 2, tz);
-      if (!feet || !head) continue;
+      if (!feet || !head || !isStableSupport(blockAt(bot, tx, by, tz))) continue;
+      if (!canOpenCellSafely(bot, tx, by + 1, tz) || !canOpenCellSafely(bot, tx, by + 2, tz)) continue;
       if (feet.boundingBox === 'block' && (!feet.diggable || isDangerousBlock(feet.name))) continue;
       if (head.boundingBox === 'block' && (!head.diggable || isDangerousBlock(head.name))) continue;
       try {
@@ -1026,6 +1153,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
           await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: false });
         }
         if (head.boundingBox === 'block') {
+          if (!canOpenCellSafely(bot, tx, by + 2, tz)) continue;
           await actions.dig({ x: tx, y: by + 2, z: tz, signal: ctx.signal, collect: false });
         }
         // 走进去：pathfinder 会自动跳上这 1 格台阶
@@ -1043,13 +1171,14 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
         // 剩 ~200 秒 ÷ 35 秒/轮 = 只够 6 轮 —— h15 实测「共爬 6 格」后超时。
         // 真走得通的路径（1~2 格）都在 1 秒内出结果；1.5 秒走不到 = 这条几何走不到，
         // 快速让位给下面的 digStepUp（带垫支撑 + 手动补位，实测那条才是活路）。
+        if (!safeStepLanding(bot, tx, by + 1, tz)) continue;
         await nav.goTo({ x: tx, y: by + 1, z: tz, range: 0.6, signal: ctx.signal, timeoutMs: 1500, segmented: false });
         // **用位置验证"真的升高了"，不信 goTo 的返回值。**
         // 它可能因为"附近有可站立点"之类的判断原地成功返回——
         // 实测那样会 24 级台阶一级都没踩上，而 climbed 却在涨。
         // （落地后再读：跳跃弧线中段 floor 虚高 1 格，同 settleFloorY 的理由）
         const nowY = await settleFloorY(bot, ctx, 800);
-        if (nowY <= by) {
+        if (!botAtSafeStep(bot, by + 1)) {
           log.debug(`挖了台阶但没上去（${by} → ${nowY}），换个方向或换办法`);
           continue;
         }
@@ -1075,7 +1204,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
       //   ② **先往侧面开一格**（挖出一个落脚点）→ 之后就有空间挖正常阶梯了
       // 先试 ①（快），没方块可垫就试 ②。
       const up1 = blockAt(bot, bx, by + 2, bz);
-      if (up1 && up1.boundingBox === 'block' && up1.diggable && !isDangerousBlock(up1.name)) {
+      if (up1 && up1.boundingBox === 'block' && up1.diggable && canOpenCellSafely(bot, bx, by + 2, bz)) {
         try {
           await actions.dig({ x: bx, y: by + 2, z: bz, signal: ctx.signal, collect: false });
         } catch (err) {
@@ -1150,7 +1279,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
  */
 async function pillarUpOneImpl({ actions, ctx, bx, by, bz, reserveItems = {} }) {
   const bot = actions.bot;
-  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'sand', 'netherrack'];
+  const CANDIDATES = ['cobblestone', 'stone', 'dirt', 'oak_planks', 'netherrack'];
   const block = CANDIDATES.find((n) => actions.countItem(n) > (reserveItems[n] || 0));
   if (!block) return false;
 
@@ -1285,17 +1414,21 @@ async function widenShaft({ actions, nav, ctx, bx, by, bz }) {
     const floor = blockAt(bot, tx, by - 1, tz);
     // 要能挖，而且那一格**下面必须有地板**（否则站过去就掉下去）
     if (!wall || wall.boundingBox !== 'block' || !wall.diggable || isDangerousBlock(wall.name)) continue;
-    if (!floor || floor.boundingBox !== 'block') continue;
+    if (!isStableSupport(floor) || !canOpenCellSafely(bot, tx, by, tz) ||
+        !canOpenCellSafely(bot, tx, by + 1, tz)) continue;
     try {
       await actions.dig({ x: tx, y: by, z: tz, signal: ctx.signal, collect: false });
       if (wallHead && wallHead.boundingBox === 'block' && wallHead.diggable && !isDangerousBlock(wallHead.name)) {
+        if (!canOpenCellSafely(bot, tx, by + 1, tz)) continue;
         await actions.dig({ x: tx, y: by + 1, z: tz, signal: ctx.signal, collect: false });
       }
       // 站过去（同样要带高度，否则"已到达"就返回了，人没动）
+      if (!safeStepLanding(bot, tx, by, tz)) continue;
       await nav.goTo({ x: tx, y: by, z: tz, range: 0.6, signal: ctx.signal, timeoutMs: 8000, segmented: false });
       // 同样验证真的挪过去了
       const np = bot.entity.position;
-      if (Math.abs(np.x - (tx + 0.5)) > 1.6 || Math.abs(np.z - (tz + 0.5)) > 1.6) {
+      if (Math.hypot(np.x - (tx + 0.5), np.z - (tz + 0.5)) > 0.9 ||
+          !bot.entity.onGround || !safeStepLanding(bot, Math.floor(np.x), Math.floor(np.y), Math.floor(np.z))) {
         log.debug('开侧洞：挖开了但没挪过去，换个方向');
         continue;
       }
@@ -1310,6 +1443,7 @@ async function widenShaft({ actions, nav, ctx, bx, by, bz }) {
 
 module.exports = {
   SkillContext,
+  collectionCheckpoint,
   skillResult,
   mergeCounts,
   positiveOnly,
@@ -1321,6 +1455,10 @@ module.exports = {
   climbToSurface,
   isUnderground,
   isDangerousBlock,
+  canDigDownSafely,
+  canOpenCellSafely,
+  canHarvestBlockSafely,
+  isStableSupport,
   // **垫脚上升要导出**（B 批次）：pave 的"垂直垫高"要复用它。
   // 不导出的话只能复制一份——而它的时序很讲究（跳起来、等真离地 0.7 格以上、
   // 趁空中往脚下放，站地上放会被服务端拒绝），复制一份必然会走样。

@@ -125,11 +125,31 @@ async function supersededWindowCloseIsHarmless() {
   assert.equal(closed, 1);
 }
 
+async function cancelledWindowOpeningDoesNotWaitForTheServer() {
+  const { bot, makeWindow } = fixture();
+  bot.openContainer = () => bot.openBlock({}); // Native windowOpen wait: no server reply yet.
+  const actions = new Actions({ bot, config: { get: () => false }, navigator: { stop() {} } });
+  const controller = new AbortController();
+  const start = Date.now();
+  const opening = actions.openContainer({ x: 1, y: 64, z: 0, signal: controller.signal });
+  const rejected = assert.rejects(opening, CancelledError);
+  await delay(5); controller.abort(); await rejected;
+  assert(Date.now() - start < 150, 'cancellation cannot wait for the native 20-second window timeout');
+  // The old private promise resumes on the same windowOpen event. It cannot
+  // operate on or close the new task's live window after its signal aborted.
+  const fresh = await makeWindow(2);
+  await delay(5);
+  assert.equal(bot.currentWindow, fresh);
+  fresh.close();
+}
+
 (async () => {
   await cancelledPrivateTransferPreservesNewWindow();
   process.stdout.write('PASS cancelled private transfer preserves new window, slots and execution context\n');
   await supersededWindowCloseIsHarmless();
   process.stdout.write('PASS superseded close is harmless and active close notifies cleanup\n');
-  process.stdout.write('2/2 window cancellation scenarios passed\n');
+  await cancelledWindowOpeningDoesNotWaitForTheServer();
+  process.stdout.write('PASS cancelled native window opening returns promptly and preserves the new window\n');
+  process.stdout.write('3/3 window cancellation scenarios passed\n');
   process.exit(0);
 })().catch((err) => { process.stderr.write(`${err.stack}\n`); process.exit(1); });

@@ -544,6 +544,11 @@ rpc.handle('stations.list', () => {  const bot = engine.bot;
   };
 });
 
+rpc.handle('home.inspect', wrap(async ({ home }) => {
+  engine.requireBot();
+  return require('./skills/building').inspectHome({ actions: engine.actions, state: engine.state, config: engine.config, home });
+}));
+
 rpc.handle(
   'config.update',
   wrap(async (params) => {

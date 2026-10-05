@@ -28,13 +28,16 @@ const log = require('./log');
 // 每种工作站最多记几个（太多没意义，反而会走很远去用一个旧箱子）
 const MAX_PER_KIND = 8;
 // 认为"这个位置还在"的检查半径（方块可能被换掉）
-const KINDS = ['crafting_table', 'furnace', 'chest', 'trapped_chest', 'barrel'];
+const KINDS = ['crafting_table', 'furnace', 'chest', 'trapped_chest', 'barrel', 'bed'];
+const kindOf = (name) => String(name || '').replace(/^minecraft:/, '').endsWith('_bed') ? 'bed' : String(name || '').replace(/^minecraft:/, '');
 
 class StationMemory {
   constructor({ file = null } = {}) {
     this._file = file;
     /** @type {Map<string, Array<{x:number,y:number,z:number,usedAt:number}>>} */
     this._byKind = new Map();
+    this._scopes = new Map([['legacy', this._byKind]]);
+    this._scopeProvider = null;
     this.load();
   }
 
@@ -43,17 +46,18 @@ class StationMemory {
     try {
       if (!fs.existsSync(this._file)) return;
       const raw = JSON.parse(fs.readFileSync(this._file, 'utf8'));
-      for (const kind of KINDS) {
-        const list = raw && Array.isArray(raw[kind]) ? raw[kind] : [];
-        if (list.length) {
-          this._byKind.set(
-            kind,
-            list
-              .filter((e) => e && Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.z))
-              .slice(0, MAX_PER_KIND),
-          );
+      const scopes = raw.version === 2 && raw.scopes && typeof raw.scopes === 'object' ? raw.scopes : { legacy: raw };
+      for (const [scope, data] of Object.entries(scopes)) {
+        const byKind = new Map();
+        for (const kind of KINDS) {
+          const list = data && Array.isArray(data[kind]) ? data[kind] : [];
+          if (list.length) {
+            byKind.set(kind, list.filter((e) => e && Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.z)).slice(0, MAX_PER_KIND));
+          }
         }
+        this._scopes.set(scope, byKind);
       }
+      this._byKind = this._scopes.get('legacy') || new Map();
       const n = [...this._byKind.values()].reduce((s, l) => s + l.length, 0);
       if (n) log.info(`工作站记忆：记得 ${n} 个位置（重启后直接走回去用）`);
     } catch (err) {
@@ -65,18 +69,35 @@ class StationMemory {
     if (!this._file) return;
     try {
       fs.mkdirSync(path.dirname(this._file), { recursive: true });
-      const out = {};
-      for (const [kind, list] of this._byKind.entries()) out[kind] = list;
+      const out = { version: 2, scopes: {} };
+      for (const [scope, byKind] of this._scopes.entries()) out.scopes[scope] = Object.fromEntries(byKind);
       fs.writeFileSync(this._file, JSON.stringify(out, null, 1), 'utf8');
     } catch (err) {
       log.debug(`存工作站记忆失败（忽略）：${err.message}`);
     }
   }
 
+  /** Resolve the live world on every access, including dimension changes without reconnecting. */
+  bindScope(provider) {
+    this._scopeProvider = provider;
+  }
+
+  _current() {
+    let key = 'legacy';
+    if (this._scopeProvider) {
+      const scope = this._scopeProvider() || {};
+      if (!scope.server || !scope.dimension) return false;
+      key = JSON.stringify([String(scope.server), String(scope.dimension).replace(/^minecraft:/, '')]);
+    }
+    if (!this._scopes.has(key)) this._scopes.set(key, new Map());
+    this._byKind = this._scopes.get(key);
+    return true;
+  }
+
   /** 记下"这个位置有个 X" */
   remember(kind, pos) {
-    const k = String(kind || '').replace(/^minecraft:/, '');
-    if (!KINDS.includes(k) || !pos) return false;
+    const k = kindOf(kind);
+    if (!this._current() || !KINDS.includes(k) || !pos || ![pos.x, pos.y, pos.z].every(Number.isFinite)) return false;
     const list = this._byKind.get(k) || [];
     const same = list.find(
       (e) => Math.abs(e.x - pos.x) < 0.6 && Math.abs(e.y - pos.y) < 0.6 && Math.abs(e.z - pos.z) < 0.6,
@@ -97,7 +118,8 @@ class StationMemory {
 
   /** 忘掉一个位置（方块不在了） */
   forget(kind, pos) {
-    const k = String(kind || '').replace(/^minecraft:/, '');
+    if (!this._current()) return;
+    const k = kindOf(kind);
     const list = this._byKind.get(k);
     if (!list) return;
     this._byKind.set(
@@ -111,7 +133,8 @@ class StationMemory {
 
   /** 离 from 最近的同类工作站（不做"还在不在"的检查，那是调用方的事） */
   nearest(kind, from) {
-    const k = String(kind || '').replace(/^minecraft:/, '');
+    if (!this._current()) return null;
+    const k = kindOf(kind);
     const list = this._byKind.get(k) || [];
     if (!list.length || !from) return null;
     let best = null;
@@ -128,6 +151,7 @@ class StationMemory {
 
   /** 全部（给面板/工具看） */
   all() {
+    if (!this._current()) return [];
     const out = [];
     for (const [kind, list] of this._byKind.entries()) {
       for (const e of list) out.push({ kind, ...e });

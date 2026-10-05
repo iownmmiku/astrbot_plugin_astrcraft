@@ -342,6 +342,8 @@ class MemoryStore:
         kinds: Iterable[str] | None = None,
         now: float | None = None,
         min_score: float = 0.0,
+        relevant_only: bool = False,
+        context: dict | None = None,
     ) -> list[MemoryEntry]:
         """按"跟当前处境的相关度"取几条记忆。
 
@@ -353,10 +355,18 @@ class MemoryStore:
         now = now or time.time()
         kind_set = set(kinds) if kinds else None
         tokens = _tokenize(query)
+        if relevant_only and not tokens:
+            return []
 
         scored: list[tuple[float, MemoryEntry]] = []
         for e in self._entries:
             if kind_set and e.kind not in kind_set:
+                continue
+            if context and any(
+                context.get(key) is not None and e.context.get(key) is not None
+                and str(context[key]) != str(e.context[key])
+                for key in ("server", "dimension")
+            ):
                 continue
             age_h = max(0.0, (e.at - now if e.at > now else now - e.at) / 3600.0)
             # 新鲜度：12 小时内基本不衰减，之后按天缓慢衰减（记忆不会完全消失）
@@ -365,6 +375,8 @@ class MemoryStore:
 
             haystack = f"{e.text} {' '.join(e.tags)} {KIND_LABEL.get(e.kind, '')}".lower()
             hits = sum(1 for t in tokens if t in haystack)
+            if relevant_only and hits == 0:
+                continue
             if tokens:
                 score += hits * 3.0
                 # 跟当前处境完全无关的琐事就别塞进上下文了（省 token）

@@ -17,6 +17,9 @@ import sys
 import asyncio
 import re
 import pathlib
+import copy
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -193,5 +196,319 @@ ok(
     "已改成真实工具名 mc_chop_tree / mc_make_tools…",
 )
 
+print("\n=== 真实注册表和工具 handler：观察预算、失效与计时 ===")
+from astrbot.core.provider.func_tool_manager import FunctionToolManager  # noqa: E402
+from astrcraft_plugin.llm_tools_core import McPerceptionTools  # noqa: E402
+from astrcraft_plugin.llm_tools_skills import McSkillTools  # noqa: E402
+
+
+class Clock:
+    def __init__(self):
+        self.value = 0.0
+
+    def now(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class FixtureEngine:
+    """只替换 RPC 对端；注册表、ActionAgent 和感知/动作 handler 均为真实实现。"""
+
+    def __init__(self, clock=None):
+        self.clock = clock
+        self.calls = []
+        self.items = {"bread": 2, "stone_pickaxe": 1}
+        self.state = {
+            "connected": True, "position": {"x": 0, "y": 64, "z": 0},
+            "health": 20, "food": 20, "dimension": "overworld", "time_of_day": 1000,
+            "held_item": None, "inventory_summary": {"entries": [{"name": "bread", "count": 2}]},
+        }
+        self.entered = asyncio.Event()
+        self.release = None
+        self.fail_state = False
+
+    async def call(self, method, params=None, **kwargs):
+        self.calls.append((method, copy.deepcopy(params or {})))
+        if self.clock:
+            self.clock.advance(0.003 if method == "state.get" else 0.020)
+        if method == "state.get":
+            if self.fail_state:
+                raise RuntimeError("状态暂时不可读")
+            return copy.deepcopy(self.state)
+        if method == "inventory.get":
+            if self.release is not None:
+                self.entered.set()
+                await self.release.wait()
+            return {"items": dict(self.items), "held": copy.deepcopy(self.state["held_item"])}
+        if method == "block.scan":
+            return {"count": 1, "blocks": [{"name": params["names"][0], "x": self.state["position"]["x"] + 2, "y": 64, "z": 0, "distance": 2}]}
+        if method == "equip":
+            self.state["held_item"] = {"name": params["item"], "count": 1}
+            return {"equipped": params["item"], "destination": "hand"}
+        if method == "craft":
+            self.items[params["item"]] = self.items.get(params["item"], 0) + params["count"]
+            return {"item": params["item"], "produced": params["count"], "delta": {}}
+        raise AssertionError(f"未预期 RPC：{method}")
+
+    async def task_status(self):
+        return {"current": None}
+
+    async def run_skill(self, skill, params):
+        self.calls.append(("skill.run", {"skill": skill, "params": params}))
+        return {"task_id": "fixture-task"}
+
+
+class ScriptedProvider:
+    def __init__(self, replies, *, before=None, clock=None):
+        self.replies = replies
+        self.before = before
+        self.clock = clock
+        self.calls = 0
+        self.contexts = []
+
+    async def text_chat(self, **kwargs):
+        self.calls += 1
+        self.contexts.append(kwargs["contexts"])
+        if self.clock:
+            self.clock.advance(0.005)
+        if self.before:
+            result = self.before(self.calls)
+            if asyncio.iscoroutine(result):
+                await result
+        if self.calls > len(self.replies):
+            raise AssertionError("发生未安排的模型调用")
+        reply = self.replies[self.calls - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        if isinstance(reply, str):
+            return SimpleNamespace(tools_call_name=[], completion_text=reply, usage=None)
+        names, args = reply
+        result = _Resp(names, args)
+        result.usage = None
+        return result
+
+
+class FixturePlugin(McPerceptionTools, McSkillTools):
+    def __init__(self, provider, engine):
+        self.engine, self.connected, self.life, self.goals = engine, True, None, None
+        self._brief_revision = 0
+        manager = FunctionToolManager()
+        for name, handler in (
+            ("mc_inventory", McPerceptionTools.tool_mc_inventory),
+            ("mc_scan", McPerceptionTools.tool_mc_scan),
+            ("mc_equip", McPerceptionTools.tool_mc_equip),
+            ("mc_craft", McPerceptionTools.tool_mc_craft),
+            ("mc_chop_tree", McSkillTools.tool_mc_chop_tree),
+        ):
+            manager.add_func(name=name, func_args=[], desc="回归测试", handler=handler)
+
+        async def get_provider():
+            return provider
+
+        self.context = SimpleNamespace(
+            get_using_provider_async=get_provider,
+            provider_manager=SimpleNamespace(llm_tools=manager),
+        )
+
+    async def _ensure_engine(self):
+        return True
+
+
+def rpc_count(engine, method):
+    return sum(name == method for name, _ in engine.calls)
+
+
+async def real_handler_checks():
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), (["mc_inventory"], [{}]), "确认背包后结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    summary, _ = await agent.act(prompt="查看背包", system=ACTION_PROMPT)
+    ok("相同真实状态下重复查看背包只执行一次 handler", rpc_count(engine, "inventory.get") == 1)
+    ok("重复观察仍计入预算，且允许模型诚实收尾", agent.last_timing["read_cache_hits"] == 1 and summary == "确认背包后结束")
+    ok("真实模型请求次数与缓存命中分别统计", agent.last_timing["provider_calls"] == 3 and agent.last_timing["tool_calls"] == 1)
+    ok("预算提醒放在完整 tool 结果之后", "观察预算" in str(provider.contexts[2][-1].content))
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory"], [{}])] * 3)
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    summary, _ = await agent.act(prompt="缺少事实时可以停止", system=ACTION_PROMPT)
+    ok("纯重复观察最多三轮模型而非六轮空转", provider.calls == 3 and rpc_count(engine, "inventory.get") == 1)
+    ok("预算耗尽不凭空提交动作", agent.last_timing["body_attempts"] == 0 and agent.last_timing["exit_reason"] == "observation_budget")
+    ok("如实说明本轮没有额外观察或猜测动作", "未再查询或猜测动作" in summary)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_scan", "mc_scan"], [{"target": "oak_log"}, {"radius": 16, "target": "oak_log"}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="同一目标", system=ACTION_PROMPT)
+    ok("同批参数省略/显式默认值按实际 handler 归一化", rpc_count(engine, "block.scan") == 1 and agent.last_timing["read_cache_hits"] == 1)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_scan", "mc_scan"], [{"target": "oak_log"}, {"target": "iron_ore"}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="不同目标", system=ACTION_PROMPT)
+    ok("不同查询参数不会误复用", rpc_count(engine, "block.scan") == 2 and agent.last_timing["read_cache_hits"] == 0)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_scan"], [{"target": "oak_log"}]), (["mc_scan"], [{"target": "oak_log"}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="世界方块可能在模型往返间改变", system=ACTION_PROMPT)
+    ok("地形查询跨模型回合重新读取，不沿用旧地形", rpc_count(engine, "block.scan") == 2)
+
+    for label, mutate in (
+        ("位置改变", lambda p: p.engine.state["position"].update(x=1)),
+        ("背包改变", lambda p: (p.engine.items.update(bread=3), p.engine.state["inventory_summary"].update(entries=[{"name": "bread", "count": 3}]))),
+        ("状态版本改变", lambda p: setattr(p, "_brief_revision", 1)),
+        ("引擎实例改变", lambda p: setattr(p, "engine", FixtureEngine())),
+    ):
+        engine = FixtureEngine()
+        holder = {}
+        def before(number):
+            if number == 2:
+                mutate(holder["plugin"])
+        provider = ScriptedProvider([(["mc_inventory"], [{}]), (["mc_inventory"], [{}]), "结束"], before=before)
+        plugin = FixturePlugin(provider, engine)
+        holder["plugin"] = plugin
+        agent = ActionAgent(plugin)
+        await agent.act(prompt=label, system=ACTION_PROMPT)
+        ok(f"{label}使缓存失效", agent.last_timing["read_cache_hits"] == 0 and agent.last_timing["tool_calls"] == 2)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory", "mc_equip", "mc_inventory"], [{}, {"item": "stone_pickaxe"}, {}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="装备后重新看真实状态", system=ACTION_PROMPT)
+    ok("身体动作之后旧观察失效，并可验证新状态", rpc_count(engine, "inventory.get") == 2 and rpc_count(engine, "equip") == 1)
+    ok("动作后刷新结果真实带上新手持", any("手持：stone_pickaxe" in str(getattr(message, "content", "")) for message in provider.contexts[-1]))
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_equip", "mc_equip"], [{"item": "stone_pickaxe"}, {"destination": "auto", "item": "stone_pickaxe"}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="禁止重复执行同一动作", system=ACTION_PROMPT)
+    ok("同一身体动作只执行一次，包括显式默认参数", rpc_count(engine, "equip") == 1 and agent.last_timing["duplicate_actions_blocked"] == 1)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_craft", "mc_craft"], [{"item": "stick", "count": 1.0}, {"item": "stick", "count": 1}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="等价 JSON 数值不能重放身体动作", system=ACTION_PROMPT)
+    ok("整数与等值浮点参数不会重复合成", rpc_count(engine, "craft") == 1 and engine.items["stick"] == 1)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), (["mc_inventory"], [{}]), "结束"], before=lambda n: engine.state.update(time_of_day=1000+n))
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="时钟前进不改变背包事实", system=ACTION_PROMPT)
+    ok("真实世界时钟前进时，未变的背包仍可复用", rpc_count(engine, "inventory.get") == 1 and agent.last_timing["read_cache_hits"] == 1)
+
+    engine = FixtureEngine()
+    del engine.state["inventory_summary"]
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), (["mc_inventory"], [{}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="残缺状态不能证明背包相同", system=ACTION_PROMPT)
+    ok("残缺快照不复用背包结果", rpc_count(engine, "inventory.get") == 2 and agent.last_timing["read_cache_hits"] == 0)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory", "mc_inventory", "mc_inventory", "mc_chop_tree", "mc_equip"], [{}, {}, {}, {"count": 2}, {"item": "stone_pickaxe"}])])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="预算限制不会拦住同批已有事实的计划", system=ACTION_PROMPT)
+    ok("同批观察超预算仍可提交已有事实支持的长任务", rpc_count(engine, "skill.run") == 1 and agent.last_timing["exit_reason"] == "task_submitted")
+    ok("长任务提交立即收尾，不执行后续身体动作", provider.calls == 1 and rpc_count(engine, "equip") == 0)
+
+    engine = FixtureEngine()
+    engine.fail_state = True
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), (["mc_inventory"], [{}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="不能确认状态时重新查询", system=ACTION_PROMPT)
+    ok("状态检查失败时不缓存、不假装世界没变", rpc_count(engine, "inventory.get") == 2 and agent.last_timing["read_cache_hits"] == 0)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), "结束", (["mc_inventory"], [{}]), "结束"])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    await agent.act(prompt="第一轮", system=ACTION_PROMPT)
+    await agent.act(prompt="第二轮", system=ACTION_PROMPT)
+    ok("观察结果与计时在 act 回合之间隔离", rpc_count(engine, "inventory.get") == 2 and agent.last_timing["read_cache_hits"] == 0 and agent.last_timing["provider_calls"] == 2)
+
+    clock = Clock()
+    engine = FixtureEngine(clock)
+    provider = ScriptedProvider([(["mc_inventory"], [{}]), "结束"], clock=clock)
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    with patch("astrcraft_plugin.action_agent.time.perf_counter", side_effect=clock.now):
+        await agent.act(prompt="分别计时", system=ACTION_PROMPT)
+    timing = agent.last_timing
+    ok("模型计时只覆盖 Provider，不混入真实 handler/RPC", abs(timing["provider_seconds"] - 0.010) < 1e-9 and abs(timing["tool_seconds"] - 0.020) < 1e-9, str(timing))
+    ok("状态检查单独计时，总时长可核对", abs(timing["state_check_seconds"] - 0.006) < 1e-9 and abs(timing["total_seconds"] - 0.036) < 1e-9)
+
+    for phase in ("provider", "tool"):
+        engine = FixtureEngine()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def before(number):
+            if phase == "provider":
+                entered.set()
+                await release.wait()
+        if phase == "tool":
+            engine.release = release
+            entered = engine.entered
+        provider = ScriptedProvider([(["mc_inventory"], [{}]), "结束"], before=before)
+        agent = ActionAgent(FixturePlugin(provider, engine))
+        task = asyncio.create_task(agent.act(prompt="取消", system=ACTION_PROMPT))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("取消应向调用者传播")
+        ok(f"{phase} 被取消仍记录计时与退出原因", agent.last_timing["exit_reason"] == "cancelled" and agent.last_timing[f"{phase}_seconds"] >= 0)
+        engine.release = None
+        provider.before = None
+        provider.calls = 0
+        await agent.act(prompt="取消后的新回合", system=ACTION_PROMPT)
+        ok(f"{phase} 取消不留下可复用的半次观察", agent.last_timing["read_cache_hits"] == 0 and agent.last_timing["tool_calls"] == 1)
+
+    engine = FixtureEngine()
+    provider = ScriptedProvider([RuntimeError("端点不可用")])
+    agent = ActionAgent(FixturePlugin(provider, engine))
+    try:
+        await agent.act(prompt="模型故障", system=ACTION_PROMPT)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("没有动作时的模型故障应交给生活循环恢复")
+    ok("Provider 故障也有独立计时与计数", agent.last_timing["exit_reason"] == "error" and agent.last_timing["provider_calls"] == 1 and agent.last_timing["tool_calls"] == 0)
+
+    from test_life_recovery import make_loop
+    for from_owner in (True, False):
+        life, _ = make_loop()
+        for _ in range(3):
+            life.note_task_result("mine_stone", False, "没有镐")
+        assert not life.skill_retry_ready("mine_stone")
+
+        def interrupted(number):
+            if number == 1:
+                if from_owner:
+                    life.note_owner_said("Alice：镐换好了，立刻再挖石头")
+                else:
+                    life.note_world_event("hurt", "刚刚受伤，先看清周围")
+
+        engine = FixtureEngine()
+        provider = ScriptedProvider([
+            (["mc_inventory"], [{}]),
+            (["mc_mine_stone"], [{"count": 4}]),
+            "结束",
+        ], before=interrupted)
+        plugin = FixturePlugin(provider, engine)
+        plugin.life = life
+        plugin.context.provider_manager.llm_tools.add_func(
+            name="mc_mine_stone", func_args=[], desc="回归测试", handler=McSkillTools.tool_mc_mine_stone)
+        agent = ActionAgent(plugin)
+        await agent.act(prompt="继续安排", system=ACTION_PROMPT)
+        label = "主人要求重试" if from_owner else "世界受伤事件"
+        ok(f"模型思考期间的{label}按输入来源处理技能冷却",
+           rpc_count(engine, "skill.run") == (1 if from_owner else 0))
+        ok(f"{label}已经注入且不留在收件箱，冷却状态仍正确",
+           len(life.inbox) == 0 and life.skill_retry_ready("mine_stone") == from_owner)
+
+
+asyncio.run(real_handler_checks())
 print(f"\n=== 结果：{passed} 通过，{failed} 失败 ===")
 sys.exit(1 if failed else 0)

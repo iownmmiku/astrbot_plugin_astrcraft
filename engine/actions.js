@@ -8,6 +8,7 @@
  */
 
 const log = require('./log');
+const { performance } = require('node:perf_hooks');
 const {
   delay,
   distance,
@@ -67,6 +68,7 @@ class Actions {
     this._lastEatAt = 0;
     this._eating = false;
     this._stopped = false;
+    this._lastContainerOpenAt = -Infinity;
     this._installControlGuards();
     // Supply the queue's signal to RPCs as well as to explicit skill calls.
     // Async context also protects continuations that forgot to forward it.
@@ -94,30 +96,41 @@ class Actions {
     const bot = this._bot;
     if (!bot || bot._astrcraftControlGuard) return;
     bot._astrcraftControlGuard = true;
-    const check = () => {
+    const check = (preparation = true) => {
       const ctx = executionContext.getStore();
       if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧动作已取消');
+      if (preparation) ctx?.preparationCheck?.();
     };
     this._guardWindow(bot.inventory);
     if (typeof bot.on === 'function') bot.on('windowOpen', (window) => this._guardWindow(window));
     const guardWindow = (window) => this._guardWindow(window);
+    const navigator = this._nav;
     for (const name of ['dig', 'placeBlock', 'craft', 'consume', 'equip', 'unequip',
       'activateItem', 'deactivateItem', 'activateBlock', 'activateEntity', 'activateEntityAt',
       'attack', 'look', 'lookAt', 'setControlState', 'clearControlStates', 'clickWindow',
       'transfer', 'putAway', 'putSelectedItemRange', 'moveSlotItem', 'toss', 'tossStack',
-      'openBlock', 'openEntity', 'openContainer', 'openFurnace', 'sleep', 'closeWindow']) {
+      'openBlock', 'openEntity', 'openContainer', 'openFurnace', 'sleep', 'wake', 'closeWindow']) {
       if (typeof bot[name] !== 'function') continue;
       const original = bot[name];
       const returnsWindow = ['openBlock', 'openEntity', 'openContainer', 'openFurnace'].includes(name);
       bot[name] = function (...args) {
-        check();
+        const preparation = !['closeWindow', 'clearControlStates', 'deactivateItem', 'wake'].includes(name);
+        check(preparation);
+        if (name === 'dig' && args[0]?.position) {
+          require('./skills/mining_return').assertProtectedHomeDig(bot, args[0].position);
+        }
+        // Native physicsTick runs outside a Task's ALS context. Its delayed
+        // equipment promise must not continue placing for a superseded path.
+        const nativePathOwner = name === 'equip' && !executionContext.getStore()?.signal &&
+          bot.pathfinder?.goal ? navigator?._activePathOwner : null;
         if (name === 'closeWindow' && args[0] !== bot.currentWindow && args[0] !== bot.inventory) return;
         const result = original.apply(this, args);
         if (result && typeof result.then === 'function') {
           return result.then((value) => {
+            if (nativePathOwner && navigator?._activePathOwner !== nativePathOwner) throw new CancelledError('原生寻路已被替换');
             // mineflayer adds close/withdraw/furnace helpers after windowOpen.
             if (returnsWindow) guardWindow(value);
-            check();
+            check(preparation);
             return value;
           });
         }
@@ -140,7 +153,16 @@ class Actions {
       const original = bot._client.write;
       bot._client.write = function (name, ...args) {
         const ctx = executionContext.getStore();
-        if (writes.has(name) && ctx && ctx.signal && ctx.signal.aborted) return;
+        const waking = name === 'entity_action' && args[0]?.actionId === 2;
+        if ((writes.has(name) || waking) && ctx && ctx.signal && ctx.signal.aborted) return;
+        if (writes.has(name) && name !== 'close_window' && ctx?.preparationCheck) {
+          try { ctx.preparationCheck(); } catch { return; }
+        }
+        if (name === 'block_dig' && [0, 2].includes(args[0]?.status) && ctx?.protectedHome) {
+          try { require('./skills/mining_return').assertProtectedHomeDig(bot, args[0].location); }
+          catch { return; }
+        }
+        if (waking && ctx?.sleepCleanup && !ctx.sleepCleanup.ownsBody()) return;
         return original.call(this, name, ...args);
       };
     }
@@ -160,6 +182,7 @@ class Actions {
       const check = () => {
         const ctx = executionContext.getStore();
         if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧窗口操作已取消');
+        if (name !== 'close') ctx?.preparationCheck?.();
         if (interactions.has(name) && window !== bot.currentWindow) {
           throw new ActionError('容器窗口已关闭或已切换，请重新打开容器');
         }
@@ -173,6 +196,7 @@ class Actions {
           return result.then((value) => {
             const ctx = executionContext.getStore();
             if (ctx && ctx.signal && ctx.signal.aborted) throw new CancelledError('旧窗口操作已取消');
+            if (name !== 'close') ctx?.preparationCheck?.();
             return value;
           });
         }
@@ -185,6 +209,8 @@ class Actions {
   }
 
   stopCurrent() {
+    this._interruptSleepSession(this._sleepSession);
+    this._controlEpoch = (this._controlEpoch || 0) + 1;
     const { executionContext } = require('./goals');
     executionContext.exit(() => {
       for (const name of ['stopDigging', 'deactivateItem', 'clearControlStates']) {
@@ -201,7 +227,49 @@ class Actions {
     });
   }
 
-  setStopped(stopped) { this._stopped = !!stopped; }
+  setStopped(stopped) {
+    this._stopped = !!stopped;
+    if (this._stopped) this._interruptSleepSession(this._sleepSession);
+  }
+
+  _ownsSleepSession(session) {
+    return !!session && session.valid && this._sleepSession === session && this._bot === session.bot &&
+      session.bot.entity === session.entity && session.bot._client === session.client &&
+      session.bot.game?.dimension === session.dimension && session.bot.isAlive !== false &&
+      !(typeof session.bot.health === 'number' && session.bot.health <= 0);
+  }
+
+  _wakeSleepSession(session) {
+    if (!this._ownsSleepSession(session) || !session.bot.isSleeping || session.wakeRequested) return;
+    session.wakeRequested = true;
+    // Only this owned wake may escape an aborted action's ALS guard. The packet
+    // guard checks ownership again if a library continuation sends it later.
+    const { executionContext } = require('./goals');
+    try {
+      const waking = executionContext.exit(() => executionContext.run({ sleepCleanup: session }, () => session.bot.wake()));
+      Promise.resolve(waking).catch(() => {});
+    } catch { /* best effort; never report a wake without server confirmation */ }
+  }
+
+  _interruptSleepSession(session) {
+    if (!session) return;
+    session.cancelled = true;
+    if (session.navigating && !session.travelStopped && this._ownsSleepSession(session)) {
+      session.travelStopped = true;
+      try { require('./goals').executionContext.exit(() => this._nav?.stop()); } catch { /* best effort */ }
+    }
+    if (!session.controller.signal.aborted) session.controller.abort();
+    this._wakeSleepSession(session);
+  }
+
+  _disposeSleepSession(session) {
+    if (!session) return;
+    session.valid = false;
+    clearTimeout(session.cleanupTimer);
+    for (const [emitter, event, listener] of session.listeners) emitter.removeListener?.(event, listener);
+    session.listeners = [];
+    if (this._sleepSession === session) this._sleepSession = null;
+  }
 
   get bot() {
     return this._bot;
@@ -209,6 +277,7 @@ class Actions {
 
   _requireBot() {
     if (!this._bot || !this._bot.entity) throw new NotConnectedError();
+    require('./goals').executionContext.getStore()?.preparationCheck?.();
     return this._bot;
   }
 
@@ -222,8 +291,9 @@ class Actions {
    * @param {AbortSignal} [o.signal]
    * @param {boolean} [o.collect] 是否收集掉落物（默认 true）
    * @param {boolean} [o.reach] 是否允许自己走过去（默认 false，由调用方决定，避免技能层重复寻路）
+   * @param {boolean} [o.safe] 自动采料时检查液体、未知邻格和脚下坠落风险
    */
-  async dig({ x, y, z, signal = null, collect = true, reach = false }) {
+  async dig({ x, y, z, signal = null, collect = true, reach = false, safe = false }) {
     this._requireBot();
     const bot = this._bot;
     const block = bot.blockAt(vec3(x, y, z));
@@ -235,6 +305,12 @@ class Actions {
       throw new ProtectedBlockError(`(${x}, ${y}, ${z}) 的 ${block.name} 挖不动（硬度无限，或需要特殊方式）`);
     }
     this._assertNotProtected(x, y, z, block.name);
+    const assertSafe = () => {
+      if (safe && !require('./skills/common').canHarvestBlockSafely(bot, { x, y, z })) {
+        throw new ActionError('采料位置存在液体、未知区块、坠落风险或不稳定支撑，换一个安全目标');
+      }
+    };
+    assertSafe();
 
     // 需要走位就先过去
     let dist = distance(bot.entity.position, blockCenter(x, y, z));
@@ -290,7 +366,8 @@ class Actions {
       } else {
         await smoothLookAt(bot, blockCenter(x, y, z), { signal, durationMs: 110 });
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
       /* 视角锁定失败不致命 */
     }
 
@@ -305,10 +382,14 @@ class Actions {
     const canDig = bot.canDigBlock(block);
     const timeout = canDig ? DIG_TIMEOUT_BASE : 2000;
     try {
-      await this._raceAbort(() => bot.dig(block), signal, timeout, `挖掘 ${block.name} 超时（${(timeout / 1000).toFixed(0)} 秒）`,
+      await this._raceAbort(() => {
+        assertSafe();
+        this._assertHeldToolFor(block);
+        return bot.dig(block);
+      }, signal, timeout, `挖掘 ${block.name} 超时（${(timeout / 1000).toFixed(0)} 秒）`,
         () => bot.stopDigging());
     } catch (err) {
-      if (err instanceof CancelledError) throw err;
+      if (err instanceof CancelledError || err instanceof NoToolError) throw err;
       const { reason, hint } = humanizeError(err);
       throw new ActionError(`挖掘 ${block.name}${fmtBlock(target)} 失败：${reason}${hint ? `；建议：${hint}` : ''}`);
     }
@@ -383,6 +464,7 @@ class Actions {
 
   /** 挖掘前挡住受保护方块（配合领地插件场景；白/黑名单可配） */
   _assertNotProtected(x, y, z, name) {
+    require('./skills/mining_return').assertProtectedHomeDig(this._bot, { x, y, z });
     // `??` 而不是 `||`：白名单**空数组是合法配置**（= 不限制），
     // 而 `|| []` 会在值为 null/undefined 时把"没有配置"悄悄变成"不限制"——
     // 安全相关的配置静默失效是最危险的一类 bug。
@@ -438,8 +520,10 @@ class Actions {
     if (better) {
       try {
         await this.holdItem({ item: better.name, signal });
+        this._assertHeldToolFor(block);
         return better.name;
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
         log.info(`装备 ${better.name} 失败：${err.message}`);
       }
     }
@@ -457,6 +541,18 @@ class Actions {
         `挖 ${block.name} 需要${needed ? `一把${toolKindName(needed)}` : '合适的工具'}，背包里没有；` +
           `建议先合成工具（例如 mc_craft("stone_pickaxe")），或放弃这个目标换一种方块`,
       );
+    }
+    this._assertHeldToolFor(block);
+    // Hand-harvestable blocks must not wear out an unrelated mining tool.
+    const held = bot.heldItem;
+    if (held?.maxDurability && !kindMatchesBlock(toolKind(held.name), block.name) &&
+        !this._requiredToolKind(block)) {
+      const harmless = bot.inventory.items().find((item) => !item.maxDurability);
+      if (harmless) await bot.equip(harmless, 'hand');
+      else await bot.unequip('hand');
+      if (bot.heldItem?.maxDurability && !kindMatchesBlock(toolKind(bot.heldItem.name), block.name)) {
+        throw new ActionError('未能收起不适合当前方块的工具，停止浪费耐久');
+      }
     }
     return null;
   }
@@ -543,24 +639,29 @@ class Actions {
    * 背包里有没有能挖这个方块的工具。
    * 只看"有没有"，不看距离、不看是否已手持——距离问题由 dig 里的走位逻辑负责。
    */
-  _hasToolFor(block) {    const bot = this._bot;
+  _hasToolFor(block, heldOnly = false) {
+    const bot = this._bot;
     if (!block) return false;
-    let harvest = null;
-    try {
-      const info = bot.registry.blocksByName[block.name];
-      harvest = block.harvestTools || (info && info.harvestTools) || null;
-    } catch {
-      harvest = null;
-    }
+    const harvest = block.harvestTools || bot.registry?.blocksByName?.[block.name]?.harvestTools;
     // 不需要特定工具（泥土、木头等徒手可挖）
     if (!harvest) return true;
+    const usable = (item) => item && harvest[item.type] &&
+      (!item.maxDurability || item.maxDurability - (item.durabilityUsed || 0) > 0);
+    if (heldOnly) return !!usable(bot.heldItem);
     for (const item of bot.inventory.items()) {
-      if (harvest[item.type]) return true;
+      if (usable(item)) return true;
     }
     // 手持的物品也要算（inventory.items() 已包含快捷栏，这里再兜一层）
     const held = bot.heldItem;
-    if (held && harvest[held.type]) return true;
+    if (usable(held)) return true;
     return false;
+  }
+
+  _assertHeldToolFor(block) {
+    if (!this._hasToolFor(block, true)) {
+      const held = this._bot.heldItem?.name || '空手';
+      throw new NoToolError(`当前手持 ${held} 无法采收 ${block.name}；合适工具未装备或已损坏，停止挖掘以保留掉落物`);
+    }
   }
 
   _requiredToolKind(block) {
@@ -583,10 +684,11 @@ class Actions {
     const bot = this._bot;
     let requiredTools = null;
     try {
-      const info = bot.registry.blocksByName[block.name];
-      if (info && info.harvestTools) {
+      const info = bot.registry?.blocksByName?.[block.name];
+      const harvest = block.harvestTools || info?.harvestTools;
+      if (harvest) {
         requiredTools = new Set(
-          Object.keys(info.harvestTools)
+          Object.keys(harvest)
             .map((id) => bot.registry.items[Number(id)])
             .filter(Boolean)
             .map((i) => i.name),
@@ -597,29 +699,33 @@ class Actions {
     }
 
     let best = null;
-    let bestScore = -1;
+    let bestScore = -Infinity;
+    let bestRemain = -1;
     for (const item of bot.inventory.items()) {
       const kind = toolKind(item.name);
       if (!kind) continue;
       if (!['pickaxe', 'axe', 'shovel', 'shears'].includes(kind)) continue;
+      if (requiredTools?.size ? !requiredTools.has(item.name) : !kindMatchesBlock(kind, block.name)) continue;
+      const remain = item.maxDurability ? item.maxDurability - (item.durabilityUsed || 0) : Infinity;
+      if (remain <= 0) continue;
       const tier = TIER_ORDER.indexOf(item.name.split('_')[0]);
       let score = tier >= 0 ? tier : 0;
       // 耐久不足的工具降权，优先用新的
       if (item.maxDurability) {
-        const remain = item.maxDurability - (item.durabilityUsed || 0);
         if (remain <= 3) score -= 5;
         else if (remain / item.maxDurability < 0.5) score -= 1;
       }
       if (kindMatchesBlock(kind, block.name)) score += 3;
       if (requiredTools && requiredTools.has(item.name)) score += 2;
-      if (score > bestScore) {
+      if (score > bestScore || score === bestScore && remain > bestRemain) {
         bestScore = score;
+        bestRemain = remain;
         best = item;
       }
     }
     // 当前手持已经是最优就不换来换去（换手有动画延迟）
     const held = bot.heldItem;
-    if (held && best && held.name === best.name) return null;
+    if (held && best && (held === best || held.slot !== undefined && held.slot === best.slot)) return null;
     return best;
   }
 
@@ -688,13 +794,14 @@ class Actions {
       try {
         await bot.equip(fresh, 'hand');
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
         log.info(`装备 ${want} 第 ${i + 1} 次失败：${err.message}`);
         await delay(200, { signal });
         continue;
       }
       await delay(120, { signal });
       const held = bot.heldItem;
-      if (held && held.name === want) return held;
+      if (held && held.name === want && (!fresh.maxDurability || held.durabilityUsed === fresh.durabilityUsed)) return held;
       log.debug(`装备 ${want} 后手持仍是 ${held ? held.name : '空手'}，重试`);
       await delay(200, { signal });
     }
@@ -709,7 +816,10 @@ class Actions {
     const bot = this._bot;
     const want = String(name).replace(/^minecraft:/, '').toLowerCase();
     const items = bot.inventory.items();
-    let found = items.find((i) => i.name === want);
+    const exact = items.filter((i) => i.name === want);
+    exact.sort((a, b) => (b.maxDurability ? b.maxDurability - (b.durabilityUsed || 0) : 0) -
+      (a.maxDurability ? a.maxDurability - (a.durabilityUsed || 0) : 0));
+    let found = exact[0];
     if (found) return found;
     found = items.find((i) => i.name.endsWith(`_${want}`) || i.name === want);
     if (found) return found;
@@ -854,6 +964,7 @@ class Actions {
 
     const after = blockAt(bot, x, y, z);
     const placed = after && after.name !== 'air' && after.boundingBox !== 'empty';
+    if (placed && this.stations) this.stations.remember(after.name, after.position || target);
     return {
       ok: placed,
       placed: blockItem.name,
@@ -929,9 +1040,13 @@ class Actions {
         return 999;
       }
     };
+    const missingCount = (r) => this._missingForRecipe(r, count, mcData)
+      .reduce((n, m) => n + Math.max(0, m.need - m.have), 0);
     recipes.sort(
       (a, b) =>
+        Number(missingCount(a) > 0) - Number(missingCount(b) > 0) ||
         lackScore(a) - lackScore(b) ||
+        missingCount(a) - missingCount(b) ||
         Number(definitelyNeedsTable(b, want)) - Number(definitelyNeedsTable(a, want)),
     );
     const recipe = recipes[0];
@@ -1241,22 +1356,12 @@ class Actions {
    */
   async _ensureCraftingTable({ signal = null, allowTravel = true, want = '物品' } = {}) {
     const bot = this._requireBot();
-    let table = bot.findBlock({ matching: (b) => b && b.name === 'crafting_table', maxDistance: 24 });
+    let table = this._findStationBlock(['crafting_table']);
 
     // **先查记忆**：附近搜不到时，想想"我之前在哪里用过工作台"。
     // 家里有一个就不该再做第二个（做一次要 4 块木板）。
     if (!table && this.stations && bot.entity) {
-      const known = this.stations.nearest('crafting_table', bot.entity.position);
-      if (known && known.distance <= 128) {
-        const b = blockAt(bot, known.x, known.y, known.z);
-        if (b && b.name === 'crafting_table') {
-          log.info(`想起 ${known.distance} 格外有个工作台，走回去用`);
-          table = b;
-        } else {
-          // 那块已经没了（被拆/被换）→ 忘掉，别再走冤枉路
-          this.stations.forget('crafting_table', known);
-        }
-      }
+      table = await this._rememberedStation('crafting_table', { signal, allowTravel });
     }
 
     if (!table) {
@@ -1270,6 +1375,7 @@ class Actions {
             // 刚放下的这个记下来：下次直接走回来
             if (table && this.stations) this.stations.remember('crafting_table', table.position);
           } catch (err) {
+            if (err instanceof CancelledError || err?.name === 'PreparationBlockedError' || signal?.aborted) throw err;
             log.info(`放置工作台失败：${err.message}`);
           }
         }
@@ -1294,7 +1400,47 @@ class Actions {
         timeoutMs: 20000,
       });
     }
+    if (this.stations) this.stations.remember('crafting_table', table.position);
     return table;
+  }
+
+  async _rememberedStation(kind, { signal = null, allowTravel = true, maxDistance = 128 } = {}) {
+    const bot = this._requireBot();
+    if (!this.stations || !bot.entity) return null;
+    const known = this.stations.nearest(kind, bot.entity.position);
+    if (!known || known.distance > maxDistance) return null;
+    if (!this._stationInsidePreparation(known)) return null;
+    let block = blockAt(bot, known.x, known.y, known.z);
+    if (!block && allowTravel) {
+      try {
+        await this._nav.goTo({ x: known.x, y: known.y, z: known.z, range: 3, signal, timeoutMs: 20000 });
+        block = blockAt(bot, known.x, known.y, known.z);
+      } catch (err) {
+        if (err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError' || err.name === 'PreparationBlockedError' || signal?.aborted) throw err;
+        log.info(`暂时走不到记忆中的 ${kind}，保留未知位置：${err.message}`);
+      }
+    }
+    // 未加载不等于被拆，只有实际读到不同方块才遗忘。
+    if (!block) return null;
+    const matches = kind === 'bed' ? String(block.name).endsWith('_bed') :
+      kind === 'furnace' ? ['furnace', 'blast_furnace', 'smoker'].includes(block.name) : block.name === kind;
+    if (!matches) { this.stations.forget(kind, known); return null; }
+    this.stations.remember(kind, block.position || known);
+    return block;
+  }
+
+  _stationInsidePreparation(position) {
+    const context = require('./goals').executionContext.getStore();
+    context?.preparationCheck?.();
+    if (!context?.indoorHome) return true;
+    return require('./skills/preparation').isIndoorStation(position, context.indoorHome);
+  }
+
+  _findStationBlock(names, { maxDistance = 24, input = null } = {}) {
+    const bot = this._requireBot();
+    return bot.findBlock({ matching: (block) => block && names.includes(block.name)
+      && (!input || canSmeltInFurnace(block.name, input)),
+      useExtraInfo: (block) => !!block?.position && this._stationInsidePreparation(block.position), maxDistance });
   }
 
   /**
@@ -1382,34 +1528,18 @@ class Actions {
   // ================================================================ 熔炼
 
   /** 熔炼。需要熔炉 + 燃料；会自动放熔炉、找燃料、等产物 */
-  async smelt({ item: itemName, count = 1, fuel: fuelName = null, signal = null }) {
+  async smelt({ item: itemName, count = 1, fuel: fuelName = null, signal = null, reserveItems = {} }) {
     const bot = this._requireBot();
     const want = String(itemName).replace(/^minecraft:/, '');
     const item = this._findItem(want);
     if (!item) throw new MissingItemError(`原料 ${want}`, '先挖到/收集到原料再熔炼');
 
-    const fuelItem = fuelName ? this._findItem(fuelName) : this._findFuel();
-    if (!fuelItem) {
-      throw new MissingItemError('燃料（煤炭/木炭/原木/木板）', '可以先用 mc_collect 弄点木头当燃料');
-    }
-
     // 找或放熔炉
-    let furnace = bot.findBlock({
-      matching: (b) => b && (b.name === 'furnace' || b.name === 'blast_furnace' || b.name === 'smoker'),
-      maxDistance: 24,
-    });
+    let furnace = this._findStationBlock(['furnace', 'blast_furnace', 'smoker'], { input: want });
     // 先查记忆：熔炉要 8 个圆石，重做一个等于白挖一轮
     if (!furnace && this.stations && bot.entity) {
-      const known = this.stations.nearest('furnace', bot.entity.position);
-      if (known && known.distance <= 128) {
-        const b = blockAt(bot, known.x, known.y, known.z);
-        if (b && (b.name === 'furnace' || b.name === 'blast_furnace' || b.name === 'smoker')) {
-          log.info(`想起 ${known.distance} 格外有个熔炉，走回去用`);
-          furnace = b;
-        } else {
-          this.stations.forget('furnace', known);
-        }
-      }
+      furnace = await this._rememberedStation('furnace', { signal });
+      if (furnace && !canSmeltInFurnace(furnace.name, want)) furnace = null;
     }
     if (!furnace) {
       const fItem = this._findItem('furnace');
@@ -1436,21 +1566,62 @@ class Actions {
       });
     }
 
-    const times = Math.max(1, Math.min(64, Number(count) || 1));
+    const times = Math.max(1, Math.min(64, Math.ceil(Number(count) || 1)));
     const before = this.inventoryMap();
-    const win = await bot.openFurnace(furnace);
+    const openedEntity = bot.entity, openedClient = bot._client;
+    // Mineflayer computes fuelSeconds using totalFuel. The remaining-fuel
+    // packet can precede that denominator, making a hot furnace look cold.
+    const fuelTicks = new Map();
+    const observeFuel = (packet) => {
+      if (packet.property === 0 && Number.isInteger(packet.value) && packet.value >= 0) {
+        fuelTicks.set(packet.windowId, packet.value);
+      }
+    };
+    openedClient?.on?.('craft_progress_bar', observeFuel);
+    let win;
     try {
-      const put = Math.min(times, item.count);
-      const fuelNeeded = Math.max(1, Math.ceil(put / 8)); // 一块煤约烧 8 个
-      const fuelPut = Math.min(fuelNeeded, fuelItem.count);
+      win = await this._raceAbort(() => bot.openFurnace(furnace), signal, 20000, '等待服务端打开熔炉超时');
+    } catch (err) {
+      openedClient?.removeListener?.('craft_progress_bar', observeFuel);
+      throw err;
+    }
+    if (this.stations) this.stations.remember('furnace', furnace.position);
+    try {
+      // Remaining heat is authoritative window data, reusable by the next batch.
+      const propertyDeadline = Date.now() + 1000;
+      while (!fuelTicks.has(win.id) && !Number.isFinite(win.fuelSeconds) && Date.now() < propertyDeadline) {
+        await delay(50, { signal });
+        this._requireBot();
+      }
+      if (win.inputItem() || win.outputItem()) {
+        throw new ActionError('熔炉里已有原料或成品，请先取出，避免混入本次熔炼结果');
+      }
+      const cookSeconds = furnace.name === 'furnace' ? 10 : 5;
+      const fuelSeconds = fuelTicks.has(win.id) ? fuelTicks.get(win.id) * 0.05 : Number(win.fuelSeconds) || 0;
+      const heatCapacity = Math.max(0, fuelSeconds) / cookSeconds;
+      const storedFuel = win.fuelItem();
+      const storedCapacity = storedFuel ? fuelSmeltCapacity(storedFuel.name) * storedFuel.count : 0;
+      // Opening/travelling to a furnace can await inventory updates. Select
+      // from the current stacks and leave the caller's reserved supplies out.
+      const fuelItem = fuelName ? this._availableFuelItem(this._findItem(fuelName), reserveItems) :
+        this._findFuel(reserveItems);
+      const capacity = fuelItem ? fuelSmeltCapacity(fuelItem.name) : 0;
+      const put = Math.min(times, item.count, Math.floor(heatCapacity + storedCapacity + capacity * (fuelItem?.count || 0)));
+      if (put <= 0) throw new MissingItemError('足够的熔炼燃料', '现有燃料不足以实际烧成一件物品');
+      const fuelNeeded = Math.max(0, put - heatCapacity - storedCapacity);
+      const fuelPut = fuelNeeded > 0 && capacity > 0 ? Math.min(Math.ceil(fuelNeeded / capacity), fuelItem.count) : 0;
+      if (fuelPut && storedFuel && storedFuel.name !== fuelItem.name) {
+        throw new ActionError('炉内燃料与背包燃料不同且余量不足，请先整理燃料');
+      }
       await win.putInput(item.type, null, put);
-      await win.putFuel(fuelItem.type, null, fuelPut);
-      log.info(`熔炼 ${want}×${put}，用 ${fuelItem.name}×${fuelPut} 作燃料`);
+      if (fuelPut) await win.putFuel(fuelItem.type, null, fuelPut);
+      log.info(`熔炼 ${want}×${put}，${fuelPut ? `用 ${fuelItem.name}×${fuelPut} 作燃料` : '沿用炉内实际余热或燃料'}`);
 
       const expected = put;
       const deadline = Date.now() + Math.min(60000, 12000 * put);
       let produced = 0;
       while (Date.now() < deadline) {
+        this._requireBot();
         if (signal && signal.aborted) throw new CancelledError();
         await delay(500, { signal });
         const out = win.outputItem();
@@ -1460,7 +1631,8 @@ class Actions {
         }
         if (!win.inputItem()) break;
       }
-      await win.takeOutput();
+      if (win.outputItem()) await win.takeOutput();
+      if (win.inputItem()) await win.takeInput();
       try {
         const leftFuel = win.fuelItem();
         if (leftFuel) await win.takeFuel();
@@ -1468,7 +1640,10 @@ class Actions {
         /* ignore */
       }
     } finally {
-      win.close();
+      openedClient?.removeListener?.('craft_progress_bar', observeFuel);
+      if (bot.entity === openedEntity && bot._client === openedClient && bot.currentWindow === win) {
+        require('./goals').executionContext.exit(() => win.close());
+      }
     }
     await delay(200, { signal });
     const after = this.inventoryMap();
@@ -1486,14 +1661,30 @@ class Actions {
     };
   }
 
-  _findFuel() {
+  _availableFuelItem(item, reserveItems = {}) {
+    if (!item) return null;
+    const total = this._bot.inventory.items().filter((entry) => entry.name === item.name && entry.type === item.type)
+      .reduce((count, entry) => count + entry.count, 0);
+    const reserved = Math.max(0, Math.ceil(Number(reserveItems?.[item.name] ?? reserveItems?.[`minecraft:${item.name}`]) || 0));
+    // Native putFuel can move across source stacks, but the destination is a
+    // single furnace slot. Bound the batch to what that slot can actually hold.
+    const stackSize = item.stackSize || this._bot.registry?.itemsByName?.[item.name]?.stackSize || 64;
+    const count = Math.min(stackSize, Math.max(0, total - reserved));
+    return count > 0 ? { ...item, count } : null;
+  }
+
+  _findFuel(reserveItems = {}) {
     const preferred = [
       'coal', 'charcoal', 'oak_planks', 'birch_planks', 'spruce_planks', 'oak_log', 'birch_log',
       'spruce_log', 'stick', 'lava_bucket', 'dried_kelp_block', 'blaze_rod',
     ];
     for (const name of preferred) {
-      const it = this._findItem(name);
-      if (it) return it;
+      const it = this._availableFuelItem(this._findItem(name), reserveItems);
+      if (it && fuelSmeltCapacity(it.name) * it.count >= 1) return it;
+    }
+    for (const item of this._bot.inventory.items()) {
+      const it = this._availableFuelItem(item, reserveItems);
+      if (it && fuelSmeltCapacity(it.name) * it.count >= 1) return it;
     }
     return null;
   }
@@ -1744,10 +1935,11 @@ class Actions {
     }
     await this.holdItem({ item: 'shield', signal });
     try {
-      await bot.activateItem(true); // 副手/主手举盾
+      await bot.activateItem(); // holdItem equips the shield in the main hand.
       await delay(Math.max(300, Math.min(holdMs, 15000)), { signal });
       bot.deactivateItem();
     } catch (err) {
+      if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
       throw new ActionError(`举盾失败：${describeFailure(err)}`);
     }
     return { ok: true, note: `举了 ${(holdMs / 1000).toFixed(1)} 秒盾` };
@@ -1828,20 +2020,38 @@ class Actions {
 
   async equipBestWeapon({ signal = null } = {}) {
     const bot = this._requireBot();
-    const held = bot.heldItem;
-    if (held && /(_sword|_axe)$/.test(held.name)) return held.name;
-    const weapons = bot.inventory
-      .items()
-      .filter((i) => /(_sword|_axe)$/.test(i.name))
-      .sort((a, b) => weaponScore(b.name) - weaponScore(a.name));
-    if (!weapons.length) return null;
-    try {
-      await bot.equip(weapons[0], 'hand');
-      await delay(120, { signal });
-    } catch {
-      /* 装备失败不影响徒手打 */
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const weapon = this._weaponCandidates()[0];
+      if (!weapon) return null;
+      if (weapon === bot.heldItem) return weapon.name;
+      try {
+        await bot.equip(weapon, 'hand');
+        await delay(120, { signal });
+        const held = bot.heldItem;
+        if (held?.name === weapon.name && (!weapon.maxDurability ||
+            (held.durabilityUsed || 0) === (weapon.durabilityUsed || 0))) return held.name;
+        log.debug(`装备武器 ${weapon.name} 后手持未匹配，重新检查背包`);
+      } catch (err) {
+        if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+        log.info(`装备武器第 ${attempt + 1} 次失败：${err.message}`);
+      }
+      if (attempt < 2) await delay(200, { signal });
     }
-    return weapons[0].name;
+    throw new ActionError(`没能把战斗武器装备到手上（当前手持：${bot.heldItem?.name || '空手'}），先重新装备再攻击`);
+  }
+
+  _weaponCandidates() {
+    const bot = this._requireBot();
+    const held = bot.heldItem;
+    const remaining = (item) => item.maxDurability ? item.maxDurability - (item.durabilityUsed || 0) : 0;
+    // The actual held stack is authoritative if an inventory snapshot still has
+    // stale durability for that slot. Another stack of the same name can replace it.
+    const weapons = bot.inventory.items().filter((item) => item !== held &&
+      !(Number.isInteger(held?.slot) && held.slot >= 0 && item.slot === held.slot));
+    if (held) weapons.unshift(held);
+    return weapons.filter((item) => /(_sword|_axe)$/.test(item.name) &&
+      (item.count === undefined || item.count > 0) && (!item.maxDurability || remaining(item) > 0))
+      .sort((a, b) => weaponScore(b.name) - weaponScore(a.name) || remaining(b) - remaining(a));
   }
 
   _resolveEntity(target) {
@@ -1917,6 +2127,107 @@ class Actions {
     return { ok: true, block: block.name, position: { x, y, z }, held: bot.heldItem ? bot.heldItem.name : null };
   }
 
+  /** 门交互必须由服务器确认上下两半，不能把发包当成开好了。 */
+  async openDoor(options) { return this._setDoorOpen({ ...options, desiredOpen: true }); }
+
+  async closeDoor(options) { return this._setDoorOpen({ ...options, desiredOpen: false }); }
+
+  async _setDoorOpen({ x, y, z, desiredOpen, signal = null, timeoutMs = 2000 }) {
+    const bot = this._requireBot();
+    const verb = desiredOpen ? '打开' : '关上';
+    const check = () => { if (signal?.aborted || this._stopped) throw new CancelledError('门交互已取消'); };
+    // Direct callers may select the upper half; the home record stores the lower one.
+    if (blockAt(bot, x, y, z)?.getProperties?.().half === 'upper') y -= 1;
+    const read = () => [blockAt(bot, x, y, z), blockAt(bot, x, y + 1, z)];
+    const properties = (b) => typeof b?.getProperties === 'function' ? b.getProperties() : {};
+    const valid = ([lower, upper]) => lower?.name?.endsWith('_door') && lower.name === upper?.name &&
+      properties(lower).half === 'lower' && properties(upper).half === 'upper' &&
+      [lower, upper].every((b) => typeof properties(b).open === 'boolean');
+    check();
+    const pair = read(), block = pair[0];
+    if (!valid(pair)) return { ok: false, note: '基地门上下两半尚未加载或已经被改变' };
+    if (pair.every((b) => properties(b).open === desiredOpen)) return { ok: true };
+    if (block.name === 'iron_door' || properties(pair[0]).open !== properties(pair[1]).open) {
+      return { ok: false, note: `无法手动确认${verb}这扇门` };
+    }
+    if (distance(bot.entity.position, blockCenter(x, y, z)) > REACH) return { ok: false, note: '基地门离得太远，暂时够不到' };
+    const deadline = Date.now() + Math.max(1, Math.min(2000, Number(timeoutMs) || 2000));
+    bot.setControlState('sneak', false);
+    await this._raceAbort(() => bot.activateBlock(block), signal, Math.max(1, deadline - Date.now()), `${verb}基地门超时`);
+    while (Date.now() < deadline) {
+      check();
+      const now = read();
+      if (!valid(now) || now[0].name !== block.name) return { ok: false, note: '交互期间基地门被改变' };
+      if (now.every((b) => properties(b).open === desiredOpen)) return { ok: true };
+      await delay(Math.min(100, Math.max(1, deadline - Date.now())), { signal });
+    }
+    check();
+    return { ok: false, note: `服务器尚未确认门已${desiredOpen ? '打开' : '关上'}` };
+  }
+
+  /** 从已打开的木门外沿中心线走到门内；真实物理移动，限两格和六秒。 */
+  async enterDoor({ x, y, z, target, signal = null, timeoutMs = 6000 }) {
+    const bot = this._requireBot();
+    let controlEpoch = null;
+    const check = () => { if (signal?.aborted || this._stopped ||
+      controlEpoch !== null && this._controlEpoch !== controlEpoch) throw new CancelledError('进屋已取消'); };
+    check();
+    const dx = target?.x - x - 0.5, dz = target?.z - z - 0.5;
+    if (!(Math.abs(dx) === 1 && dz === 0 || Math.abs(dz) === 1 && dx === 0) || target.y !== y) {
+      return { ok: false, note: '进屋目标不是门内相邻落脚点' };
+    }
+    const outside = { x: x + 0.5 - dx, y, z: z + 0.5 - dz };
+    if (distance(bot.entity.position, outside) > 0.9) return { ok: false, note: '尚未实际站到基地门外' };
+    const name = blockAt(bot, x, y, z)?.name;
+    const clearPair = () => [0, 1].every((dy) => {
+      const b = blockAt(bot, x, y + dy, z), props = b?.getProperties?.();
+      const axis = dx ? 2 : 0;
+      return b?.name === name && name?.endsWith('_door') && name !== 'iron_door' &&
+        props?.half === (dy ? 'upper' : 'lower') && props.open === true &&
+        Array.isArray(b.shapes) && b.shapes.length > 0 && b.shapes.every((shape) =>
+          shape[axis + 3] <= 0.2 || shape[axis] >= 0.8);
+    });
+    const safeFloor = (p) => {
+      const b = blockAt(bot, p.x, y - 1, p.z);
+      return b?.boundingBox === 'block' && !['water', 'lava', 'magma_block', 'cactus', 'fire', 'powder_snow'].includes(b.name);
+    };
+    const clearLanding = (p) => safeFloor(p) && [0, 1].every((dy) => {
+      const b = blockAt(bot, p.x, y + dy, p.z);
+      return b?.boundingBox === 'empty' && !['water', 'lava', 'fire', 'soul_fire', 'powder_snow', 'sweet_berry_bush'].includes(b.name);
+    });
+    if (!clearPair()) return { ok: false, note: '基地门尚未确认打开，或门的朝向挡住入口' };
+    if (!clearLanding(outside) || !clearLanding(target) || !safeFloor({ x, z })) return { ok: false, note: '基地门两侧没有安全通道' };
+    const deadline = Date.now() + Math.max(1, Math.min(6000, Number(timeoutMs) || 6000));
+    this._nav.stop();
+    controlEpoch = this._controlEpoch = (this._controlEpoch || 0) + 1;
+    let controlling = false;
+    try {
+      await this._raceAbort(() => bot.lookAt(vec3(target.x, y + 1.62, target.z), true), signal,
+        Math.max(1, deadline - Date.now()), '对准基地入口超时');
+      check();
+      controlling = true;
+      for (const key of ['sprint', 'jump', 'sneak']) bot.setControlState(key, false);
+      bot.setControlState('forward', true);
+      while (Date.now() < deadline) {
+        check();
+        if (!clearPair()) return { ok: false, note: '进屋期间基地门被改变或关闭' };
+        if (!clearLanding(outside) || !clearLanding(target) || !safeFloor({ x, z }) || !safeFloor(bot.entity.position)) {
+          return { ok: false, note: '进屋期间入口支撑或通道被改变' };
+        }
+        if (bot.entity.isInWater || bot.entity.isInLava || bot.entity.isOnFire) return { ok: false, note: '基地入口出现危险' };
+        if (distance(bot.entity.position, target) <= 0.3 && bot.entity.onGround) return { ok: true };
+        await delay(Math.min(50, Math.max(1, deadline - Date.now())), { signal });
+      }
+      check();
+      return { ok: false, note: '尚未实际穿过基地门，进屋超时' };
+    } finally {
+      // Clearing our controls is required even after cancellation; no late travel or door click.
+      if (controlling && this._controlEpoch === controlEpoch) {
+        require('./goals').executionContext.exit(() => bot.clearControlStates());
+      }
+    }
+  }
+
   /**
    * 手写的小范围找床（不依赖 `bot.findBlock`）。
    *
@@ -1958,108 +2269,173 @@ class Actions {
    *   - 床被占了 / 只有半张床 → 换一张
    * 另外她会**先走过去**——睡觉得站到床边。
    */
-  async sleepInBed({ signal = null, timeoutMs = 120000 } = {}) {
+  async sleepInBed({ signal = null, timeoutMs = 120000, bed_position = null } = {}) {
     const bot = this._requireBot();
-    if (bot.isSleeping) return { ok: true, already: true, note: '已经在睡了' };
-
-    // 先找床：附近 32 格（findBlock），找不到再用**手写的小范围扫描**兜底。
-    //
-    // 为什么要兜底：实测 `bot.findBlock` 在她**站进床里**（放床时被挤过去）之后
-    // 会返回 null——同一张床在天黑前能看到、天黑后就"消失"了，
-    // 于是她明明睡在一张床上却报"附近没有床"。
-    let bed = bot.findBlock({ matching: (b) => b && String(b.name).endsWith('_bed'), maxDistance: 32 });
-    if (!bed) bed = this._scanForBed(16);
-    if (!bed && this.stations && bot.entity) {
-      const known = this.stations.nearest('bed', bot.entity.position);
-      if (known && known.distance <= 96) {
-        const b = blockAt(bot, known.x, known.y, known.z);
-        if (b && String(b.name).endsWith('_bed')) bed = b;
-        else this.stations.forget('bed', known);
-      }
+    if (bot.game?.dimension && !/^(?:minecraft:)?overworld$/.test(String(bot.game.dimension))) {
+      throw new ActionError('这个维度不能安全睡床，床会爆炸；请在主世界休息');
     }
-    if (!bed) {
-      throw new MissingItemError(
-        '床',
-        '附近 32 格内没有床。先做一张（3 个羊毛 + 3 块木板）放在屋里——晚上能睡过去，还能设重生点',
-      );
+    if (this._ownsSleepSession(this._sleepSession)) {
+      return { ok: false, already: true, slept: false, day_confirmed: false, note: '已有睡觉动作在等待服务器确认，请稍后再试' };
     }
-
-    // 走过去（睡觉得站到床边）
-    const d = distance(bot.entity.position, blockCenter(bed.position.x, bed.position.y, bed.position.z));
-    if (d > 2) {
-      try {
-        await this._nav.goTo({
-          x: bed.position.x,
-          y: null,
-          z: bed.position.z,
-          range: 1.6,
-          signal,
-          timeoutMs: 25000,
-          segmented: false,
-        });
-      } catch (err) {
-        if (err instanceof CancelledError) throw err;
-        log.info(`走到床边失败，就地试着睡：${err.message}`);
-      }
-    }
-
-    // 天亮就如实说，别浪费一轮
-    const tod = bot.time ? Number(bot.time.timeOfDay) : 0;
-    const isNight = tod >= 12541 && tod <= 23458;
-    const storm = !!bot.isRaining && Number(bot.thunderState) > 0;
-    if (!isNight && !storm) {
-      return {
-        ok: false,
-        note: '现在天还亮着，睡不了（原版规则：只能夜里或雷雨天睡）。天黑再来，或者先干点别的',
-      };
-    }
-
-    try {
-      await bot.sleep(bed);
-    } catch (err) {
-      const msg = String(err.message || err);
-      let hint = msg;
-      if (/not night/i.test(msg)) hint = '服务器说现在不是夜里，睡不了';
-      else if (/occupied/i.test(msg)) hint = '这张床被占了，换一张';
-      else if (/only half bed/i.test(msg)) hint = '这床只有半张（另一半被拆了），放一张新的';
-      else if (/monster|too far|not safe/i.test(msg)) hint = '附近有怪，原版规则不让睡——先清掉它们';
-      else if (/cant click/i.test(msg)) hint = '够不到这张床，走近一点再试';
-      throw new ActionError(`睡觉失败：${hint}`);
-    }
-
-    // 等服务器确认她真的睡下
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline && !bot.isSleeping) {
-      if (signal && signal.aborted) throw new CancelledError();
-      await delay(200, { signal });
-    }
-    if (!bot.isSleeping) {
-      return { ok: false, note: '请求睡觉了但服务器没让睡（可能床的位置不对，或附近有怪）' };
-    }
-    log.info('她睡下了（天黑了）');
-
-    // 等天亮（睡着期间服务器推进时间）。醒来或超时就返回。
-    const wakeDeadline = Date.now() + Math.max(30000, Math.min(timeoutMs, 600000));
-    while (Date.now() < wakeDeadline) {
-      if (signal && signal.aborted) throw new CancelledError();
-      if (!bot.isSleeping) break;
-      await delay(1000, { signal });
-    }
-    const stillSleeping = !!bot.isSleeping;
-    if (stillSleeping) {
-      try {
-        await bot.wake();
-      } catch {
-        /* 叫不醒就算了 */
-      }
-    }
-    const tod2 = bot.time ? Number(bot.time.timeOfDay) : 0;
-    return {
-      ok: true,
-      slept: true,
-      woke_at: tod2,
-      note: stillSleeping ? '睡了很久还没天亮（可能有人在旁边），先起来了' : '睡醒了，天亮了',
+    this._disposeSleepSession(this._sleepSession);
+    const ms = Number(timeoutMs);
+    const deadline = Date.now() + Math.max(1, Math.min(600000, Number.isFinite(ms) ? ms : 120000));
+    const session = this._sleepSession = {
+      bot, entity: bot.entity, client: bot._client, dimension: bot.game?.dimension,
+      controller: new AbortController(), valid: true, cancelled: false,
+      slept: !!bot.isSleeping, already: !!bot.isSleeping, woke: false, wakeRequested: false,
+      requestPending: false, finished: false, listeners: [],
     };
+    session.ownsBody = () => this._ownsSleepSession(session);
+    const add = (emitter, event, listener, first = false) => {
+      if (typeof emitter?.on !== 'function') return;
+      if (first && typeof emitter.prependListener === 'function') emitter.prependListener(event, listener);
+      else emitter.on(event, listener);
+      session.listeners.push([emitter, event, listener]);
+    };
+    const invalidate = () => {
+      session.valid = false;
+      this._interruptSleepSession(session);
+    };
+    // A native respawn may reuse the same entity object and dimension. Invalidate
+    // before other listeners stop actions, so cleanup cannot wake the new body.
+    for (const event of ['respawn', 'death', 'end']) add(bot, event, invalidate, true);
+    for (const event of ['respawn', 'login', 'end']) add(session.client, event, invalidate, true);
+    add(bot, 'sleep', () => {
+      if (!session.ownsBody()) return;
+      if (session.woke) return invalidate(); // A later sleep cycle has another owner.
+      session.slept = true;
+      if (session.cancelled) this._wakeSleepSession(session);
+    });
+    add(bot, 'wake', () => { if (session.ownsBody() && session.slept) session.woke = true; });
+    const abort = () => this._interruptSleepSession(session);
+    if (signal) {
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    }
+    const sleepSignal = session.controller.signal;
+    const check = () => {
+      if (signal?.aborted || sleepSignal.aborted || this._stopped || !session.ownsBody()) throw new CancelledError('睡觉已取消或身体已切换');
+    };
+    const remaining = () => {
+      check();
+      const left = deadline - Date.now();
+      if (left <= 0) throw new TimeoutError('睡觉等待超时');
+      return left;
+    };
+    const result = (note, extra = {}) => {
+      const tod = bot.time?.timeOfDay;
+      const knownTime = typeof tod === 'number' && Number.isFinite(tod) && tod >= 0 && tod < 24000;
+      const day = knownTime && tod < 12541;
+      return { ok: session.slept && !bot.isSleeping && day, slept: session.slept,
+        already: session.already, day_confirmed: day, sleeping: !!bot.isSleeping,
+        woke_at: knownTime ? tod : null, note, ...extra };
+    };
+    const race = (operation, message) => this._raceAbort(operation, sleepSignal, remaining(), message,
+      () => this._interruptSleepSession(session));
+    try {
+      remaining();
+      if (!session.already) {
+        let bed = null;
+        if (bed_position) {
+          if (!['x', 'y', 'z'].every((k) => Number.isFinite(bed_position[k]))) throw new ActionError('床坐标无效');
+          bed = blockAt(bot, bed_position.x, bed_position.y, bed_position.z);
+          if (!bed || !String(bed.name).endsWith('_bed')) throw new MissingItemError('基地里的床', '记录的床尚未加载或已经被拆，请重新检查基地');
+        } else {
+          bed = bot.findBlock({ matching: (b) => b && String(b.name).endsWith('_bed'), maxDistance: 32 });
+        }
+        if (!bed) bed = this._scanForBed(16);
+        remaining();
+        if (!bed && this.stations) bed = await race(() => this._rememberedStation('bed', { signal: sleepSignal, maxDistance: 96 }), '寻找记忆中的床超时');
+        if (!bed) throw new MissingItemError('床', '附近 32 格内没有床。先做一张（3 个羊毛 + 3 块木板）放在屋里——晚上能睡过去，还能设重生点');
+        remaining();
+        const d = distance(bot.entity.position, blockCenter(bed.position.x, bed.position.y, bed.position.z));
+        if (d > 2) {
+          session.navigating = true;
+          try {
+            await race(() => this._nav.goTo({ x: bed.position.x, y: null, z: bed.position.z,
+              range: 1.6, signal: sleepSignal, timeoutMs: Math.min(25000, remaining()), segmented: false }), '走到床边超时');
+          } catch (err) {
+            if (err instanceof CancelledError || err instanceof TimeoutError) throw err;
+            log.info(`走到床边失败，就地试着睡：${err.message}`);
+          } finally { session.navigating = false; }
+        }
+        remaining();
+        const tod = Number(bot.time?.timeOfDay);
+        const night = Number.isFinite(tod) && tod >= 12541 && tod <= 23458;
+        const storm = !!bot.isRaining && Number(bot.thunderState) > 0;
+        if (!night && !storm) return result(Number.isFinite(tod) ? '现在不是可睡觉的夜里或雷雨天，天黑再来' : '服务器时间尚未确认，暂不能判断能否睡觉', { ok: false });
+        if (this.stations) this.stations.remember('bed', bed.position);
+        try {
+          await race(() => {
+            session.requestPending = true;
+            let request;
+            try { request = Promise.resolve(bot.sleep(bed)); } catch (err) { session.requestPending = false; throw err; }
+            const settled = () => {
+              session.requestPending = false;
+              if (session.finished) {
+                this._wakeSleepSession(session);
+                this._disposeSleepSession(session);
+              }
+            };
+            request.then(settled, settled);
+            return request;
+          }, '服务器确认睡觉超时');
+        } catch (err) {
+          if (err instanceof CancelledError || err instanceof TimeoutError || sleepSignal.aborted) throw err;
+          const msg = String(err.message || err);
+          let hint = msg;
+          if (/not night/i.test(msg)) hint = '服务器说现在不是夜里，睡不了';
+          else if (/occupied/i.test(msg)) hint = '这张床被占了，换一张';
+          else if (/only half bed/i.test(msg)) hint = '这床只有半张（另一半被拆了），放一张新的';
+          else if (/monster|not safe/i.test(msg)) hint = '附近有怪，原版规则不让睡——先清掉它们';
+          else if (/too far|cant click/i.test(msg)) hint = '够不到这张床，走近一点再试';
+          throw new ActionError(`睡觉失败：${hint}`);
+        }
+      }
+      check();
+      // Observe events before calling sleep: a full sleep/wake cycle can finish
+      // before its promise resumes. Polling still supports older bot adapters.
+      const confirmDeadline = Math.min(deadline, Date.now() + 8000);
+      while (!session.slept && Date.now() < confirmDeadline) {
+        check();
+        if (bot.isSleeping) { session.slept = true; break; }
+        await delay(Math.min(50, remaining()), { signal: sleepSignal });
+      }
+      if (!session.slept) { remaining(); return result('请求睡觉了但服务器尚未确认入睡', { ok: false }); }
+      log.info('她睡下了');
+      while (bot.isSleeping) {
+        remaining();
+        await delay(Math.min(100, remaining()), { signal: sleepSignal });
+      }
+      check();
+      // Wake can precede the server's time update. Give that update a bounded
+      // chance to arrive, while never treating an unknown clock as dawn.
+      const timeDeadline = Math.min(deadline, Date.now() + 1000);
+      while (!result('').day_confirmed && Date.now() < timeDeadline) {
+        check();
+        await delay(Math.min(50, Math.max(1, timeDeadline - Date.now())), { signal: sleepSignal });
+      }
+      check();
+      const awake = result('');
+      return { ...awake, note: awake.ok ? '睡醒了，已确认天亮' : '已经醒来，但尚未确认天亮，夜晚可能还没有跳过' };
+    } catch (err) {
+      if (err instanceof TimeoutError) {
+        this._interruptSleepSession(session);
+        return result(bot.isSleeping ? '睡觉等待超时，已请求起床；服务器尚未确认醒来或天亮' : '睡觉等待超时，尚未确认睡到天亮', { ok: false, timed_out: true });
+      }
+      throw err;
+    } finally {
+      session.finished = true;
+      if (signal) signal.removeEventListener('abort', abort);
+      this._wakeSleepSession(session);
+      if (session.cancelled && session.requestPending && session.ownsBody()) {
+        // A bed click already sent can be accepted after cancellation. Retain
+        // only its owned confirmation listener, bounded by mineflayer's 3s wait.
+        session.cleanupTimer = setTimeout(() => this._disposeSleepSession(session), 3500);
+        session.cleanupTimer.unref?.();
+      } else this._disposeSleepSession(session);
+    }
   }
 
   /**
@@ -2162,7 +2538,7 @@ class Actions {
 
   async openContainer({ x, y, z, signal = null, reach = false }) {
     const bot = this._requireBot();
-    const block = blockAt(bot, x, y, z);
+    let block = blockAt(bot, x, y, z);
     if (!block) throw new ActionError(`${fmtBlock({ x, y, z })} 没有加载`);
     const containerNames = ['chest', 'trapped_chest', 'barrel', 'shulker_box', 'ender_chest'];
     const isContainer = containerNames.some((n) => block.name.includes(n));
@@ -2172,7 +2548,19 @@ class Actions {
       if (!reach) throw new ActionError(`箱子距离 ${d.toFixed(1)} 格，够不到；先移动过去`);
       await this._nav.goTo({ x, y, z, range: 2, signal, timeoutMs: 15000 });
     }
-    const win = await bot.openContainer(block);
+    // Rapid close/reopen verification can exceed the server's interaction burst
+    // limit. Space requests across ticks so a valid open is not silently dropped.
+    while (performance.now() - this._lastContainerOpenAt < 75) {
+      await delay(75 - (performance.now() - this._lastContainerOpenAt), { signal });
+    }
+    if (signal?.aborted || this._stopped) throw new CancelledError('开箱等待被取消');
+    block = blockAt(bot, x, y, z);
+    if (!block || !containerNames.some((name) => block.name.includes(name))) {
+      throw new ActionError('打开前容器已改变或区块未加载，请重新观察');
+    }
+    this._lastContainerOpenAt = performance.now();
+    const win = await this._raceAbort(() => bot.openContainer(block), signal, 20000, '等待服务端打开容器超时');
+    if (this.stations) this.stations.remember(block.name, block.position || { x, y, z });
     return {
       win,
       describe() {
@@ -2189,24 +2577,57 @@ class Actions {
     const container = await this.openContainer({ x, y, z, signal, reach });
     const win = container.win;
     const moved = {};
+    const check = () => {
+      if (signal?.aborted || this._stopped) throw new CancelledError('存物动作被取消');
+      if (win !== this._bot.currentWindow) throw new ActionError('存物窗口已切换，请重新打开容器');
+    };
+    const countIn = (list, name) => list.reduce((total, item) => total + (item.name === name ? item.count : 0), 0);
+    const inventoryInitially = win.items().map((item) => ({ name: item.name, count: item.count }));
+    const containerInitially = win.containerItems().map((item) => ({ name: item.name, count: item.count }));
     try {
       const keepSet = new Set((keep || []).map((k) => String(k).replace(/^minecraft:/, '')));
       const wantSet = items ? new Set(items.map((k) => String(k).replace(/^minecraft:/, ''))) : null;
       for (const item of win.items()) {
+        check();
         if (wantSet && !wantSet.has(item.name)) continue;
         if (keepSet.has(item.name)) continue;
         const n = item.count;
+        const inventoryBefore = countIn(win.items(), item.name);
+        const containerBefore = countIn(win.containerItems(), item.name);
         try {
           await win.deposit(item.type, null, n);
-          moved[item.name] = (moved[item.name] || 0) + n;
         } catch (err) {
+          if (signal?.aborted || err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
           log.info(`存入 ${item.name} 失败：${err.message}`);
         }
+        // A resolved transfer can be a no-op; a full container can accept only
+        // part of a stack before rejecting the rest. Count both actual sides.
+        await delay(100, { signal });
+        check();
+        const transferred = Math.max(0, Math.min(n, inventoryBefore - countIn(win.items(), item.name),
+          countIn(win.containerItems(), item.name) - containerBefore));
+        if (transferred > 0) moved[item.name] = (moved[item.name] || 0) + transferred;
       }
+      check();
     } finally {
       win.close();
     }
-    return { ok: true, stored: moved, total: Object.values(moved).reduce((a, b) => a + b, 0) };
+    if (Object.keys(moved).length) {
+      // 1.17+ clicks update client slots optimistically. A fresh server window
+      // snapshot after all clicks confirms storage, including delayed rejection.
+      const verified = await this.openContainer({ x, y, z, signal, reach: false });
+      try {
+        if (signal?.aborted || this._stopped) throw new CancelledError('存物核验被取消');
+        for (const [name, claimed] of Object.entries(moved)) {
+          const confirmed = Math.max(0, Math.min(claimed,
+            countIn(inventoryInitially, name) - countIn(verified.win.items(), name),
+            countIn(verified.win.containerItems(), name) - countIn(containerInitially, name)));
+          if (confirmed > 0) moved[name] = confirmed; else delete moved[name];
+        }
+      } finally { verified.win.close(); }
+    }
+    const total = Object.values(moved).reduce((a, b) => a + b, 0);
+    return { ok: total > 0, stored: moved, total };
   }
 
   /** 从箱子取出物品 */
@@ -2225,23 +2646,96 @@ class Actions {
     const container = await this.openContainer({ x, y, z, signal, reach });
     const win = container.win;
     const taken = {};
+    let failureReason = null;
+    const bot = this._requireBot();
+    const check = (window = win) => {
+      if (signal?.aborted || this._stopped) throw new CancelledError('取物动作被取消');
+      if (window !== bot.currentWindow) throw new ActionError('取物窗口已切换，请重新打开容器');
+    };
+    const countIn = (list, name) => list.reduce((total, item) => total + (item.name === name ? item.count : 0), 0);
+    const inventoryInitially = win.items().map((item) => ({ name: item.name, count: item.count }));
+    const containerInitially = win.containerItems().map((item) => ({ name: item.name, count: item.count }));
+    const capacityFor = (item) => {
+      if (!Array.isArray(win.slots) || !Number.isInteger(win.inventoryStart) || !Number.isInteger(win.inventoryEnd)) return Infinity;
+      const size = item.stackSize || 64;
+      return win.slots.slice(win.inventoryStart, win.inventoryEnd).reduce((room, slot) => {
+        if (!slot) return room + size;
+        if (slot.type !== item.type || slot.metadata !== item.metadata || JSON.stringify(slot.nbt) !== JSON.stringify(item.nbt)) return room;
+        return room + Math.max(0, size - slot.count);
+      }, 0);
+    };
     try {
-      const want = itemName ? String(itemName).replace(/^minecraft:/, '') : null;
+      check();
+      const want = itemName ? String(itemName).trim().toLowerCase().replace(/^minecraft:/, '') : null;
       const available = win.containerItems();
-      const pool = want ? available.filter((i) => i.name === want || i.name.includes(want)) : available;
+      const exact = want ? available.filter((i) => i.name === want) : available;
+      const knownItem = want && (bot.registry?.itemsByName?.[want] ||
+        (bot.version ? require('minecraft-data')(bot.version)?.itemsByName?.[want] : null));
+      // A real item ID is a precise recipe/resource request. Only category
+      // shorthand may use substring matching; never pad oak logs with dark oak.
+      const pool = (want && !knownItem && !exact.length ? available.filter((i) => i.name.includes(want)) : exact)
+        .map((item) => ({ ...item }));
       if (!pool.length) throw new MissingItemError(`箱子里的 ${want || '任何物品'}`, '箱子是空的或没有这个物品');
-      let remain = Math.max(1, Number(count) || 1);
+      const requested = Number(count);
+      let remain = Number.isFinite(requested) ? Math.max(1, Math.floor(requested)) : 1;
       for (const item of pool) {
+        check();
         if (remain <= 0) break;
-        const n = Math.min(remain, item.count);
-        await win.withdraw(item.type, null, n);
-        taken[item.name] = (taken[item.name] || 0) + n;
-        remain -= n;
+        const capacity = capacityFor(item);
+        const n = Math.min(remain, countIn(win.containerItems(), item.name), item.count, capacity);
+        if (n <= 0) {
+          failureReason = failureReason || (capacity <= 0 ? `背包没有可容纳 ${item.name} 的空位或堆叠空间，先整理背包再取物` : `箱子里的 ${item.name} 已不足，请重新查看容器`);
+          continue;
+        }
+        const inventoryBefore = countIn(win.items(), item.name);
+        const containerBefore = countIn(win.containerItems(), item.name);
+        try {
+          await this._raceAbort(() => {
+            // Mineflayer's withdraw rejects a full slot layout even when an
+            // existing stack has room. Its native transfer supports that case.
+            if (bot.inventory?.emptySlotCount?.() === 0 && typeof bot.transfer === 'function') {
+              return bot.transfer({ window: win, itemType: item.type, metadata: item.metadata ?? null, count: n, nbt: item.nbt,
+                sourceStart: 0, sourceEnd: win.inventoryStart, destStart: win.inventoryStart, destEnd: win.inventoryEnd });
+            }
+            return win.withdraw(item.type, item.metadata ?? null, n, item.nbt);
+          }, signal, 20000, '等待服务端取物超时');
+        } catch (err) {
+          if (signal?.aborted || err instanceof CancelledError || err instanceof TimeoutError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
+          failureReason = `取物失败：${describeFailure(err)}`;
+          log.info(`取出 ${item.name} 失败：${err.message}`);
+        }
+        await delay(100, { signal });
+        check();
+        const transferred = Math.max(0, Math.min(n, countIn(win.items(), item.name) - inventoryBefore,
+          containerBefore - countIn(win.containerItems(), item.name)));
+        if (transferred > 0) {
+          taken[item.name] = (taken[item.name] || 0) + transferred;
+          remain -= transferred;
+        }
+        // A failed native transfer may retain its remainder on the cursor.
+        // Closing and reopening resolves that server state before another task.
+        if (win.selectedItem) break;
       }
+      check();
     } finally {
       win.close();
     }
-    return { ok: true, taken };
+    if (Object.keys(taken).length) {
+      // Modern clicks are optimistic. Only a fresh server window confirms both
+      // the player's gain and the container's loss, including partial rejection.
+      const verified = await this.openContainer({ x, y, z, signal, reach: false });
+      try {
+        check(verified.win);
+        for (const [name, claimed] of Object.entries(taken)) {
+          const confirmed = Math.max(0, Math.min(claimed,
+            countIn(verified.win.items(), name) - countIn(inventoryInitially, name),
+            countIn(containerInitially, name) - countIn(verified.win.containerItems(), name)));
+          if (confirmed > 0) taken[name] = confirmed; else delete taken[name];
+        }
+      } finally { verified.win.close(); }
+    }
+    const total = Object.values(taken).reduce((a, b) => a + b, 0);
+    return { ok: total > 0, taken, total, ...(total === 0 ? { reason: failureReason || '服务端没有确认背包增加与容器减少，请重新查看容器和背包后再取物' } : {}) };
   }
 
   /**
@@ -2256,6 +2750,7 @@ class Actions {
     const bot = this._requireBot();
     const before = this.inventoryMap();
     const countBefore = sumCounts(before);
+    const startedAt = Date.now();
     const deadline = Date.now() + timeoutMs;
 
     // 先给服务器一点时间生成掉落物实体。
@@ -2277,11 +2772,20 @@ class Actions {
         .filter((d) => d.dist <= maxDistance)
         .sort((a, b) => a.dist - b.dist);
 
-      if (!drops.length) break;
+      if (!drops.length) {
+        // Destruction, item spawn and inventory confirmation are separate
+        // packets. Allow a short bounded spawn window when expecting a drop.
+        if (expectIncrease && sumCounts(this.inventoryMap()) <= countBefore &&
+            Date.now() < Math.min(deadline, startedAt + 1000)) {
+          await delay(Math.min(100, Math.max(1, deadline - Date.now())), { signal });
+          continue;
+        }
+        break;
+      }
 
       const nearest = drops[0];
       // 已经很近了：站着等吸附，不必寻路
-      if (nearest.dist <= 1.6) {
+      if (nearest.dist <= 0.9) {
         await delay(400, { signal });
         const nowCount = sumCounts(this.inventoryMap());
         if (nowCount === lastCount) {
@@ -2299,7 +2803,7 @@ class Actions {
           x: nearest.entity.position.x,
           y: nearest.entity.position.y,
           z: nearest.entity.position.z,
-          range: 1,
+          range: 0.5,
           signal,
           timeoutMs: Math.min(8000, Math.max(1500, deadline - Date.now())),
         });
@@ -2508,6 +3012,7 @@ class Actions {
         const x = Math.floor(p.x) + dx;
         const y = Math.floor(p.y) + dy;
         const z = Math.floor(p.z) + dz;
+        if (!this._stationInsidePreparation({ x, y, z })) continue;
         const here = blockAt(bot, x, y, z);
         const below = blockAt(bot, x, y - 1, z);
         if (!here || !below) continue;
@@ -2703,10 +3208,32 @@ function guessSmeltOutput(input) {
     jungle_log: 'charcoal',
     acacia_log: 'charcoal',
     dark_oak_log: 'charcoal',
+    mangrove_log: 'charcoal',
+    cherry_log: 'charcoal',
+    pale_oak_log: 'charcoal',
     netherrack: 'nether_brick',
     ancient_debris: 'netherite_scrap',
   };
   return map[n] || `${n}_smelted`;
+}
+
+function fuelSmeltCapacity(name) {
+  const short = String(name).replace(/^minecraft:/, '');
+  if (/^(crimson|warped)_/.test(short)) return 0;
+  if (['coal', 'charcoal'].includes(short)) return 8;
+  if (short.endsWith('_planks') || short.endsWith('_log') || short.endsWith('_wood')) return 1.5;
+  return ({ stick: 0.5, lava_bucket: 100, dried_kelp_block: 20, blaze_rod: 12 })[short] || 0;
+}
+
+function canSmeltInFurnace(station, input) {
+  const name = String(input).replace(/^minecraft:/, '');
+  if (station === 'furnace') return true;
+  if (station === 'smoker') return ['beef', 'porkchop', 'chicken', 'mutton', 'rabbit', 'cod', 'salmon', 'potato', 'kelp'].includes(name);
+  if (station !== 'blast_furnace') return false;
+  return ['raw_iron', 'raw_gold', 'raw_copper', 'iron_ore', 'deepslate_iron_ore', 'gold_ore', 'deepslate_gold_ore',
+    'nether_gold_ore', 'copper_ore', 'deepslate_copper_ore', 'ancient_debris'].includes(name)
+    || /^(iron|golden|chainmail)_(pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots)$/.test(name)
+    || name === 'iron_horse_armor' || name === 'golden_horse_armor';
 }
 
 /** 背包差分：{item: deltaCount}，只保留变化项 */
@@ -2749,6 +3276,8 @@ module.exports = {
   ProtectedBlockError,
   diffInventory,
   guessSmeltOutput,
+  fuelSmeltCapacity,
+  canSmeltInFurnace,
   toolKind,
   armorKind,
   isPlaceable,

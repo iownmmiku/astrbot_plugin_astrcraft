@@ -21,7 +21,7 @@ AstrBot（Python 插件）  ──NDJSON/JSON-RPC──▶  Node 引擎子进程
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | AstrBot | >= 4.17, < 5 | 插件 API 依赖 `@filter.llm_tool` 与 `context.llm_generate` |
-| Node.js | >= 18（推荐 20/22/24） | 引擎运行环境。**必须能被 AstrBot 进程找到**，找不到就在配置里填绝对路径 |
+| Node.js | >= 22 | 当前锁定的 Mineflayer 依赖要求 Node.js 22+。**必须能被 AstrBot 进程找到**，找不到就在配置里填绝对路径 |
 | Java | >= 17 | 只有需要跑本地 Minecraft 服务端时才需要；连接别人的服务器不需要 |
 | Minecraft 服务端 | 原版 / Paper / Spigot | **不支持 Forge/Fabric 模组服**（原因见 LIMITS.md） |
 
@@ -56,6 +56,8 @@ node dev-tools\smoke.js
 ---
 
 ## 3. 安装 AstrBot 插件
+
+发布 ZIP 可按 [README](../README.md) 解压到插件目录，保留完整 `engine/` 与 `skills_docs/`，并在该 `engine/` 下执行 `npm ci`。下面的复制方式适用于引擎留在项目目录、随后配置外置 `engine_dir` 的部署。
 
 把仓库根目录里的文件复制到 AstrBot 插件目录下的一个新文件夹里：
 

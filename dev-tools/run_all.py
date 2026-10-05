@@ -3,7 +3,7 @@
 
 ## 为什么需要这个
 
-仓库里有 **54 个** `check_*` / `test_*` 脚本（38 个 Python + 16 个 JS）。
+仓库中的 `check_*` / `test_*` 脚本包括 Python 与 JavaScript 检查。
 在加这个脚本之前，"我的改动是对的吗？"这个问题**没有便宜的答案**：
 你得自己知道该跑哪几个、哪些需要测试服、哪些本来就会偶发红。
 
@@ -11,7 +11,7 @@
 
 ## 用法
 
-    python dev-tools/run_all.py              # 只跑不需要服务器的（约 1 分钟）
+    python dev-tools/run_all.py              # 只跑不需要服务器的（通常数分钟）
     python dev-tools/run_all.py --full       # 全跑（需要测试服在 25566）
     python dev-tools/run_all.py --only life  # 只跑名字里带 life 的
     python dev-tools/run_all.py -v           # 把每个脚本的输出也打出来
@@ -24,7 +24,7 @@
    写死清单的话，加一个测试就得记得来改这里，迟早会忘。
 
 **② 明确说"跳过了什么"。**
-   默认运行时，8 个服务器脚本会被跳过。**"跳过了"必须打出来**，
+   默认运行时，需要服务器的脚本会被跳过。**"跳过了"必须打出来**，
    否则"全绿"是假的 —— 你只是没测那些而已。
 
 **③ 展示历史偶发记录，但所有失败都报红。**
@@ -149,9 +149,12 @@ def parse_result(text: str, code: int) -> tuple[str, str]:
     for l in reversed(lines):
         if "全部通过" in l or "检查通过" in l or "所有承诺都兑现" in l:
             return l[:60], l
+        m = re.search(r"\b(\d+)/(\d+)\s+passed\b", l)
+        if m:
+            return f"{m.group(1)}/{m.group(2)} passed", l
     # SKIP（拿不到 AstrBot 运行时的脚本会这样）
     for l in reversed(lines):
-        if "SKIP" in l or "跳过" in l:
+        if re.search(r"(?:^|\]\s)(?:⏭️?\s*)?(?:SKIP\b|(?:已)?跳过(?:[:：]|进服测试))", l):
             return "SKIP", l
     return ("(无摘要)" if code == 0 else "(失败，无摘要)"), lines[-1] if lines else ""
 

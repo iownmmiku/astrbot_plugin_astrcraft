@@ -48,7 +48,7 @@ from .llm_tools_life import McLifeTools
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
@@ -223,6 +223,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         self.engine.on_disconnected = self._on_engine_disconnected
         self.engine.on("bot.spawn", self._on_bot_spawn)
         self.engine.on("bot.respawn", self._on_bot_respawn)
+        self.engine.on("bot.world_changed", self._on_bot_world_changed)
+        self.engine.on("bot.world_ready", self._on_bot_world_ready)
         self.engine.on("bot.death", self._on_bot_death)
         self.engine.on("bot.kicked", self._on_bot_kicked)
         self.engine.on("bot.disconnect", self._on_bot_disconnect)
@@ -883,6 +885,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     async def _on_bot_spawn(self, data: dict) -> None:
         if self._manual_disconnect_requested:
             return
+        self._bot_lifecycle_id = data.get("lifecycle_id", 0)
+        self._world_transition_id = None
         self.connected = True
         self._invalidate_brief()
         pos = data.get("position") or {}
@@ -951,11 +955,39 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             else:
                 logger.info("过日子循环已在配置中关闭（enable_life_loop=false）")
 
+    def _accept_bot_lifecycle(self, data: dict) -> bool:
+        """Ignore lifecycle notifications from a superseded body/world."""
+        incoming = data.get("lifecycle_id")
+        if type(incoming) is not int:
+            return True  # Compatibility with engines/tests without lifecycle IDs.
+        if incoming < getattr(self, "_bot_lifecycle_id", 0):
+            return False
+        self._bot_lifecycle_id = incoming
+        return True
+
+    async def _on_bot_world_changed(self, data: dict) -> None:
+        if self._manual_disconnect_requested or not self._accept_bot_lifecycle(data):
+            return
+        self._invalidate_brief()
+        self._world_transition_id = data.get("lifecycle_id")
+        if self.life:
+            self.life.on_world_change()
+
+    async def _on_bot_world_ready(self, data: dict) -> None:
+        if (self._manual_disconnect_requested
+                or data.get("lifecycle_id") != getattr(self, "_world_transition_id", None)
+                or not self._accept_bot_lifecycle(data)):
+            return
+        self._invalidate_brief()
+        self._world_transition_id = None
+        if self.life:
+            self.life.on_world_ready()
+
     async def _on_bot_respawn(self, data: dict) -> None:
         """身体真正恢复生命后解除死亡停牌，保留死亡恢复清单和主人暂停。"""
-        self._invalidate_brief()
-        if self._manual_disconnect_requested:
+        if self._manual_disconnect_requested or not self._accept_bot_lifecycle(data):
             return
+        self._invalidate_brief()
         self.connected = True
         if self.life:
             self.life.note_dead(False)
@@ -1051,6 +1083,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         await self._notify_subscribers(f"👀 她注意到有人过来：{who}")
 
     async def _on_bot_death(self, data: dict) -> None:
+        if not self._accept_bot_lifecycle(data):
+            return
         pos = data.get("position") or {}
         place = f"({pos.get('x')}, {pos.get('y')}, {pos.get('z')})"
         self._invalidate_brief()
@@ -1125,7 +1159,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         顾问据此判断她在哪个生存阶段、下一步该做什么。
         取不到就返回空 dict，顾问会用保守默认值，不会因此崩掉决策。
         """
-        out: dict = {"has_shelter": bool(getattr(self.life, "_has_shelter", False))}
+        out: dict = {"has_shelter": False}
         if not self.engine or not self.engine.running or not self.connected:
             return out
         try:
@@ -1135,13 +1169,19 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return out
         if not isinstance(st, dict):
             return out
+        if st.get("connected") is False or st.get("ready") is False:
+            return out
         out["health"] = st.get("health", 20)
         out["food"] = st.get("food", 20)
+        out["server"] = st.get("server") or f"{self._cfg('server_host', '127.0.0.1')}:{self._cfg('server_port', 25565)}"
+        out["dimension"] = str(st.get("dimension") or "").removeprefix("minecraft:")
+        out["position"] = st.get("position")
+        out["mining_return_safety"] = st.get("mining_return_safety")
         out["nearby_entities"] = st.get("nearby_entities") or []
         # 白天/黑夜：Minecraft 一天 24000 tick，13000-23000 是夜晚
         tod = st.get("time_of_day")
         if isinstance(tod, (int, float)):
-            out["is_night"] = 13000 <= int(tod) <= 23000
+            out["is_night"] = 13000 <= int(tod) <= 23000 and out["dimension"] in ("", "overworld")
         inv_summary = st.get("inventory_summary") or {}
         if isinstance(inv_summary, dict):
             out["inventory_slots_used"] = int(inv_summary.get("used_slots") or 0)
@@ -1154,6 +1194,19 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     out["inventory_slots_used"] = len(items)
         except Exception as exc:  # noqa: BLE001
             logger.info("取背包失败：%s", exc)
+        get_home = getattr(self.life, "home_for_world", None)
+        home = get_home(out) if callable(get_home) else None
+        if home:
+            out["home"] = home
+            out["home_status"] = {"condition": "unknown", "safe": False, "loaded": False}
+            try:
+                status = await self.engine.call("home.inspect", {"home": home}, timeout=3.0)
+                if isinstance(status, dict):
+                    out["home_status"] = status
+                    out["has_shelter"] = bool(status.get("safe"))
+                    self.life.note_home_status(home, status)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("基地暂不能核验，保留位置：%s", exc)
         return out
 
     async def _on_task_finished(self, data: dict) -> None:
@@ -1196,7 +1249,12 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 status = str(data.get("status") or "")
                 if status == "done":
                     self.life.note_world_event("task_done", f"「{name}」做完了")
-                elif status in ("failed", "cancelled"):
+                elif status == "cancelled":
+                    why = str(data.get("error") or "").strip()
+                    self.life.note_world_event(
+                        "task_cancelled", f"「{name}」被中断{f'：{why}' if why else ''}"
+                    )
+                elif status == "failed":
                     why = str(data.get("error") or "").strip()
                     self.life.note_world_event(
                         "task_failed", f"「{name}」没做成{f'：{why}' if why else ''}"
@@ -1219,12 +1277,45 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if self.life:
             try:
                 task_name = str(data.get("name") or "")
-                ok = data.get("status") == "done"
+                status = data.get("status")
                 # 把"砍 2 根木头""挖石头"这类中文任务名映射回技能名
                 meta = data.get("meta") or {}
                 skill_name = meta.get("skill") if isinstance(meta, dict) else None
                 skill_name = skill_name or self._skill_name_from_task(task_name)
-                self.life.note_task_result(skill_name or task_name, ok, str(data.get("error") or ""))
+                result = data.get("result") or {}
+                if isinstance(result, dict):
+                    if skill_name == "build_shelter" and status == "done" and result.get("ok") is True:
+                        remember_home = getattr(self.life, "remember_home", None)
+                        if callable(remember_home):
+                            remember_home(result.get("shelter") or {})
+                    elif skill_name in ("return_home", "store_items", "resupply_food", "leave_home") and isinstance(result.get("home"), dict) and isinstance(result.get("home_status"), dict):
+                        note_home = getattr(self.life, "note_home_status", None)
+                        if callable(note_home):
+                            note_home(result["home"], result["home_status"])
+                        note_food = getattr(self.life, "note_home_food", None)
+                        if skill_name == "resupply_food" and status in ("done", "failed") and callable(note_food):
+                            note_food(result["home"], result)
+                if status == "cancelled":
+                    note_cancelled = getattr(self.life, "note_task_cancelled", None)
+                    if callable(note_cancelled):
+                        cancel_details = {"task_id": data.get("task_id") or data.get("id")} if isinstance(self.life, LifeLoop) else {}
+                        note_cancelled(skill_name or task_name, str(data.get("error") or ""), **cancel_details)
+                elif status in ("done", "failed"):
+                    empty_shelf = (skill_name == "resupply_food" and status == "failed"
+                                   and isinstance(result, dict)
+                                   and result.get("food_stock_checked") is True
+                                   and result.get("food_stock_empty") is True
+                                   and isinstance(result.get("home_status"), dict)
+                                   and result["home_status"].get("safe") is True)
+                    if empty_shelf:
+                        self.life.note_task_result(skill_name, False, str(data.get("error") or result.get("reason") or ""),
+                                                   expected_unavailable=True)
+                    else:
+                        details = {}
+                        if isinstance(self.life, LifeLoop):
+                            details = {"result": result, "task_id": data.get("task_id") or data.get("id")}
+                        self.life.note_task_result(skill_name or task_name, status == "done",
+                                                   str(data.get("error") or ""), **details)
             except Exception as exc:  # noqa: BLE001
                 logger.info("记录任务结果失败：%s", exc)
 
