@@ -32,6 +32,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _paths  # noqa: E402
 
+_paths.require_astrbot("test_agent_plan")
 _paths.load_plugin()
 LifeLoop = _paths.plugin_module("life").LifeLoop
 

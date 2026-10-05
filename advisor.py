@@ -130,7 +130,7 @@ def best_tool_tier(inv: dict, kinds) -> str | None:
     return best
 
 
-def _stage_of(inv: dict, has_shelter: bool) -> tuple[str, str]:
+def _stage_of(inv: dict, has_shelter: bool, *, has_table: bool = False) -> tuple[str, str]:
     """判断她处在生存的哪个阶段。"""
     wood = count_any(inv, WOOD_NAMES)
     pick = best_tool_tier(inv, ("pickaxe",))
@@ -142,8 +142,13 @@ def _stage_of(inv: dict, has_shelter: bool) -> tuple[str, str]:
         return ("stone_age", "石器时代（有石镐）") if not has_shelter else ("stone_age", "石器时代（有石镐 + 住处）")
     if pick in ("wooden", "golden"):
         return "wooden_age", "木器时代（只有木镐，该换石头了）"
-    if wood >= 3:
-        return "have_wood", "有木头但还没工具"
+    # Count the shared budget for a pick, sticks (a batch of four), and a
+    # workstation. Processed wood must not send a prepared body back to trees.
+    wood_units = wood * 4 + count_any(inv, (name for name in inv if name.endswith("_planks")))
+    pick_budget = 3 + (0 if inv.get("stick", 0) >= 2 else 2)
+    pick_budget += 0 if has_table or inv.get("crafting_table", 0) > 0 else 4
+    if wood_units >= pick_budget:
+        return "have_wood", "有木料但还没工具"
     return "bare", "一穷二白（没木头也没工具）"
 
 
@@ -186,7 +191,9 @@ def advise(
     build_blocks = count_any(inv, BUILD_BLOCKS)
     torch = inv.get("torch", 0)
 
-    adv.stage, adv.stage_label = _stage_of(inv, has_shelter)
+    has_table = (safe_home and home_status.get("loaded") is True and home_condition == "intact"
+                 and (home_status.get("furniture") or {}).get("crafting_table") is True)
+    adv.stage, adv.stage_label = _stage_of(inv, has_shelter, has_table=has_table)
 
     # ---- 危险优先级最高：血量/饥饿
     if health <= 6:
@@ -242,7 +249,7 @@ def advise(
         adv.missing.append("工具")
         adv.skill = "make_tools"
         adv.params = {"tier": "wooden", "kinds": ["pickaxe"]}
-        adv.why = "先做木镐进入石器阶段，避免把木材耗在即将淘汰的整套木工具上"
+        adv.why = "现有木料够做木镐，先进入石器阶段，其他木工具按实际需要补齐"
         adv.hard = True
 
     elif adv.stage == "wooden_age":
@@ -320,12 +327,16 @@ def advise(
 
     # 已拿到矿物就推进加工/升级，别反复挖同一种矿却一直不用。
     if adv.skill == "mine_ores" and adv.params.get("ore") == "iron":
-        if pick not in ("iron", "diamond", "netherite") and inv.get("iron_ingot", 0) >= 3:
+        iron_inputs = [name for name in ("raw_iron", "iron_ore", "deepslate_iron_ore") if inv.get(name, 0) > 0]
+        ingots = inv.get("iron_ingot", 0)
+        enough_mixed_iron = ingots + count_any(inv, iron_inputs) >= 3 and (ingots > 0 or len(iron_inputs) > 1)
+        if pick not in ("iron", "diamond", "netherite") and (ingots >= 3 or enough_mixed_iron):
             adv.skill, adv.params = "make_tools", {"tier": "iron", "kinds": ["pickaxe"]}
-            adv.why = "已有铁锭，先做铁镐再继续探索"
-        elif inv.get("raw_iron", 0) > 0:
-            adv.skill, adv.params = "smelt", {"item": "raw_iron", "count": min(8, inv["raw_iron"])}
-            adv.why = "已有铁矿，先炼成可用的铁锭"
+            adv.why = "现有铁锭与铁料够做铁镐，统一加工升级后再继续探索"
+        elif iron_inputs:
+            source = max(iron_inputs, key=lambda name: inv[name])
+            adv.skill, adv.params = "smelt", {"item": source, "count": min(8, inv[source])}
+            adv.why = "已有铁料，先炼成可用的铁锭"
 
     # 生存优先级覆盖成长阶段；仅提醒不能阻止她饿着继续挖矿。
     needs_food = food <= 10 or (health <= 12 and food < 18)

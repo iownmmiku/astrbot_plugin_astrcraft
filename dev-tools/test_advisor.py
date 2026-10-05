@@ -112,6 +112,27 @@ check("金镐不会取代石镐的采矿等级", A.best_tool_tier({"golden_picka
 check("只有金镐仍需升级石器", A.advise({"golden_pickaxe": 1, "cobblestone": 3}).params.get("tier") == "stone")
 check("已有铁矿先熔炼", A.advise({"stone_pickaxe": 1, "raw_iron": 4, "bread": 2}, has_shelter=True).skill == "smelt")
 check("有铁锭直接升级镐", A.advise({"stone_pickaxe": 1, "iron_ingot": 3, "bread": 2}, has_shelter=True).params.get("tier") == "iron")
+
+for item in ("iron_ore", "deepslate_iron_ore"):
+    ore_advice = A.advise({"stone_pickaxe": 1, item: 4, "bread": 2}, has_shelter=True)
+    check(f"已有 {item} 先炼成铁锭", ore_advice.skill == "smelt" and ore_advice.params == {"item": item, "count": 4})
+mixed_iron = A.advise({"stone_pickaxe": 1, "raw_iron": 1, "iron_ore": 2, "bread": 2}, has_shelter=True)
+check("混合铁料能凑一把镐时由做工具技能统一加工", mixed_iron.skill == "make_tools" and mixed_iron.params == {"tier": "iron", "kinds": ["pickaxe"]})
+check("部分铁锭与深层铁矿合起来够升级时不用再采矿", A.advise({"stone_pickaxe": 1, "iron_ingot": 2, "deepslate_iron_ore": 1, "bread": 2}, has_shelter=True).params.get("tier") == "iron")
+check("带铁镐时零数量铁矿不触发加工", A.advise({"iron_pickaxe": 1, "iron_ore": 0, "bread": 2}, has_shelter=True).skill == "mine_ores")
+
+for inv in ({"oak_planks": 9}, {"oak_log": 2, "oak_planks": 1},
+            {"oak_planks": 5, "crafting_table": 1}, {"oak_planks": 3, "stick": 2, "crafting_table": 1},
+            {"oak_planks": 7, "stick": 2}):
+    prepared = A.advise(inv)
+    check(f"已有木镐材料就先做工具 {inv}", prepared.skill == "make_tools" and prepared.params.get("tier") == "wooden")
+for inv in ({"oak_planks": 8}, {"oak_planks": 4, "crafting_table": 1}, {"oak_planks": 6, "stick": 2}):
+    check(f"木材总预算不足时仍先采木 {inv}", A.advise(inv).skill == "chop_tree")
+
+table_home = {"dimension": "overworld", "condition": "intact"}
+table_status = {"condition": "intact", "loaded": True, "safe": True, "furniture": {"crafting_table": True}}
+check("安全基地的实际工作台可以减少木镐预算", A.advise({"oak_planks": 5}, home=table_home, home_status=table_status).skill == "make_tools")
+check("未加载的历史工作台不能减少木镐预算", A.advise({"oak_planks": 5}, home=table_home, home_status={**table_status, "loaded": False, "safe": False, "condition": "unknown"}).skill == "chop_tree")
 check("早期也会整理满背包", A.advise({"wooden_pickaxe": 1}, inventory_slots_used=34).skill == "store_items")
 check("先吃饭再整理背包", A.advise({"bread": 2}, food=4, inventory_slots_used=36).skill == "eat")
 check("背包里没有家具不代表屋里没有", not any("没有床" in w or "没有箱子" in w for w in A.advise({"bread": 3}, has_shelter=True).warnings))

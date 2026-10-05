@@ -20,7 +20,8 @@ const { assertPreparationSearch, isIndoorStation } = require('./preparation');
 // item in the pack does not mean that the body has safely left the mine.
 function miningReturn(result) {
   return result?.return_status ? { return_status: result.return_status,
-    collection_ok: result.collection_ok } : {};
+    collection_ok: result.collection_ok,
+    ...(typeof result.material_collection_ok === 'boolean' ? { material_collection_ok: result.material_collection_ok } : {}) } : {};
 }
 
 function unsafeMiningReturn(result) {

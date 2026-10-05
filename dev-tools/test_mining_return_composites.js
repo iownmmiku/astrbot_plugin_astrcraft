@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const wood = require('../engine/skills/wood');
 const gathering = require('../engine/skills/gathering');
+const skills = require('../engine/skills');
 const { Actions, guessSmeltOutput } = require('../engine/actions');
 const { SkillContext } = require('../engine/skills/common');
 const { executionContext } = require('../engine/goals');
@@ -177,6 +178,42 @@ test('iron tools stop before smelting and crafting when acquired ore cannot safe
   assert.equal(r.collection_ok, false); assert.equal(r.material_collection_ok, true);
   assert.deepEqual(r.produced, { raw_iron: 3 }); assert.equal(f.counts.raw_iron, 3);
   assert.deepEqual(f.calls.map((c) => c.kind), ['dig', 'dig', 'dig', 'nav']);
+});
+
+for (const bread of [0, 3]) test(`food chain retains furnace-material rescue with ${bread} ready portions`, async () => {
+  const f = fixture({ inventory: { bread, beef: 4 - bread, torch: 4 }, ore: 'stone', amount: 8,
+    loseAfterDig: true, stations: ['crafting_table'] });
+  const r = await skills.get('food_chain').run({ ...f, params: {} });
+  unsafe(r);
+  assert.equal(r.collection_ok, false);
+  assert.equal(r.material_collection_ok, true);
+  assert.equal(r.return_status.required, true);
+  assert.equal(r.return_status.server, '127.0.0.1:25566');
+  assert.equal(r.return_status.dimension, 'overworld');
+  assert.ok(r.return_status.target);
+  assert.equal(r.food_ready, bread);
+  assert.deepEqual(r.produced, { cobblestone: 8 });
+  assert.equal(f.counts.beef, 4 - bread);
+  assert.equal(f.calls.some((c) => ['smelt', 'craft'].includes(c.kind)), false);
+});
+
+test('food chain uses existing furnace and finishes actual supplies without a spurious rescue', async () => {
+  const f = fixture({ inventory: { beef: 4, torch: 4 } });
+  const r = await skills.get('food_chain').run({ ...f, params: {} });
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(r.return_status, undefined);
+  assert.equal(r.food_ready, 4);
+  assert.deepEqual(r.produced, { cooked_beef: 4 });
+  assert.deepEqual(r.consumed, { beef: 4 });
+  assert.deepEqual(f.calls.map((c) => c.kind), ['smelt']);
+});
+
+test('food chain propagates cancellation during furnace-material gathering', async () => {
+  const f = fixture({ inventory: { beef: 4, torch: 4 }, ore: 'stone', amount: 8,
+    cancelAfterDig: true, stations: ['crafting_table'] });
+  await assert.rejects(skills.get('food_chain').run({ ...f, params: {} }), CancelledError);
+  assert.equal(f.counts.cobblestone, 8);
+  assert.equal(f.calls.some((c) => c.kind !== 'dig'), false);
 });
 test('safe iron collection continues smelting and confirms the requested tool', async () => {
   const f = fixture(); const r = await f.tools(); assert.equal(r.ok, true);

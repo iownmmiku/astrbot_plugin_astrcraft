@@ -557,7 +557,7 @@ const SKILLS = {
       const before = actions.inventoryMap();
       const child = (stage) => typeof ctx.child === 'function' ? ctx.child(['food_chain', stage]) : ctx;
       const foodReady = () => gathering.READY_FOOD.reduce((sum, name) => sum + actions.countItem(name), 0);
-      const finish = (failure = null) => {
+      const finish = (failure = null, dependency = null) => {
         const food = foodReady(), pick = mining.bestPickaxeTier(actions), torches = actions.countItem('torch');
         const missing = [...(food < 4 ? ['food'] : []), ...(!pick ? ['pickaxe'] : []), ...(torches < 4 ? ['torch'] : [])];
         const after = actions.inventoryMap();
@@ -566,18 +566,27 @@ const SKILLS = {
           consumed: positiveOnly(wood.diffOf(after, before)),
           note: `${ok ? '补给已备好' : '补给尚未齐全'}：食物 ${food}/4 份，镐 ${pick || '无'}，火把 ${torches}/4 根`,
           reason: ok ? null : failure || `还缺 ${missing.join('、')}，补齐后再继续原任务`,
-          extra: { food_ready: food, pickaxe_tier: pick, torch_count: torches, missing } });
+          extra: { food_ready: food, pickaxe_tier: pick, torch_count: torches, missing,
+            // A nested food/tool dependency may have gathered furnace material
+            // without returning safely. The outer result must let LifeLoop
+            // rescue that body before it can resume any dependent work.
+            ...(dependency?.return_status ? { return_status: dependency.return_status, collection_ok: ok,
+              material_collection_ok: dependency.material_collection_ok === true || dependency.collection_ok === true } : {}) } });
       };
       const food = await gathering.cookFood({ actions, nav, state, ctx: child('food'), count: 4 });
       ctx.checkAborted();
       steps.push(...food.steps);
-      if (!food.ok || foodReady() < 4) return finish(food.reason || '食物还不足 4 份，先补齐食物再准备工具');
+      if (!food.ok || foodReady() < 4 || food.return_status?.ok === false) {
+        return finish(food.reason || food.return_status?.reason || '食物还不足 4 份，先补齐食物再准备工具', food);
+      }
       if (!mining.bestPickaxeTier(actions)) {
         const tier = actions.countItem('cobblestone') >= 3 ? 'stone' : 'wooden';
         const tools = await wood.makeTools({ actions, nav, state, ctx: child('pickaxe'), tier, kinds: ['pickaxe'] });
         ctx.checkAborted();
         steps.push(...tools.steps);
-        if (!tools.ok || !mining.bestPickaxeTier(actions)) return finish(tools.reason || '没有做出可用的镐');
+        if (!tools.ok || !mining.bestPickaxeTier(actions) || tools.return_status?.ok === false) {
+          return finish(tools.reason || tools.return_status?.reason || '没有做出可用的镐', tools);
+        }
       }
       if (actions.countItem('torch') < 4) {
         if (actions.countItem('coal') + actions.countItem('charcoal') <= 0) return finish('还缺火把与煤或木炭燃料，现有食物和镐已保留');

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -95,6 +96,41 @@ class MiningReturnTests(unittest.IsolatedAsyncioTestCase):
         self.arm(loop, state, name="make_tools")
         self.assertEqual((await loop._survival_step())["skill"], "climb_out")
         self.assertEqual(len(loop._plan), 1)
+
+    async def test_real_food_chain_dependency_result_is_rescued_by_life_loop(self):
+        script = """
+const { fixture } = require('./dev-tools/test_mining_return_composites');
+const skills = require('./engine/skills');
+(async () => {
+  const f = fixture({ inventory: { beef: 4, torch: 4 }, ore: 'stone', amount: 8,
+    loseAfterDig: true, stations: ['crafting_table'] });
+  const result = await skills.get('food_chain').run({ ...f, params: {} });
+  process.stdout.write(JSON.stringify({ result, inventory: f.counts,
+    position: f.bot.entity.position }));
+})().catch((error) => { process.stderr.write(String(error.stack)); process.exitCode = 1; });
+"""
+        proc = await asyncio.create_subprocess_exec("node", "-e", script, cwd=str(S._paths.REPO),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise
+        self.assertEqual(proc.returncode, 0, err.decode("utf-8", errors="replace"))
+        actual = json.loads(out)
+        result = actual["result"]
+        state = snapshot(server="127.0.0.1:25566", inventory=actual["inventory"], position=actual["position"])
+        loop = self.make_loop(state)
+        loop._set_plan([{"skill": "make_tools", "params": {"tier": "iron", "kinds": ["pickaxe"]}}])
+        self.arm(loop, state, name="food_chain", result=result)
+        self.assertIsNotNone(loop._mining_return)
+        self.assertEqual(loop._plan, [], "unfinished food cannot unlock work dependent on complete supplies")
+        self.assertEqual(loop._recent_outcomes[-1]["produced"], {"cobblestone": 8})
+        step = await loop._survival_step()
+        self.assertEqual(step["skill"], "climb_out")
+        self.assertEqual(step["params"]["return_target"], result["return_status"]["target"])
+        self.assertEqual(state["inventory"]["beef"], 4)
 
     async def test_existing_eat_and_recover_precede_escape(self):
         state = snapshot(food=0, health=6)
