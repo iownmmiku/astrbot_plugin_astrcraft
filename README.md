@@ -1,6 +1,6 @@
 # Astrcraft
 
-**v1.3.0 · AstrBot 的 Minecraft 自主游玩插件**
+**v1.3.1 · AstrBot 的 Minecraft 自主游玩插件**
 
 让 AstrBot 的机器人以真实玩家身份进入 Minecraft：观察环境、安排工作、采集资源、制作工具、建造基地，并在饥饿、受伤或遇险时调整行动。
 
@@ -39,7 +39,7 @@ Node.js 和 npm 必须能在 **AstrBot 实际运行的环境**中执行。AstrBo
 
 ### 2. 安装完整插件
 
-可在 AstrBot 插件管理中安装本仓库，或从 [Releases](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases) 下载 `astrbot_plugin_astrcraft-v1.3.0.zip`。
+可在 AstrBot 插件管理中安装本仓库，或从 [Releases](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases) 下载 `astrbot_plugin_astrcraft-v1.3.1.zip`。
 
 手动安装时，将 ZIP 解压到：
 
@@ -173,7 +173,14 @@ mc她在干嘛
 
 新决策仍受模型响应速度影响。既定计划与部分规则补给可以减少模型往返，不能消除生产模型的网络延迟。
 
-## 1.3.0 累计更新
+## 1.3.1 本次更新
+
+- **网页控制台**：新增中文 WebUI，查看生存状态、自主计划、目标步骤、背包和世界记录，支持控制机器人并进入 3D 观战。
+- **控制一致性**：网页、聊天指令与目标暂停/恢复工具共享控制入口；暂停抵抗旧任务完成通知，急停和退服可以中断网页发起的目标规划。
+- **故障恢复**：引擎首次启动失败后，网页仍可访问；进服重试成功会恢复生活循环的引擎状态与监管。
+- **生存补给**：复合补给链保留矿洞返程责任；开荒复用已有木板、木棍和工作台，制铁镐识别铁矿变体与现成铁锭，减少重复采集。
+
+## 此前 1.3.0 累计更新
 
 本版汇总 1.2.0 代码更新以来、截至 2026-10-05 的生存与执行修复：
 
