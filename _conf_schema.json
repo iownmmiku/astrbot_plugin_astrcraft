@@ -1,22 +1,28 @@
 {
   "enable_webui": {
     "type": "bool",
-    "description": "【WebUI】启用 Astrcraft 网页控制台，查看生存、任务、背包并控制机器人。修改后重载插件",
-    "default": false
+    "description": "【WebUI】启用 Astrcraft 控制台 API，查看生存、任务、背包并控制机器人。默认从 AstrBot 插件详情页打开；修改后重载插件",
+    "default": true
+  },
+  "webui_mode": {
+    "type": "string",
+    "description": "【WebUI】astrbot 使用官方 Pages、管理面板登录和 bridge；standalone 使用独立端口和插件令牌，兼容旧版 AstrBot",
+    "default": "astrbot",
+    "options": ["astrbot", "standalone"]
   },
   "webui_host": {
     "type": "string",
-    "description": "【WebUI】监听地址，默认只允许本机。容器或局域网访问可设 0.0.0.0；公网使用 HTTPS 反向代理",
+    "description": "【WebUI · 独立模式】监听地址，仅 webui_mode=standalone 生效。容器或局域网可设 0.0.0.0",
     "default": "127.0.0.1"
   },
   "webui_port": {
     "type": "int",
-    "description": "【WebUI】控制台端口，与 3D 观战端口独立。修改后重载插件",
+    "description": "【WebUI · 独立模式】控制台端口，仅 webui_mode=standalone 生效；修改后重载插件",
     "default": 3008
   },
   "webui_token": {
     "type": "string",
-    "description": "【WebUI】访问令牌；留空自动生成并保存在插件数据目录 webui_token.txt。管理员私聊发送 mc控制台 获取。修改后重载插件",
+    "description": "【WebUI · 独立模式】仅 standalone 生效。留空自动生成 webui_token.txt；管理员私聊发送 mc控制台 获取。原生 Pages 使用 AstrBot 登录",
     "default": ""
   },
   "engine_dir": {
@@ -233,6 +239,10 @@
       "spruce_leaves",
       "birch_leaves",
       "dark_oak_leaves",
+      "wheat",
+      "carrots",
+      "potatoes",
+      "beetroots",
       "netherrack",
       "coal_ore",
       "deepslate_coal_ore",

@@ -11,6 +11,24 @@
   --radius:15px
 }
 
+[data-theme="dark"] {
+  --bg:#16241d;
+  --card:#1e3026;
+  --ink:#e0eade;
+  --muted:#a2b5a5;
+  --line:#354b3d;
+  --green:#9cc99b;
+  --pale:#293e30;
+  --red:#ec9d92;
+  --amber:#e2bb6a;
+  color-scheme:dark
+}
+.model-usage {margin-top:20px}
+.usage-summary {display:flex;flex-wrap:wrap;gap:20px;margin:12px 0 20px;color:var(--muted);font-size:13px}
+.usage-summary strong {color:var(--ink);margin-left:8px}
+[data-theme="dark"] .sidebar,[data-theme="dark"] dialog {background:var(--card);color:var(--ink)}
+[data-theme="dark"] input,[data-theme="dark"] select {background:var(--bg);color:var(--ink)}
+
 * {
   box-sizing:border-box
 }

@@ -49,7 +49,7 @@ from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.2"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
@@ -81,7 +81,7 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
   /mc技能              她能做的事
   /mc看她              看她：观战窗口（浏览器里的第一视角）+ 她的背包 + 她在干什么
   /mc开观战            立刻打开观战窗口（不用重进服）
-  /mc控制台            WebUI 地址与访问令牌（管理员）
+  /mc控制台            网页控制台入口（管理员）
   /mc调试              排障信息
   /mc帮助              显示本帮助
 
@@ -316,19 +316,25 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             self.engine.on("*", self._on_any_engine_event)
 
         # Keep diagnostics available even when Node cannot start.
-        if self._cfg("enable_webui", False):
+        if self._cfg("enable_webui", True):
             try:
+                native = self._cfg("webui_mode", "astrbot") == "astrbot"
                 self.webui = WebUI(
                     self, host=str(self._cfg("webui_host", "127.0.0.1")),
                     port=int(self._cfg("webui_port", 3008)),
-                    token=WebUI.load_token(self._data_dir, str(self._cfg("webui_token", ""))),
-                    version=PLUGIN_VERSION,
+                    token="" if native else WebUI.load_token(self._data_dir, str(self._cfg("webui_token", ""))),
+                    version=PLUGIN_VERSION, native=native,
                 )
-                self.webui.start()
-                logger.info("Astrcraft WebUI 已启动：%s（管理员发送 /mc控制台 获取访问令牌）", self.webui.url)
+                if native:
+                    self.webui.register(self.context, PLUGIN_NAME)
+                else:
+                    self.webui.start()
+                logger.info("Astrcraft 控制台已启动：%s", self.webui.url)
             except Exception as exc:
+                if self.webui:
+                    await self.webui.close()
                 self.webui = None
-                logger.error("WebUI 启动失败：%s", exc)
+                logger.error("控制台启动失败：%s；原生 Pages 需要支持 Pages/astrbot.api.web 的 AstrBot。可更新管理面板或选择 webui_mode=standalone。", exc)
 
         try:
             await self.engine.start()
@@ -377,6 +383,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """插件卸载：停目标与过日子、落盘、断游戏、关引擎。"""
         logger.info("Minecraft 插件正在卸载")
         self._terminating = True
+        self._invalidate_player_goal()
         if getattr(self, "webui", None):
             await self.webui.close()
         if self._supervise_task and not self._supervise_task.done():
@@ -553,11 +560,24 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             raise EngineUnavailable("引擎未初始化")
         if self._emergency_stopped and method == "skill.run":
             raise EngineError("机器人处于急停状态，请先用 /mc继续 恢复")
+        if method == "skill.run" and (getattr(self, "_manual_disconnect_requested", False)
+                                      or getattr(self, "_owner_paused", False)
+                                      or getattr(self, "_terminating", False)):
+            raise EngineError("玩家控制已中断目标，不能继续提交动作")
         return await self.engine.call(method, params, timeout=timeout)
+
+    def _invalidate_player_goal(self) -> int:
+        """Stop pending plans synchronously, before a control request awaits RPC."""
+        self._player_goal_revision = getattr(self, "_player_goal_revision", 0) + 1
+        invalidate = getattr(self.goals, "invalidate_pending", None)
+        if callable(invalidate):
+            invalidate()
+        return self._player_goal_revision
 
     async def _emergency_stop(self) -> dict:
         """命令与工具共享急停状态，先收回自主权，再取消引擎动作。"""
         self._emergency_stopped = True
+        self._invalidate_player_goal()
         if self.life:
             self.life.pause(reason="急停", max_seconds=0)
         running = bool(self.engine and self.engine.running)
@@ -572,6 +592,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """保护目标建立期间的暂停，旧任务的完成事件不能提前归还自主权。"""
         if self._emergency_stopped:
             raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
+        if getattr(self, "_manual_disconnect_requested", False) or getattr(self, "_terminating", False):
+            raise EngineError("机器人已退服或正在卸载，不能建立目标")
+        revision = self._invalidate_player_goal()
         self._owner_paused = False  # A newly assigned goal explicitly takes control.
         self._player_action_inflight = getattr(self, "_player_action_inflight", 0) + 1
         try:
@@ -584,22 +607,25 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     await self._engine_call("task.cancel", {})
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("准备新目标时未能取消旧动作，将继续建立目标：%s", exc)
-            if self._emergency_stopped:
-                raise EngineError("机器人处于急停状态，先用 /mc继续 恢复")
-            if self._owner_paused:
-                raise EngineError("目标准备期间收到暂停，先用 /mc继续 恢复")
+            self._check_player_goal_revision(revision)
             message = await self.goals.start(goal)
-            # 目标规划可能等待模型；期间收到急停时，新目标仍需保持暂停。
-            if self._emergency_stopped or self._owner_paused:
-                await self.goals.pause()
-                reason = "急停" if self._emergency_stopped else "暂停"
-                raise EngineError(f"目标准备期间收到{reason}，先用 /mc继续 恢复")
+            self._check_player_goal_revision(revision)
             return message
         finally:
             self._player_action_inflight = max(0, self._player_action_inflight - 1)
             if self.life and self._can_resume_autonomy():
                 self.life.resume()
                 self.life.wake(reason="目标未建立，恢复自主游玩")
+
+    def _check_player_goal_revision(self, revision: int) -> None:
+        if getattr(self, "_emergency_stopped", False):
+            raise EngineError("目标准备期间收到急停，先用 /mc继续 恢复")
+        if getattr(self, "_owner_paused", False):
+            raise EngineError("目标准备期间收到暂停，先用 /mc继续 恢复")
+        if getattr(self, "_manual_disconnect_requested", False) or getattr(self, "_terminating", False):
+            raise EngineError("目标准备已因退服或卸载取消")
+        if revision != getattr(self, "_player_goal_revision", 0):
+            raise EngineError("目标准备已取消，请使用最新指令")
 
     def _can_resume_autonomy(self) -> bool:
         return not (getattr(self, "_emergency_stopped", False)
@@ -892,6 +918,11 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     async def _do_disconnect(self) -> str:
         self._manual_disconnect_requested = True
+        self._invalidate_player_goal()
+        if self.life:
+            self.life.pause(reason="主动退服", max_seconds=0)
+        if self.goals:
+            await self.goals.abandon(reason="主动退服")
         async with self._connect_lock:
             self.connected = False
             if not self.engine or not self.engine.running:
@@ -943,6 +974,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if self.life:
             try:
                 self.life.on_session_start()
+                if self._can_resume_autonomy():
+                    self.life.resume()
+                    self.life.wake(reason="重新进服，恢复自主游玩")
             except Exception as exc:  # noqa: BLE001
                 logger.info("会话开始时清理计划失败：%s", exc)
 
@@ -1392,7 +1426,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 "用你的人格在游戏里说一句（不超过 30 字），告诉大家这个结果。"
                 "成功了可以带点成就感，失败了直说原因，不要道歉腔。只输出这句话本身。"
             )
-            line = await self._llm(prompt, system)
+            line = await self._llm(prompt, system, kind="chat")
             if not line:
                 return
             line = line.strip().splitlines()[0][:120]
@@ -1510,7 +1544,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     context_parts.append(f"玩家 {sender} 对你说：{message}")
                     context_parts.append("用一句话回应（不超过 40 字），符合你的身份与当前处境。")
 
-                    reply = await self._llm("\n\n".join(context_parts), system)
+                    reply = await self._llm("\n\n".join(context_parts), system, kind="chat")
 
                 if not reply:
                     return
@@ -1545,7 +1579,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             logger.info("取默认模型失败：%s", exc)
         return None
 
-    async def _llm(self, prompt: str, system: str | None = None, umo: str | None = None) -> str | None:
+    async def _llm(self, prompt: str, system: str | None = None, umo: str | None = None,
+                   *, kind: str = "autonomous") -> str | None:
         """调用 AstrBot 的 LLM。
 
         未配置 Provider 时返回 None 而不是抛异常——游戏流程不该因为模型没配就中断。
@@ -1555,11 +1590,27 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             if not provider_id:
                 logger.debug("没有可用的聊天 Provider，跳过 LLM 调用")
                 return None
-            resp = await self.context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                system_prompt=system,
-            )
+            started = time.perf_counter()
+            resp = None
+            status = "failed"
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=system,
+                )
+                status = "ok"
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            finally:
+                try:
+                    from .tokens import ledger
+
+                    ledger().record(getattr(resp, "usage", None), kind=kind,
+                                    duration_seconds=time.perf_counter() - started, status=status)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("记录用量失败（不影响主流程）：%s", exc)
             text = getattr(resp, "completion_text", None)
             if text:
                 return str(text).strip()
@@ -1567,7 +1618,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             if hasattr(resp, "result_chain"):
                 try:
                     return resp.result_chain.get_plain_text().strip()
-                # **尽力而为**的统计：拿不到就当 0，不影响主流程
+                # 旧响应链不一定含纯文本；解析失败不影响主流程。
                 except Exception:  # noqa: BLE001
                     pass
             return None
@@ -1576,7 +1627,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return None
 
     async def _llm_plan(self, prompt: str, system: str) -> str | None:
-        return await self._llm(prompt, system)
+        return await self._llm(prompt, system, kind="planning")
 
     # ================================================================ 人格 / 记忆 / 过日子
 
@@ -2209,6 +2260,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     async def _pause_play(self) -> str:
         self._owner_paused = True
+        self._invalidate_player_goal()
         if self.life:
             self.life.pause(reason="用户暂停", max_seconds=0)
         msg = await self.goals.pause() if self.goals else ""
@@ -2257,6 +2309,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         yield event.plain_result(await self._abandon_goal())
 
     async def _abandon_goal(self) -> str:
+        self._invalidate_player_goal()
         msg = await self.goals.abandon() if self.goals else "目标系统未初始化"
         self._owner_paused = False
         # 任务结束了 → 让她继续过自己的日子
@@ -2267,10 +2320,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc控制台", alias={"mcwebui"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_webui(self, event: AstrMessageEvent):
-        """获取 WebUI 地址和令牌；只在管理员私聊中返回凭据。"""
+        """获取原生控制台入口；独立模式只在管理员私聊返回令牌。"""
         ui = getattr(self, "webui", None)
         if not ui:
             yield event.plain_result("WebUI 未启动。在插件配置开启 enable_webui 后重载插件；启动失败请查看 AstrBot 日志。")
+            return
+        if getattr(ui, "native", False):
+            yield event.plain_result(f"控制台：{ui.url}\n使用 AstrBot 管理面板登录即可，无需额外令牌或映射端口。若插件详情页没有控制台，请更新 AstrBot 和管理面板后重载插件。")
             return
         # An admin command in a group must not distribute its credential to everyone.
         private = getattr(event, "is_private_chat", None)

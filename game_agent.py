@@ -26,8 +26,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -318,6 +320,9 @@ class GameChatAgent:
         executed_ok: list[str] = []
 
         for step in range(self.MAX_STEPS):
+            started = time.perf_counter()
+            resp = None
+            status = "failed"
             try:
                 resp = await provider.text_chat(
                     contexts=list(contexts),
@@ -325,20 +330,25 @@ class GameChatAgent:
                     func_tool=toolset,
                     tool_choice="auto",
                 )
+                status = "ok"
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.error("游戏内 LLM 调用失败：%s", exc)
                 if self.last_request_had_action:
                     return "动作已经交代下去了，后续回复暂时没跟上。"
                 return None
 
-            # 记一次用量（W6）——和 action_agent 记进同一个台账，
-            # 否则 /mc状态 显示的用量只覆盖"自主行动"，玩家对话那条路是黑的。
-            try:
-                from .tokens import ledger
+            finally:
+                # 同一请求只记一次；报错/取消也保留延迟，用量未报告时显示未知。
+                try:
+                    from .tokens import ledger
 
-                ledger().record(getattr(resp, "usage", None))
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("记录用量失败（不影响主流程）：%s", exc)
+                    ledger().record(getattr(resp, "usage", None), kind="chat",
+                                    duration_seconds=time.perf_counter() - started, status=status)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("记录用量失败（不影响主流程）：%s", exc)
 
             tool_names = list(getattr(resp, "tools_call_name", None) or [])
             tool_args = list(getattr(resp, "tools_call_args", None) or [])

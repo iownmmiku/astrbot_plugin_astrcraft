@@ -11,7 +11,7 @@
 
 const log = require('../log');
 const { delay, CancelledError, TimeoutError, describeFailure, vec3, distance, blockCenter } = require('../util');
-const { skillResult, positiveOnly } = require('./common');
+const { skillResult, positiveOnly, collectionCheckpoint } = require('./common');
 const wood = require('./wood');
 const mining = require('./mining');
 const { assertPreparationSearch, isIndoorStation } = require('./preparation');
@@ -131,18 +131,35 @@ async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDoma
   const want = String(item || '').replace(/^minecraft:/, '').toLowerCase();
   const target = Math.max(1, Math.min(256, Number(count) || 1));
   const steps = [];
-  const before = actions.inventoryMap();
+
+  if (wood.CROPS[want]) {
+    // Crops always use surface search and verified replanting, including a
+    // resumed harvest whose inventory target was reached before interruption.
+    return wood.harvestCrops({ actions, nav, ctx, itemName: want, count: target,
+      radius: 40, maxAttempts: attempts });
+  }
 
   const haveTarget = () => countCollectedItem(actions, want);
+  const checkpoint = collectionCheckpoint(ctx, ['collectItem', want, target, attempts || null],
+    { have: haveTarget, want: Math.max(0, target - haveTarget()), inventory: () => actions.inventoryMap() });
+  const before = checkpoint.before;
   const already = haveTarget();
-  if (already >= target) {
+  if (already >= target && !checkpoint.gather) {
     return skillResult(true, { steps, note: `背包里已经有 ${already} 个 ${want}，不需要再收集`, extra: { collection_ok: true } });
   }
 
   // 1) 先看是不是"某个配方可以直接做出来的"，先试便宜的路径
-  const plan = planFor({ actions, want, deficit: target - already });
+  const plan = checkpoint.gather?.plan || planFor({ actions, want, deficit: target - already });
+  // collect's count is a total inventory target. Its direct gathering child
+  // receives an additional amount, whose original value also identifies the
+  // child's checkpoint and mine entrance. Keep that amount when replaying;
+  // even a final accepted drop can precede cancellation and safe return.
+  if (['chop', 'mine', 'mine_any'].includes(plan.type) && !checkpoint.gather) {
+    checkpoint.gather = { plan: { ...plan }, want: target - already };
+  }
+  const gatherWant = checkpoint.gather?.want ?? target - already;
 
-  ctx.progress(`收集 ${want}×${target - already}：计划走 ${plan.type}${plan.detail ? `（${plan.detail}）` : ''}`);
+  ctx.progress(`收集 ${want}×${Math.max(0, target - already)}：计划走 ${plan.type}${plan.detail ? `（${plan.detail}）` : ''}`);
 
   let result;
   switch (plan.type) {
@@ -151,7 +168,7 @@ async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDoma
       break;
     case 'chop':
       assertPreparationSearch({ actions, ctx, operation: '砍树收集木材' });
-      result = await wood.chopTree({ actions, nav, state, ctx, want: target - already,
+      result = await wood.chopTree({ actions, nav, state, ctx, want: gatherWant,
         logNames: [want], maxAttempts: attempts });
       steps.push(...result.steps);
       break;
@@ -160,11 +177,11 @@ async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDoma
       const blockNames = BLOCK_ALIASES[plan.ore] || [plan.ore];
       result = mining.ORES[plan.ore]
         ? await mining.mineOre({ actions, nav, state, ctx, ore: plan.ore,
-          want: target - already, maxAttempts: attempts })
+          want: gatherWant, maxAttempts: attempts })
         : want === 'cobblestone'
-        ? await mining.mineStone({ actions, nav, state, ctx, want: target - already,
+        ? await mining.mineStone({ actions, nav, state, ctx, want: gatherWant,
           strictOnly: true, radius: 40, maxAttempts: attempts })
-        : await wood.mineSpecific({ actions, nav, ctx, blockNames, want: target - already, itemName: want, radius: 40, maxAttempts: attempts });
+        : await wood.mineSpecific({ actions, nav, ctx, blockNames, want: gatherWant, itemName: want, radius: 40, maxAttempts: attempts });
       ctx.checkAborted();
       steps.push(...result.steps);
       break;
@@ -249,7 +266,7 @@ async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDoma
     case 'mine_any': {
       assertPreparationSearch({ actions, ctx, operation: '挖掘原料' });
       // 未知物品：尝试按方块名直接挖（很多物品名和方块名一致）
-      result = await wood.mineSpecific({ actions, nav, ctx, blockNames: [want], want: target - already, itemName: want, radius: 40 });
+      result = await wood.mineSpecific({ actions, nav, ctx, blockNames: [want], want: gatherWant, itemName: want, radius: 40 });
       steps.push(...result.steps);
       break;
     }

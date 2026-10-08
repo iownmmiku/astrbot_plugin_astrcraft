@@ -78,6 +78,11 @@ python dev-tools/test_tool_contracts.py    # AstrBot 工具注册与 JSON 多步
 node dev-tools/test_engine_control.js     # 真队列与动作层：取消、反射、合成和移动
 node dev-tools/test_window_cancel.js      # 实际 mineflayer 窗口取消后不污染新窗口
 node dev-tools/test_building_completion.js # 完整结构验收、缺料、取材和换建材
+python dev-tools/test_goal_control.py      # 旧规划失效、暂停预算和目标验收
+node dev-tools/test_goal_resume.js         # 追加采集/库存总目标续做，采齐后仍完成原矿口返程
+python dev-tools/test_astrbot_pages.py      # 已安装 AstrBot 官方路由与 Pages 集成
+python dev-tools/test_webui.py             # 独立 HTTP 鉴权、任务回执和急停
+node dev-tools/test_webui_sessions.js       # 迟到会话响应与原生 bridge
 ```
 
 真实游戏测试使用项目 `.testserver` 的 Paper 1.20.1，Minecraft 端口 `25566`、RCON `25576`。
@@ -92,11 +97,58 @@ node dev-tools/test_survival_chain.js --step 3  # 独立建房，保留相同结
 node dev-tools/test_pit_escape.js               # 浅坑/零装备/深井共 6 项真实验收
 node dev-tools/test_pit_escape.js --step 4      # 10 格深井爬升 + 独立无镐深井垫高
 node dev-tools/crafttest.js --port 25566 --rcon-port 25576 --rcon-dir .testserver
+node dev-tools/test_crop_live.js            # 四类幼苗/成熟收割补种、地形判断
+python dev-tools/test_goal_resume_live.py   # 5 煤追加 8 煤，两次暂停后恰好 13 煤
+python dev-tools/test_goal_resume_live.py --collect # 总库存目标 13 煤，两次暂停续做
 ```
 
 自主测试的模型回复固定，验证一次规划后的执行、实物产出、衔接与急停恢复；
 不代表实际模型已通过开放世界长期游玩测试。Python 脚本应使用安装 AstrBot 的解释器，
 必要时将 `ASTRBOT_APP` 与 `PYTHONPATH` 指向 AstrBot 的应用目录。
+
+### 真实模型持续生存评测
+
+`survival_eval.py` 使用生产 `LifeLoop`、`ActionAgent`、`PerceptionAgent`、
+`EngineClient` 与 AstrBot 的 `ProviderOpenAIOfficial` 适配器，模型真实请求，不提供固定答案。
+必须使用独立、自然生成的 `online-mode=false` 测试世界；默认运行 60 分钟。
+脚本使用全新随机离线玩家，要求生存模式、空背包；不改地形、昼夜或难度，不赠送补给。
+RCON 只查询 `doDaylightCycle`、`naturalRegeneration`、`doMobSpawning`、`keepInventory`
+与难度；要求前三项开启、死亡掉物品、难度非和平，不满足时终止评测。
+首次核验前保持引擎急停并关闭自主循环，生存模式、存活身体与空背包核验通过后才启动。
+重新进服、死亡、重生、换维度和引擎断开沿用当前插件的生产生命周期方法，
+避免评测遗漏恢复事件而把正常的重新进服误判成永久停滞；初始化失败或取消同样关闭子进程。
+
+```powershell
+$env:ASTRBOT_APP='<AstrBot>/backend/app'
+$env:ASTRCRAFT_EVAL_ENDPOINT='<显式指定的兼容 Chat Completions API 基址>'
+$env:ASTRCRAFT_EVAL_MODEL='<模型 ID>'
+$env:ASTRCRAFT_EVAL_API_KEY='<环境中的 API 密钥>'
+$env:ASTRCRAFT_EVAL_RCON_PASSWORD='<专用测试服 RCON 密码>'
+python dev-tools/survival_eval.py --test-host 127.0.0.1 --test-port 25566 --rcon-port 25576 --minutes 60
+python dev-tools/test_survival_eval.py  # 汇总规则、生命周期和失败清理离线验证，不连接服务器/模型
+```
+
+实际运行请使用安装 AstrBot 的 Python。服务器地址和端口没有默认值，
+模型凭据只读上述环境变量，不寻找已安装账户的密钥。缺少配置会明确 `SKIP`，
+不会连接服务器或称作真实生存验证。兼容端点须支持工具调用；API 调用会使用实际模型额度。
+
+报告默认写入 `.testserver/real-survival.json`，可用 `--report` 指定位置。
+报告包含死亡次数、饥饿/饥饿至零的观察时长、低血量、重复技能失败、任务完成与取消、
+技能衔接间隔、模型等待/Token 分组、昼夜变化，以及疑似静止工作次数。
+`stationary_work_candidates` 仅指长时间位置与背包都未变化的工作任务，
+正常原地工作也可能命中；应结合任务失败、死亡与耗时判断，不能单凭这个数字宣称卡住。
+漏读与断线期间不推断饥饿时长；provider 未报告 Token 显示未知，累计数只含已报告部分。
+`completed` 表示测量运行结束，不表示生存能力通过。任何中断/失败都会保留汇总并清理子进程。
+Python 与引擎的数据使用临时目录，评测结束删除，不覆盖插件的生产记忆或家园。
+
+如需人工救援、赠物、传送或输入指令，请追加 JSONL 人工记录并传入
+`--interventions <文件路径>`，每行例如 `{"kind":"rescue"}`；
+只统计类别（`command/give/teleport/rescue/pause/other`），不收录正文。
+游戏里的外部聊天事件另有计数，普通聊天不自动算作救援；未提供人工记录时，
+报告不能证明没有控制台/RCON/其它客户端干预。
+为保护环境配置，评测禁用原始模型和引擎日志；报告不保存提示词、模型回答、
+聊天正文、错误正文或认证信息。不同种子、出生环境和模型应分别复跑多个昼夜，
+单次有界测量不能证明所有开放世界条件下都能长期存活。
 
 脱困测试要求任务真实结束且实际站到井口；每个场景清空背包，独立准备地形。
 设置 `MC_ENGINE_LOG_LEVEL=info`、`MC_TEST_VERBOSE=1` 可以在长测试期间连续输出引擎日志。

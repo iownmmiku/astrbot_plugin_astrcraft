@@ -20,6 +20,7 @@
 import sys
 import pathlib
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -79,10 +80,31 @@ class Bare:
 
 ok("AstrBot 的 TokenUsage 形状", Usage.from_any(AstrBotStyle()).total == 105)
 o = Usage.from_any(OpenAIStyle())
-ok("OpenAI 的 prompt/completion 那套", o.input_other == 100 and o.output == 5, str(o))
+ok("OpenAI 输入合计包含缓存，先减去命中部分", o.input_other == 60 and o.output == 5 and o.total == 105, str(o))
 ok("OpenAI 的 cached_tokens 也认", o.input_cached == 40, str(o))
 ok("字段不全不炸（缺的按 0）", Usage.from_any(Bare()).total == 7, str(Usage.from_any(Bare())))
 ok("None 不炸", Usage.from_any(None).is_empty() is True)
+ok("OpenAI Chat 原始嵌套缓存", Usage.from_any({
+    "prompt_tokens": 100, "completion_tokens": 5,
+    "prompt_tokens_details": {"cached_tokens": 40},
+}) == Usage(60, 40, 5))
+ok("OpenAI Responses 原始嵌套缓存", Usage.from_any(SimpleNamespace(
+    input_tokens=100, output_tokens=5, input_tokens_details=SimpleNamespace(cached_tokens=40),
+)) == Usage(60, 40, 5))
+ok("AstrBot 显式 0 不回退到原始 prompt/output 字段", Usage.from_any({
+    "input_other": 0, "input_cached": 100, "output": 0,
+    "prompt_tokens": 100, "completion_tokens": 5,
+}) == Usage(0, 100, 0))
+ok("Anthropic 输入本来不含缓存，加创建部分而不重复扣除读取部分", Usage.from_any({
+    "input_tokens": 10, "cache_creation_input_tokens": 20,
+    "cache_read_input_tokens": 90, "output_tokens": 5,
+}) == Usage(30, 90, 5))
+ok("无效数值不污染 JSON", Usage.from_any({
+    "prompt_tokens": float("inf"), "cached_tokens": True, "completion_tokens": float("nan"),
+}).is_empty())
+ok("异常缓存不能超过 provider 输入合计", Usage.from_any({
+    "input_tokens": 10, "cached_tokens": 50, "output_tokens": 1,
+}) == Usage(0, 10, 1))
 
 print("\n=== **上一轮** vs 累计（这是核心）===")
 led = TokenLedger()
@@ -119,6 +141,36 @@ led.record(None)  # provider 没报
 led.record(Usage())  # 全 0
 ok("只算报了用量的那次", led.calls == 1, f"calls={led.calls}")
 ok("平均每次不会被 0 拉低", led.total.total / max(1, led.calls) == 110, "110")
+ok("未知请求也计模型调用次数", led.requests == 3 and led.snapshot()["unknown_calls"] == 2)
+ok("最近一次未知不会沿用上次用量", led.snapshot()["latest"]["usage"] is None
+   and "上一轮：用量未知" in led.describe(short=True))
+
+print("\n=== 控制台 DTO：分组、未知与耗时 ===")
+led = TokenLedger()
+ok("没有报告用量时总量为 null", led.snapshot()["total"] is None)
+led.record(Usage(20, 80, 5), kind="autonomous", duration_seconds=0.2)
+led.record(None, kind="planning", duration_seconds=0.1)
+led.record(Usage(5, 10, 2), kind="perception", duration_seconds=0.3)
+led.record(None, kind="chat", duration_seconds=0.4, status="failed")
+led.record(None, kind="planning", duration_seconds=0.5, status="cancelled")
+snapshot = led.snapshot()
+ok("所有调用与报告调用分开", snapshot["calls"] == 5 and snapshot["reported_calls"] == 2
+   and snapshot["unknown_calls"] == 3 and snapshot["total"]["total"] == 122)
+ok("规划有调用但消耗未知", snapshot["groups"]["planning"]["calls"] == 2
+   and snapshot["groups"]["planning"]["total"] is None)
+ok("失败与取消有独立计数", snapshot["failed_calls"] == snapshot["cancelled_calls"] == 1)
+ok("统计模型往返延迟（不混入工具耗时）", snapshot["latency_ms"]["average"] == 300
+   and snapshot["groups"]["planning"]["latency_ms"]["average"] == 300)
+ok("DTO 是合法 JSON", json.loads(json.dumps(snapshot, allow_nan=False))["latest"]["status"] == "cancelled")
+snapshot["groups"]["autonomous"]["latest"]["usage"]["total"] = -1
+ok("DTO 修改不污染台账", led.snapshot()["groups"]["autonomous"]["latest"]["usage"]["total"] == 105)
+for _ in range(40):
+    led.record(None, kind="chat")
+ok("最近请求历史有界，未知延迟不显示为 0", len(led.snapshot()["recent"]) == 30
+   and led.snapshot()["latest"]["duration_ms"] is None)
+unknown_only = TokenLedger()
+unknown_only.record(None)
+ok("只有未知调用时状态明确说明未知", "用量未知" in unknown_only.describe())
 
 print("\n=== 缓存看起来没生效要能报出来 ===")
 led = TokenLedger()
@@ -158,6 +210,15 @@ if _paths.astrbot_available():
     from astrbot.core.provider.func_tool_manager import FunctionToolManager
     from astrcraft_plugin.action_agent import ActionAgent, ACTION_PROMPT
     from astrcraft_plugin.llm_tools_core import McPerceptionTools
+    from astrcraft_plugin.perception_agent import PerceptionAgent
+    from astrcraft_plugin.game_agent import GameChatAgent
+    from astrcraft_plugin.main import MinecraftPlugin
+    from unittest.mock import AsyncMock
+    from astrbot.core.provider.entities import TokenUsage
+
+    ok("实际 AstrBot TokenUsage 的全缓存输入", Usage.from_any(
+        TokenUsage(input_other=0, input_cached=100, output=5),
+    ) == Usage(0, 100, 5))
 
     class UsageEngine:
         async def call(self, method, params=None, **kwargs):
@@ -210,6 +271,15 @@ if _paths.astrbot_available():
         async def _ensure_engine(self):
             return True
 
+        async def _system_prompt_for_mc(self, **kwargs):
+            return "计量测试"
+
+        async def _get_brief(self):
+            return "位置已知，背包有面包"
+
+        async def _my_memory(self, *args, **kwargs):
+            return ""
+
     provider = UsageProvider()
     agent = ActionAgent(UsagePlugin(provider))
     measured = TokenLedger()
@@ -224,6 +294,8 @@ if _paths.astrbot_available():
         "工具缓存命中不减少模型用量，latest 仍是最后一次响应",
         agent.last_timing["read_cache_hits"] == 1 and measured.latest == Usage(30, 90, 3),
     )
+    ok("自主请求分类和延迟有记录", measured.snapshot()["groups"]["autonomous"]["calls"] == 3
+       and measured.snapshot()["latency_ms"]["samples"] == 3)
 
     provider = UsageProvider()
     plugin = UsagePlugin(provider)
@@ -238,6 +310,73 @@ if _paths.astrbot_available():
         agent.last_timing["exit_reason"] == "state_changed" and used == []
         and provider.calls == measured.calls == 1 and measured.total.total == 101,
     )
+
+    print("\n=== 侦察与聊天每轮计量（含最终总结） ===")
+    provider = UsageProvider()
+    measured = TokenLedger()
+    with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+        result, used = asyncio.run(PerceptionAgent(UsagePlugin(provider)).decide(
+            prompt="先确认背包", system="输出决定",
+        ))
+    ok("侦察工具轮与强制最终结论均只记一次", result == "已确认背包"
+       and len(used) == 2 and provider.calls == measured.requests == measured.calls == 3
+       and measured.total.total == 336 and measured.snapshot()["groups"]["perception"]["calls"] == 3)
+
+    provider = UsageProvider()
+    measured = TokenLedger()
+    with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+        result = asyncio.run(GameChatAgent(UsagePlugin(provider)).handle("主人", "查一下背包"))
+    ok("聊天工具轮和最终回复均只记一次", result == "已确认背包"
+       and provider.calls == measured.requests == measured.calls == 3
+       and measured.total.total == 336 and measured.snapshot()["groups"]["chat"]["calls"] == 3)
+
+    print("\n=== 主入口：规划、纯文字、自主兜底及失败/取消 ===")
+    async def main_usage():
+        plugin = MinecraftPlugin.__new__(MinecraftPlugin)
+        plugin._resolve_provider_id = AsyncMock(return_value="metrics-provider")
+        plugin.context = SimpleNamespace(llm_generate=AsyncMock(return_value=SimpleNamespace(
+            completion_text="测试响应", usage=TokenUsage(input_other=0, input_cached=100, output=5),
+        )))
+        measured = TokenLedger()
+        with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+            await plugin._llm_plan("规划", "JSON")
+            await plugin._llm("自主兜底")
+            await plugin._llm("玩家聊天", kind="chat")
+            plugin.context.llm_generate.side_effect = RuntimeError("测试 provider 失败")
+            value = await plugin._llm_plan("失败规划", "JSON")
+            plugin.context.llm_generate.side_effect = asyncio.CancelledError()
+            cancelled = False
+            try:
+                await plugin._llm("取消请求", kind="chat")
+            except asyncio.CancelledError:
+                cancelled = True
+            plugin._resolve_provider_id.return_value = None
+            await plugin._llm("没有配置模型")
+        return measured, value, cancelled, plugin.context.llm_generate.await_count
+
+    measured, failed_value, was_cancelled, actual_calls = asyncio.run(main_usage())
+    snapshot = measured.snapshot()
+    ok("主入口只记真正发出的请求，无 provider 不记", snapshot["calls"] == actual_calls == 5
+       and snapshot["reported_calls"] == 3 and snapshot["total"]["total"] == 315)
+    ok("规划/自主/聊天正确分组", [snapshot["groups"][key]["calls"]
+       for key in ("planning", "autonomous", "chat")] == [2, 1, 2])
+    ok("主入口失败和取消不被误算为零消耗", failed_value is None and was_cancelled
+       and snapshot["failed_calls"] == snapshot["cancelled_calls"] == 1
+       and snapshot["unknown_calls"] == 2 and snapshot["latest"]["usage"] is None)
+    ok("所有已发出请求均有模型延迟", snapshot["latency_ms"]["samples"] == 5)
+
+    class FailingProvider:
+        async def text_chat(self, **kwargs):
+            raise RuntimeError("测试 provider 失败")
+
+    measured = TokenLedger()
+    with patch("astrcraft_plugin.tokens.ledger", return_value=measured):
+        result, used = asyncio.run(PerceptionAgent(UsagePlugin(FailingProvider())).decide(
+            prompt="侦察失败", system="测试",
+        ))
+    ok("侦察失败也统计一次未知请求", result is None and not used
+       and measured.snapshot()["groups"]["perception"]["failed_calls"] == 1
+       and measured.requests == 1 and measured.calls == 0)
 else:
     print("  ⏭ SKIP：ActionAgent 实际记账测试需要 AstrBot 运行时；纯台账测试已执行")
 

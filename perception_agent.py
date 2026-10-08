@@ -26,8 +26,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -191,6 +193,27 @@ class PerceptionAgent:
             logger.warning("感知工具 %s 执行失败：%s", name, exc)
             return f"error: {type(exc).__name__}: {exc}"
 
+    async def _request(self, provider, **kwargs):
+        """每次模型往返独立计量，包括最后结论和未报告用量的请求。"""
+        started = time.perf_counter()
+        resp = None
+        status = "failed"
+        try:
+            resp = await provider.text_chat(**kwargs)
+            status = "ok"
+            return resp
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            try:
+                from .tokens import ledger
+
+                ledger().record(getattr(resp, "usage", None), kind="perception",
+                                duration_seconds=time.perf_counter() - started, status=status)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("记录用量失败（不影响主流程）：%s", exc)
+
     # ------------------------------------------------------------ 主入口
 
     async def decide(self, *, prompt: str, system: str, umo: str = "") -> tuple[str | None, list[str]]:
@@ -220,7 +243,7 @@ class PerceptionAgent:
 
         for _ in range(self.max_steps):
             try:
-                resp = await provider.text_chat(
+                resp = await self._request(provider,
                     contexts=list(contexts),
                     system_prompt=system,
                     func_tool=toolset,
@@ -282,7 +305,7 @@ class PerceptionAgent:
         # 查了太多次还没决定：再要一次纯文本结论
         contexts.append(Message(role="user", content="请现在直接给出你的最终决定（JSON），不要再查看。"))
         try:
-            resp = await provider.text_chat(contexts=list(contexts), system_prompt=system)
+            resp = await self._request(provider, contexts=list(contexts), system_prompt=system)
             text = (getattr(resp, "completion_text", None) or "").strip()
             return text or None, used
         except Exception as exc:  # noqa: BLE001

@@ -444,6 +444,8 @@ class ActionAgent:
             provider_started = time.perf_counter()
             owner_generation = getattr(life, "_decision_owner_generation", 0)
             timing["provider_calls"] += 1
+            resp = None
+            status = "failed"
             try:
                 resp = await provider.text_chat(
                     contexts=list(contexts),
@@ -451,6 +453,10 @@ class ActionAgent:
                     func_tool=toolset,
                     tool_choice="auto",
                 )
+                status = "ok"
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自主行动的模型调用失败：%s", exc)
                 # 调用失败要传给恢复回路，不能伪装成代理不可用后再烧一次模型请求。
@@ -459,25 +465,22 @@ class ActionAgent:
                 timing["exit_reason"] = "provider_failed_after_action"
                 return "（模型调用失败，已执行的动作先保留）", used
             finally:
-                timing["provider_seconds"] += time.perf_counter() - provider_started
+                elapsed = time.perf_counter() - provider_started
+                timing["provider_seconds"] += elapsed
 
-            # 收到响应就记费用；环境变化后丢弃的决定也已经消耗 token。
-            # 每一步都记，不能只记本轮最后的总结或真正执行了工具的响应。
-            try:
-                from .tokens import ledger
+                # 环境变化后丢弃的响应也已消耗 token；每次往返独立记录。
+                try:
+                    from .tokens import ledger
 
-                u = ledger().record(getattr(resp, "usage", None))
-                if not u.is_empty():
-                    logger.debug(
-                        "用量：输入 %d（缓存命中 %d，%.0f%%）+ 输出 %d = %d",
-                        u.input_total,
-                        u.input_cached,
-                        u.hit_rate * 100,
-                        u.output,
-                        u.total,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("记录用量失败（不影响主流程）：%s", exc)
+                    u = ledger().record(getattr(resp, "usage", None), kind="autonomous",
+                                        duration_seconds=elapsed, status=status)
+                    if not u.is_empty():
+                        logger.debug(
+                            "用量：输入 %d（缓存命中 %d，%.0f%%）+ 输出 %d = %d",
+                            u.input_total, u.input_cached, u.hit_rate * 100, u.output, u.total,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("记录用量失败（不影响主流程）：%s", exc)
 
             life = getattr(plugin, "life", None)
             if plan_revision != getattr(life, "_plan_revision", 0):

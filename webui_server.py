@@ -1,7 +1,7 @@
-"""Optional, authenticated dashboard; HTTP threads never touch the bot directly.
+"""AstrBot Plugin Page backend, with an optional standalone HTTP transport.
 
-All snapshots and controls run on AstrBot's asyncio loop. The frontend uses
-the standard library server and local assets, so installation needs no build.
+Both transports share controls and snapshots on AstrBot's asyncio loop.
+The native Page uses AstrBot authentication and its public bridge API.
 """
 from __future__ import annotations
 
@@ -30,12 +30,15 @@ class WebUI:
               "/app.js": ("app.js", "text/javascript; charset=utf-8"),
               "/favicon.svg": ("favicon.svg", "image/svg+xml")}
 
-    def __init__(self, plugin, *, host: str, port: int, token: str, version: str):
-        if not token.strip() or len(token.encode("utf-8")) > 512:
+    def __init__(self, plugin, *, host: str = "127.0.0.1", port: int = 3008,
+                 token: str = "", version: str, native: bool = False):
+        if (not native and not token.strip()) or len(token.encode("utf-8")) > 512:
             raise ValueError("WebUI 访问令牌不能为空且不能超过 512 字节")
         if any(not 33 <= ord(char) <= 126 for char in token.strip()):
             raise ValueError("WebUI 访问令牌请使用英文字母、数字或 ASCII 符号，不含空格")
         self.plugin = plugin
+        self.native = native
+        self._registrations = []
         self.host, self.port, self.token, self.version = host, port, token.strip(), version
         self.loop = asyncio.get_running_loop()
         self.server = None
@@ -65,10 +68,58 @@ class WebUI:
 
     @property
     def url(self) -> str:
+        if self.native:
+            return "AstrBot 管理面板 → 插件 → Astrcraft → 控制台"
         host = "127.0.0.1" if self.host == "0.0.0.0" else self.host
         return f"http://{host}:{self.port}"
 
+    def register(self, context, plugin_name: str) -> None:
+        """Use AstrBot's public request/response helpers and existing login.
+
+        Imports are lazy so older hosts can still select standalone mode.
+        No dashboard password or access token is exposed to Page scripts.
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        async def state_api():
+            if self.closing or getattr(self.plugin, "_terminating", False):
+                return error_response("控制台正在关闭", status_code=503)
+            return json_response(await self.snapshot(), headers={"Cache-Control": "no-store"})
+
+        async def action_api():
+            try:
+                if request.content_type is None or request.content_type.split(";")[0].strip() != "application/json":
+                    raise ApiError(415, "请求必须使用 JSON")
+                origin = request.headers.get("Origin")
+                if origin:
+                    parsed = urlsplit(origin)
+                    if (parsed.scheme not in {"http", "https"} or parsed.netloc != request.headers.get("Host", "")
+                            or parsed.path or parsed.query or parsed.fragment or parsed.username):
+                        raise ApiError(403, "只允许从控制台页面执行操作")
+                if request.headers.get("Sec-Fetch-Site") in {"cross-site", "same-site"}:
+                    raise ApiError(403, "只允许从控制台页面执行操作")
+                raw = await request.body()
+                if not 0 < len(raw) <= 4096:
+                    raise ApiError(413, "请求内容为空或过长")
+                try:
+                    body = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    raise ApiError(400, "JSON 格式无效") from None
+                if not isinstance(body, dict):
+                    raise ApiError(400, "请求必须是对象")
+                return json_response(await self.submit(body), status_code=202,
+                                     headers={"Cache-Control": "no-store"})
+            except ApiError as exc:
+                return error_response(str(exc), status_code=exc.status)
+
+        for suffix, handler, methods in (("state", state_api, ["GET"]), ("action", action_api, ["POST"])):
+            route = f"/{plugin_name}/{suffix}"
+            context.register_web_api(route, handler, methods, "Astrcraft 控制台")
+            self._registrations.append((context, route, handler, methods))
+
     def start(self) -> None:
+        if self.native:
+            raise RuntimeError("AstrBot Pages 由管理面板托管，请调用 register()")
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -131,7 +182,7 @@ class WebUI:
                     path = urlsplit(self.path).path
                     if path in owner.ASSETS:
                         name, mime = owner.ASSETS[path]
-                        self.reply(200, (Path(__file__).parent / "webui" / name).read_bytes(), mime)
+                        self.reply(200, (Path(__file__).parent / "pages" / "control" / name).read_bytes(), mime)
                     elif path == "/api/state":
                         if not self.authorized():
                             raise ApiError(401, "请使用有效的访问令牌登录")
@@ -185,8 +236,14 @@ class WebUI:
 
     async def close(self):
         self.closing = True
-        for task in self.tasks.values():
-            task.cancel()
+        for context, route, handler, methods in self._registrations:
+            # An older instance must never unregister a newly reloaded instance.
+            context.registered_web_apis[:] = [entry for entry in context.registered_web_apis
+                                            if not (entry[0] == route and entry[1] is handler and entry[2] == methods)]
+        self._registrations.clear()
+        for job_id, task in self.tasks.items():
+            if not task.done():
+                self._cancel_job(job_id, "控制台关闭，操作已中断")
         await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         if self.server:
             await asyncio.to_thread(self.server.shutdown)
@@ -204,6 +261,7 @@ class WebUI:
             p, life, goals = self.plugin, self.plugin.life, self.plugin.goals
             plan = goals.plan if goals else None
             current = life.current if life else None
+            from .tokens import ledger
             return {**self._cached,
                     "version": self.version, "sampled_at": time.time(),
                     "plugin": {"connected": p.connected, "emergency_stopped": p._emergency_stopped,
@@ -221,7 +279,8 @@ class WebUI:
                              "steps": [{"skill": step.skill, "label": step.describe()} for step in plan.steps] if plan else [],
                              "log": goals.log[-10:]} if goals else None,
                     "events": p._event_buffer[-40:],
-                    "jobs": list(self.jobs.values())[-20:]}
+                    "usage": ledger().snapshot(),
+                    "jobs": list(self.jobs.values())}
 
     async def _read_engine(self):
         engine = self.plugin.engine
@@ -255,7 +314,13 @@ class WebUI:
             raise ApiError(400, "请填写内容")
         busy = [(key, task) for key, task in self.tasks.items() if not task.done()]
         urgent = action in {"stop", "disconnect"}
-        if busy and (not urgent or any(self.jobs[key]["action"] in {"stop", "disconnect"} for key, _ in busy)):
+        if urgent:
+            # Repeated urgent clicks share the original receipt. Stop must remain
+            # available while disconnect waits for an in-progress connection.
+            for key, _ in busy:
+                if self.jobs[key]["action"] == action:
+                    return dict(self.jobs[key])
+        elif busy:
             raise ApiError(409, "上一项控制操作还在执行；急停和退服可中断普通操作")
         if urgent:
             if action == "stop":
@@ -264,16 +329,38 @@ class WebUI:
                     self.plugin.life.pause(reason="急停", max_seconds=0)
             else:
                 self.plugin._manual_disconnect_requested = True
-            for _, task in busy:
-                task.cancel()
+            for key, _ in busy:
+                if self.jobs[key]["action"] not in {"stop", "disconnect"}:
+                    self._cancel_job(key, "操作被急停或退服中断")
         job_id = secrets.token_hex(8)
         self.jobs[job_id] = {"id": job_id, "action": action, "status": "running", "at": time.time(), "message": "操作已接收"}
         self.tasks[job_id] = asyncio.create_task(self._run(job_id, text), name=f"mc-webui-{action}")
+        self.tasks[job_id].add_done_callback(lambda task, key=job_id: self._job_finished(key, task))
         for key in list(self.jobs)[:-30]:
             if self.tasks[key].done():
                 self.tasks.pop(key)
                 self.jobs.pop(key)
         return dict(self.jobs[job_id])
+
+    def _cancel_job(self, job_id, message):
+        # A task cancelled before its first turn never enters _run's finally.
+        job = self.jobs[job_id]
+        if job["status"] == "running":
+            job.update(status="cancelled", message=message, finished_at=time.time())
+        self.tasks[job_id].cancel()
+        self._cached_at = 0
+
+    def _job_finished(self, job_id, task):
+        job = self.jobs.get(job_id)
+        if job is None or job["status"] != "running":
+            return
+        if task.cancelled():
+            job.update(status="cancelled", message="操作已中断")
+        else:
+            error = task.exception()
+            job.update(status="failed" if error else "done", message=str(error) if error else "操作已完成")
+        job["finished_at"] = time.time()
+        self._cached_at = 0
 
     async def _run(self, job_id, text):
         job = self.jobs[job_id]

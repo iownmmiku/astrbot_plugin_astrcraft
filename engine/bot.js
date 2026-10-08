@@ -9,6 +9,7 @@
 
 const mineflayer = require('mineflayer');
 const path = require('path');
+const { isDeepStrictEqual } = require('node:util');
 const log = require('./log');
 const { StationMemory } = require('./stations');
 const { Config, isHostileName } = require('./config');
@@ -2392,13 +2393,35 @@ class McEngine {
   }
 
   /** 把技能提交成任务，立刻返回 task_id */
-  submitSkill({ skill, params = {}, name = null, priority = PRIORITY.SKILL }) {
+  submitSkill({ skill, params = {}, name = null, priority = PRIORITY.SKILL, resumeTaskId = null }) {
     this.assertCanAct();
-    this.requireBot();
+    const bot = this.requireBot();
     const registry = require('./skills');
     const def = registry.get(skill);
     if (!def) {
       throw new GameError(`没有这个技能：${skill}。可用技能：${registry.names().join(' / ')}`);
+    }
+    // A cancelled collection may retain its inventory target and mine entrance.
+    // Only this engine's exact Task and body can supply that continuation; the
+    // caller cannot submit checkpoint data or reuse a reference after respawn.
+    this._skillContinuations = this._skillContinuations || new Map();
+    const body = { bot, entity: bot.entity, client: bot._client,
+      lifecycle: this._bodyLifecycle, dimension: this._dimensionOf(bot) };
+    let checkpoints = null, previous = null;
+    if (resumeTaskId !== null && resumeTaskId !== undefined) {
+      previous = typeof resumeTaskId === 'string' && this._skillContinuations.get(resumeTaskId);
+      if (!previous || previous.used || previous.task.status !== 'cancelled' ||
+          !['chop_tree', 'mine_ores', 'mine_stone', 'collect'].includes(skill) ||
+          previous.skill !== skill || !isDeepStrictEqual(previous.params, params) ||
+          previous.body.bot !== body.bot || previous.body.entity !== body.entity ||
+          previous.body.client !== body.client || previous.body.lifecycle !== body.lifecycle ||
+          previous.body.dimension !== body.dimension || this._manualDisconnect ||
+          !(bot.health > 0) || bot.isAlive === false || bot._client?.socket?.destroyed) {
+        throw new GameError('暂停任务已失效，不能在不同身体、世界或参数下继续');
+      }
+      // Copy rather than share: a cancelled coroutine may finish a bare await
+      // later, but must never mutate the restored execution's checkpoints.
+      checkpoints = structuredClone(previous.task._skillCheckpoints || new Map());
     }
     const task = this.queue.submit({
       name: name || def.label || skill,
@@ -2407,7 +2430,7 @@ class McEngine {
       preemptible: true,
       meta: { skill, params },
       run: async ({ signal, task: self }) => {
-        self._skillCheckpoints = self._skillCheckpoints || new Map();
+        self._skillCheckpoints = self._skillCheckpoints || checkpoints || new Map();
         const ctx = new registry.SkillContext({
           signal,
           checkpoints: self._skillCheckpoints,
@@ -2482,6 +2505,11 @@ class McEngine {
         }
       },
     });
+    this._skillContinuations.set(task.id, { task, skill, params: structuredClone(params), body, used: false });
+    if (previous) previous.used = true;
+    while (this._skillContinuations.size > 32) {
+      this._skillContinuations.delete(this._skillContinuations.keys().next().value);
+    }
     return task;
   }
 

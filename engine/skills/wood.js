@@ -18,6 +18,149 @@ const LOG_NAMES = [
   'mangrove_log', 'cherry_log', 'pale_oak_log', 'crimson_stem', 'warped_stem',
 ];
 
+// Crops are living food sources, not ores. Their item and block names differ.
+const CROPS = {
+  wheat: { block: 'wheat', age: 7, seed: 'wheat_seeds' },
+  carrot: { block: 'carrots', age: 7, seed: 'carrot' },
+  potato: { block: 'potatoes', age: 7, seed: 'potato' },
+  beetroot: { block: 'beetroots', age: 3, seed: 'beetroot_seeds' },
+};
+const CROP_BLOCKS = new Map(Object.values(CROPS).map((crop) => [crop.block, crop]));
+
+function matureCrop(block) {
+  const crop = CROP_BLOCKS.get(block?.name);
+  if (!crop) return true;
+  try {
+    const age = block.getProperties?.()?.age;
+    return age !== undefined && age !== null && Number(age) === crop.age;
+  } catch { return false; }
+}
+
+async function replantCrop({ actions, nav, ctx, position, crop }) {
+  const bot = actions.bot;
+  const existing = blockAt(bot, position.x, position.y, position.z);
+  if (existing?.name === crop.block) return false;
+  if (!existing || !['air', 'cave_air'].includes(existing.name)) throw new Error('收割位置已被占用或未加载，尚未补种');
+  if (actions.countItem(crop.seed) < 1) throw new Error(`已收割但缺少 ${crop.seed}，尚未补种`);
+  if (distance(bot.entity.position, position) > 4) {
+    const { executionContext } = require('../goals');
+    await executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false },
+      () => nav.goTo({ ...position, y: null, range: 3, signal: ctx.signal, timeoutMs: 12000 }));
+  }
+  ctx.checkAborted();
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: '补种作物' });
+  const soil = blockAt(bot, position.x, position.y - 1, position.z);
+  if (soil?.name !== 'farmland') throw new Error('收割后的耕地已消失，尚未补种');
+  await actions.holdItem({ item: crop.seed, signal: ctx.signal });
+  ctx.checkAborted();
+  // Actions.place deliberately accepts blocks only. Seeds require using the
+  // upper farmland face, with the same scoped cancellation as other actions.
+  await actions._raceAbort(() => bot.placeBlock(soil, vec3(0, 1, 0)), ctx.signal,
+    Math.min(8000, Math.max(1, (ctx.deadline || Date.now() + 8000) - Date.now())), '补种等待服务器确认超时');
+  ctx.checkAborted();
+  if (blockAt(bot, position.x, position.y, position.z)?.name !== crop.block) {
+    throw new Error('服务器未确认作物补种');
+  }
+  return true;
+}
+
+async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 40, maxAttempts = 12, allowSearch = true }) {
+  const crop = CROPS[itemName];
+  if (!crop) return skillResult(false, { reason: `没有 ${itemName} 的作物收割规则` });
+  const have = () => actions.countItem(itemName);
+  const checkpoint = collectionCheckpoint(ctx, ['harvestCrops', itemName, count, radius, maxAttempts, allowSearch],
+    { have, want: Math.max(0, count - have()), inventory: () => actions.inventoryMap() });
+  if (checkpoint.result) return checkpoint.result;
+  const steps = checkpoint.steps || (checkpoint.steps = []);
+  const pending = checkpoint.pendingPlant || (checkpoint.pendingPlant = []);
+  const plantPending = async () => {
+    while (pending.length) {
+      const planted = await replantCrop({ actions, nav, ctx, position: pending[0], crop });
+      steps.push(planted ? `已确认补种 ${crop.block}` : `原有 ${crop.block} 仍在，无需重复补种`);
+      pending.shift();
+    }
+  };
+  let failure = null;
+  try {
+    // A preempted harvest must finish planting even if its drops already
+    // satisfy the requested inventory count on the resumed task.
+    await plantPending();
+    const result = await driveUntil({ have, want: count, ctx, checkpoint, maxAttempts,
+      label: `收割${itemName}`, fetchOne: async (attempt) => {
+        await plantPending();
+        require('./preparation').assertPreparationSearch({ actions, ctx, operation: '寻找成熟作物' });
+        let found = findNearestDiggable(actions, [crop.block], radius);
+        if (!found) {
+          if (!allowSearch) return false;
+          return relocateSurface({ actions, nav, ctx, attempt });
+        }
+        if (distance(actions.bot.entity.position, found) > 4) {
+          const { executionContext } = require('../goals');
+          await executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false },
+            () => nav.goTo({ x: found.x, y: null, z: found.z, range: 3,
+              signal: ctx.signal, timeoutMs: 12000 }));
+        }
+        ctx.checkAborted();
+        // Read the actual state after approach. Palette states and an earlier
+        // scan cannot authorize breaking an unripe or newly planted crop.
+        found = blockAt(actions.bot, found.x, found.y, found.z);
+        if (found?.name !== crop.block || !matureCrop(found)) return false;
+        const position = { x: found.position.x, y: found.position.y, z: found.position.z };
+        const { executionContext } = require('../goals');
+        const inherited = executionContext.getStore();
+        const preparationCheck = () => {
+          inherited?.preparationCheck?.();
+          const actual = blockAt(actions.bot, position.x, position.y, position.z);
+          if (actual?.name === crop.block && !matureCrop(actual)) {
+            throw new Error('作物在接近或装备期间已被重新种下，停止收割未成熟植株');
+          }
+        };
+        // Save the obligation before the packet: a cancellation can arrive
+        // after the server harvests but before Actions.dig returns its drops.
+        pending.push(position);
+        await executionContext.run({ ...inherited, preparationCheck }, () =>
+          actions.dig({ ...position, signal: ctx.signal, collect: true, reach: false, safe: true }));
+        steps.push(`收割成熟 ${crop.block}`);
+        await plantPending();
+        return true;
+      } });
+    failure = result.lastError;
+  } catch (err) {
+    if (err instanceof CancelledError || ['PreparationBlockedError', 'ProtectedBlockError', 'ProtectedHomeError'].includes(err?.name)) throw err;
+    failure = describeFailure(err);
+  }
+  ctx.checkAborted();
+  const harvestOk = have() >= count, replantOk = pending.length === 0;
+  const result = skillResult(harvestOk && replantOk, { steps: [...steps],
+    produced: positiveOnly(diffOf(checkpoint.before, actions.inventoryMap())),
+    consumed: positiveOnly(diffOf(actions.inventoryMap(), checkpoint.before)),
+    note: `现有 ${itemName}×${have()}，已补种 ${steps.filter((s) => s.startsWith('已确认补种')).length} 株`,
+    reason: harvestOk && replantOk ? null : failure || `附近没有足够的成熟 ${crop.block}，可等待生长或在地表寻找其它农田`,
+    extra: { item: itemName, have: have(), wanted: count, collection_ok: harvestOk, replant_ok: replantOk,
+      pending_replant: pending.map((p) => ({ ...p })) } });
+  if (result.ok) checkpoint.result = result;
+  return result;
+}
+
+async function relocateSurface({ actions, nav, ctx, attempt }) {
+  require('./preparation').assertPreparationSearch({ actions, ctx, operation: '在地表寻找作物' });
+  const p = { ...actions.bot.entity.position };
+  const angle = (attempt - 1) * Math.PI / 2;
+  const dist = 16 + Math.min(16, Math.floor((attempt - 1) / 4) * 8);
+  const x = p.x + Math.cos(angle) * dist, z = p.z + Math.sin(angle) * dist;
+  ctx.progress(`附近没有成熟作物，在地表向 (${x.toFixed(0)}, ${z.toFixed(0)}) 寻找农田`);
+  try {
+    const { executionContext } = require('../goals');
+    await executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false },
+      () => nav.goTo({ x, y: null, z, range: 4, signal: ctx.signal, timeoutMs: 20000 }));
+    ctx.checkAborted();
+    return distance(actions.bot.entity.position, p) > 1;
+  } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    return false;
+  }
+}
+
 /** 方块 → 对应木板名 */
 function planksOf(logName) {
   return `${String(logName).replace(/_log$|_stem$/, '')}_planks`;
@@ -1061,7 +1204,7 @@ function findNearestDiggable(actions, names, radius) {
   const bot = actions.bot;
   const protection = require('./mining_return');
   const available = (block) => !!block?.position && !protection.isProtectedHomePosition(bot, block.position) &&
-    canSeeBlock(bot, block) &&
+    matureCrop(block) && canSeeBlock(bot, block) &&
     require('./common').canHarvestBlockSafely(bot, block.position);
   // Stone and cobblestone have the same requested drop. Prefer a natural stone
   // source before nearby built cobblestone; separate queries also stop the first
@@ -1240,4 +1383,6 @@ module.exports = {
   ensurePickaxeDurability,
   carriedPickaxeTier,
   bestPickaxe,
+  CROPS,
+  harvestCrops,
 };

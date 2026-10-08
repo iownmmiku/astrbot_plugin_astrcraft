@@ -82,7 +82,9 @@ def _template_tools(tier: str) -> GoalPlan:
 def _template_mine(ore: str, count: int) -> GoalPlan:
     return GoalPlan(
         goal=f"挖 {count} 个{ore}",
-        steps=[GoalStep("mine_ores", {"ore": ore, "count": count}, label=f"挖{ore} ×{count}", max_attempts=3)],
+        steps=[GoalStep("mine_stone" if ore == "stone" else "mine_ores",
+                        {"count": count} if ore == "stone" else {"ore": ore, "count": count},
+                        label=f"挖{ore} ×{count}", max_attempts=3)],
     )
 
 
@@ -197,6 +199,18 @@ class GoalManager:
         self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._cancel_requested = False
+        self._generation = 0
+        self._run_generation = 0
+        self._interruption_generation = 0
+        self._control_lock = asyncio.Lock()
+        self._resume_task_id: str | None = None
+        self._planning_tasks: set[asyncio.Task] = set()
+
+    def invalidate_pending(self) -> None:
+        """Invalidate a pending model plan before a control operation awaits I/O."""
+        self._generation += 1
+        for task in list(self._planning_tasks):
+            task.cancel()
 
     # ------------------------------------------------------------ 查询
 
@@ -220,14 +234,14 @@ class GoalManager:
         lines = [f"目标：{self.plan.goal}（{status_cn}，进度 {done}/{total}）"]
         if self.status == GOAL_RUNNING and self.step_index < total:
             step = self.plan.steps[self.step_index]
-            lines.append(f"当前步骤：{step.describe()}（第 {self.attempt + 1}/{step.max_attempts} 次尝试）")
+            lines.append(f"当前步骤：{step.describe()}（第 {max(1, self.attempt)}/{step.max_attempts} 次尝试）")
         if self.last_error:
             lines.append(f"最近问题：{self.last_error}")
         recent = self.log[-4:]
         if recent:
             lines.append("最近结果：")
             for entry in recent:
-                mark = "✅" if entry.get("ok") else "❌"
+                mark = "⏸" if entry.get("cancelled") else "✅" if entry.get("ok") else "❌"
                 lines.append(f"  {mark} {entry.get('step')}：{entry.get('summary', '')}")
         return "\n".join(lines)
 
@@ -244,53 +258,91 @@ class GoalManager:
     # ------------------------------------------------------------ 控制
 
     async def start(self, goal: str | None = None, plan: GoalPlan | None = None) -> str:
-        if self.active:
-            await self.abandon(reason="被新目标替换")
-
-        if plan is None:
-            if goal:
-                plan = plan_from_text(goal)
-            if plan is None and goal and self._llm_planner:
-                plan = await self._plan_with_llm(goal)
+        self.invalidate_pending()
+        generation = self._generation
+        async with self._control_lock:
+            if generation != self._generation:
+                return "目标准备已取消，请使用最新指令"
+            if self.active:
+                await self._abandon_current(reason="被新目标替换")
+        try:
             if plan is None:
-                raise ValueError(
-                    f"没法把「{goal}」拆成可执行的步骤。可以试试更具体的说法，例如："
-                    "「砍 10 根木头」「挖 8 个铁矿」「做一套石制工具」「盖一个庇护所」「自己去生存」"
-                )
-
-        self.plan = plan
-        self.status = GOAL_RUNNING
-        self.step_index = 0
-        self.attempt = 0
-        self.log = []
-        self.started_at = time.time()
-        self.finished_at = None
-        self.last_error = None
-        self._cancel_requested = False
-        self._pause_event.set()
-        self._task = asyncio.create_task(self._run_loop(), name="mc-goal-loop")
+                if goal:
+                    plan = plan_from_text(goal)
+                if plan is None and goal and self._llm_planner:
+                    planning = asyncio.create_task(self._plan_with_llm(goal), name="mc-goal-planning")
+                    self._planning_tasks.add(planning)
+                    try:
+                        plan = await planning
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if generation != self._generation and current and not current.cancelling():
+                            return "目标准备已取消，请使用最新指令"
+                        raise
+                    finally:
+                        self._planning_tasks.discard(planning)
+            async with self._control_lock:
+                # Planning may await a provider for minutes. A newer goal, pause,
+                # stop or disconnect always wins, even when that plan returns last.
+                if generation != self._generation:
+                    return "目标准备已取消，请使用最新指令"
+                if plan is None:
+                    raise ValueError(
+                        f"没法把「{goal}」拆成可执行的步骤。可以试试更具体的说法，例如："
+                        "「砍 10 根木头」「挖 8 个铁矿」「做一套石制工具」「盖一个庇护所」「自己去生存」"
+                    )
+                self.plan = plan
+                self.status = GOAL_RUNNING
+                self.step_index = 0
+                self.attempt = 0
+                self.log = []
+                self.started_at = time.time()
+                self.finished_at = None
+                self.last_error = None
+                self._cancel_requested = False
+                self._resume_task_id = None
+                self._pause_event.set()
+                self._run_generation += 1
+                self._task = asyncio.create_task(self._run_loop(self._run_generation, plan), name="mc-goal-loop")
+        except asyncio.CancelledError:
+            if generation == self._generation:
+                self.invalidate_pending()
+            raise
         await self._emit("goal.started", {"goal": plan.goal, "steps": [s.describe() for s in plan.steps], "source": plan.source})
         return f"已开始目标「{plan.goal}」，共 {len(plan.steps)} 步：{plan.describe()}"
 
     async def pause(self) -> str:
-        if self.status != GOAL_RUNNING:
-            return "当前没有正在进行的目标"
-        self.status = GOAL_PAUSED
-        self._pause_event.clear()
-        # 同时停掉正在执行的动作，避免"暂停了但身体还在走"
-        await self._safe_cancel_current()
+        self.invalidate_pending()
+        async with self._control_lock:
+            if self.status != GOAL_RUNNING:
+                return "当前没有正在进行的目标"
+            self.status = GOAL_PAUSED
+            self._interruption_generation += 1
+            self._pause_event.clear()
+            # Keep the cancelled Task's checkpoint for supported collection skills.
+            if self.current_task_id:
+                self._resume_task_id = self.current_task_id
+            await self._safe_cancel_current()
         await self._emit("goal.paused", {"goal": self.plan.goal if self.plan else None})
         return "目标已暂停（当前动作也已停止）"
 
     async def resume(self) -> str:
-        if self.status != GOAL_PAUSED:
-            return "当前没有被暂停的目标"
-        self.status = GOAL_RUNNING
-        self._pause_event.set()
+        async with self._control_lock:
+            if self.status != GOAL_PAUSED:
+                return "当前没有被暂停的目标"
+            self.status = GOAL_RUNNING
+            self._pause_event.set()
         await self._emit("goal.resumed", {"goal": self.plan.goal if self.plan else None})
         return "目标已继续"
 
     async def abandon(self, *, reason: str = "用户放弃") -> str:
+        self.invalidate_pending()
+        async with self._control_lock:
+            return await self._abandon_current(reason=reason)
+
+    async def _abandon_current(self, *, reason: str) -> str:
+        self._run_generation += 1
+        self._resume_task_id = None
         if not self.plan:
             return "当前没有目标"
         self._cancel_requested = True
@@ -310,6 +362,9 @@ class GoalManager:
 
     async def stop(self) -> None:
         """插件卸载时调用。"""
+        self.invalidate_pending()
+        self._run_generation += 1
+        self._resume_task_id = None
         self._cancel_requested = True
         self._pause_event.set()
         if self._task and not self._task.done():
@@ -322,21 +377,28 @@ class GoalManager:
 
     # ------------------------------------------------------------ 执行循环
 
-    async def _run_loop(self) -> None:
-        assert self.plan is not None
+    async def _run_loop(self, generation: int, plan: GoalPlan) -> None:
         try:
-            while self.step_index < len(self.plan.steps):
-                if self._cancel_requested:
+            while self.step_index < len(plan.steps):
+                if self._cancel_requested or generation != self._run_generation:
                     return
                 await self._pause_event.wait()
-                if self._cancel_requested:
+                if self._cancel_requested or generation != self._run_generation:
                     return
 
-                step = self.plan.steps[self.step_index]
+                step = plan.steps[self.step_index]
+                interruption = self._interruption_generation
                 self.attempt += 1
-                logger.info("目标步骤 %s/%s：%s（第 %s 次）", self.step_index + 1, len(self.plan.steps), step.describe(), self.attempt)
+                logger.info("目标步骤 %s/%s：%s（第 %s 次）", self.step_index + 1, len(plan.steps), step.describe(), self.attempt)
 
-                result = await self._execute_step(step)
+                result = await self._execute_step(step, interruption)
+                if generation != self._run_generation or self._cancel_requested:
+                    return
+                if result.get("interrupted") or (interruption != self._interruption_generation and not result.get("ok")):
+                    self.attempt = max(0, self.attempt - 1)
+                    self.log.append({"step": step.describe(), "ok": False, "cancelled": True,
+                                     "summary": "用户暂停，恢复后继续", "at": time.time(), "attempt": self.attempt})
+                    continue
                 ok = bool(result.get("ok"))
                 summary = _summarize(result)
                 self.log.append(
@@ -350,48 +412,83 @@ class GoalManager:
                     continue
 
                 self.last_error = summary
-                if self.attempt < step.max_attempts:
+                if self.attempt < step.max_attempts and not result.get("fatal"):
                     # 重试前稍等，并让引擎把卡住的状态清掉
                     logger.info("步骤失败，准备第 %s 次重试：%s", self.attempt + 1, summary)
                     await asyncio.sleep(2.0)
                     continue
 
                 self.attempt = 0
-                if step.required:
+                if step.required or result.get("fatal"):
                     self.status = GOAL_FAILED
                     self.finished_at = time.time()
                     await self._emit(
                         "goal.failed",
-                        {"goal": self.plan.goal, "step": step.describe(), "reason": summary},
+                        {"goal": plan.goal, "step": step.describe(), "reason": summary},
                     )
                     return
                 # 非必需步骤失败 → 跳过继续
                 logger.info("非必需步骤失败，跳过继续：%s", step.describe())
                 self.step_index += 1
 
+            if generation != self._run_generation or self._cancel_requested:
+                return
+            # A pause arriving at the final result still retains player control.
+            await self._pause_event.wait()
+            if generation != self._run_generation or self._cancel_requested:
+                return
             self.status = GOAL_DONE
             self.finished_at = time.time()
-            await self._emit("goal.done", {"goal": self.plan.goal, "steps": len(self.plan.steps), "log": self.log[-6:]})
+            await self._emit("goal.done", {"goal": plan.goal, "steps": len(plan.steps), "log": self.log[-6:]})
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            if generation != self._run_generation or self._cancel_requested:
+                return
             logger.error("目标执行循环异常：%s", exc)
             self.status = GOAL_FAILED
             self.last_error = str(exc)
             self.finished_at = time.time()
             await self._emit("goal.failed", {"goal": self.plan.goal if self.plan else None, "reason": str(exc)})
 
-    async def _execute_step(self, step: GoalStep) -> dict:
+    async def _execute_step(self, step: GoalStep, interruption: int) -> dict:
         """提交技能并等它结束（异步等待，不阻塞事件循环）。"""
+        payload = {"skill": step.skill, "params": step.params}
+        resume_id = self._resume_task_id
+        self._resume_task_id = None
+        if resume_id:
+            # Wait for cancellation to finish before restoring the exact Task checkpoint.
+            # A changed body/world causes the engine to reject this reference safely.
+            for _ in range(20):
+                status = await self._call("task.status", {"task_id": resume_id})
+                if (status or {}).get("status") not in {"running", "pending", "queued"}:
+                    break
+                await asyncio.sleep(0.1)
+            if (status or {}).get("status") == "cancelled":
+                if step.skill in {"chop_tree", "mine_ores", "mine_stone", "collect"}:
+                    payload["resume_task_id"] = resume_id
+            elif (status or {}).get("status") == "done":
+                result = (status or {}).get("result") or {}
+                if isinstance(result, dict) and result.get("ok", True) and (not step.verify or step.verify(result)):
+                    return {**result, "ok": True}
+            else:
+                return {"ok": False, "fatal": True, "reason": "暂停动作尚未确认停止，未重复提交技能"}
+        if self._interruption_generation != interruption or self.status == GOAL_PAUSED:
+            self._resume_task_id = resume_id
+            return {"ok": False, "interrupted": True}
         try:
-            started = await self._call("skill.run", {"skill": step.skill, "params": step.params})
+            started = await self._call("skill.run", payload)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "reason": f"提交技能失败：{exc}"}
+            return {"ok": False, "fatal": bool(payload.get("resume_task_id")), "reason": f"提交技能失败：{exc}"}
 
         task_id = (started or {}).get("task_id")
         self.current_task_id = task_id
         if not task_id:
             return {"ok": False, "reason": "引擎没有返回 task_id"}
+        if self._interruption_generation != interruption or self.status == GOAL_PAUSED:
+            self._resume_task_id = task_id
+            await self._safe_cancel_current()
+            return {"ok": False, "interrupted": True}
 
         # 轮询直到结束。技能可能跑几分钟，所以轮询间隔逐渐拉长。
         interval = 1.5
@@ -400,8 +497,11 @@ class GoalManager:
             if self._cancel_requested:
                 await self._safe_cancel_current()
                 return {"ok": False, "reason": "目标被放弃"}
-            await self._pause_event.wait()
+            if self._interruption_generation != interruption:
+                return {"ok": False, "interrupted": True}
             await asyncio.sleep(interval)
+            if self._interruption_generation != interruption:
+                return {"ok": False, "interrupted": True}
             waited += interval
             interval = min(5.0, interval * 1.2)
             try:
@@ -416,7 +516,7 @@ class GoalManager:
                     result = (st or {}).get("result")
                     payload = result if isinstance(result, dict) else {}
                     if step.verify and not step.verify(payload):
-                        return {"ok": False, **payload, "reason": payload.get("reason") or "步骤完成但结果不符合预期"}
+                        return {**payload, "ok": False, "reason": payload.get("reason") or "步骤完成但结果不符合预期"}
                     return {"ok": True, **payload}
                 if status == "cancelled":
                     return {"ok": False, "reason": (st or {}).get("error") or "动作被取消"}

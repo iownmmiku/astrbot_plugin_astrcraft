@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "control": {
+      "title": "Astrcraft 控制台",
+      "description": "查看 Minecraft 生存状态、目标、背包与模型用量，并控制机器人。"
+    }
+  }
+}

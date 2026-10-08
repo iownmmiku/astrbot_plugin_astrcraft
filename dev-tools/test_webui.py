@@ -212,6 +212,46 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "failed")
         self.p.engine.say.assert_not_awaited()
 
+    async def test_stop_before_job_first_turn_has_terminal_receipt(self):
+        # Do not yield between submitting the ordinary job and cancelling it.
+        old = await self.ui.submit({"action": "pause"})
+        stop = await self.ui.submit({"action": "stop"})
+        await asyncio.gather(*self.ui.tasks.values(), return_exceptions=True)
+        self.assertTrue(self.ui.tasks[old["id"]].cancelled())
+        self.assertEqual(self.ui.jobs[old["id"]]["status"], "cancelled")
+        self.assertIn("finished_at", self.ui.jobs[old["id"]])
+        self.assertEqual(self.ui.jobs[stop["id"]]["status"], "done")
+        self.assertFalse(any(job["status"] == "running" for job in (await self.ui.snapshot())["jobs"]))
+
+    async def test_snapshot_contains_every_retained_receipt(self):
+        for _ in range(35):
+            job = await self.ui.submit({"action": "stop"})
+            await self.finish(job)
+        snapshot = await self.ui.snapshot()
+        self.assertEqual(len(self.ui.jobs), 30)
+        self.assertEqual(len(snapshot["jobs"]), 30)
+        self.assertEqual({job["id"] for job in snapshot["jobs"]}, set(self.ui.jobs))
+
+    async def test_stop_runs_while_disconnect_waits_and_both_finish(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def disconnect():
+            started.set()
+            await release.wait()
+            self.p.connected = False
+            return "已断开"
+        self.p._do_disconnect.side_effect = disconnect
+        leave = await self.ui.submit({"action": "disconnect"})
+        await started.wait()
+        stop = await self.ui.submit({"action": "stop"})
+        repeated = await self.ui.submit({"action": "stop"})
+        self.assertEqual(repeated["id"], stop["id"])
+        self.assertEqual((await self.finish(stop))["status"], "done")
+        self.p._emergency_stop.assert_awaited_once()
+        self.assertFalse(self.ui.tasks[leave["id"]].cancelled())
+        release.set()
+        self.assertEqual((await self.finish(leave))["status"], "done")
+        self.assertFalse(self.p.connected)
+
     async def test_shutdown_cancels_jobs_and_rejects_new_controls(self):
         started = asyncio.Event()
         async def long_resume():

@@ -541,33 +541,31 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         p.goals.resume.assert_not_awaited()
         self.assertTrue(p.life.paused)
 
-    async def test_emergency_during_goal_preparation_keeps_new_goal_paused(self):
+    async def test_emergency_during_goal_preparation_invalidates_new_plan(self):
         p = plugin()
         preparing = asyncio.Event()
         release = asyncio.Event()
-
-        class Goals:
-            active = False
-            pause_calls = 0
-
-            async def start(self, goal):
-                preparing.set()
-                await release.wait()
-                self.active = True
-                return "目标已开始"
-
-            async def pause(self):
-                self.pause_calls += 1
-                return "目标已暂停"
-
-        p.goals = Goals()
-        task = asyncio.create_task(results(p.tool_mc_set_goal(Event(), goal="盖房子")))
+        from astrcraft_plugin.goals import GoalManager
+        async def plan(*args):
+            preparing.set()
+            await release.wait()
+            return '[{"skill":"chop_tree","params":{"count":8}}]'
+        async def call(method, params=None, **kwargs):
+            if method == "skill.list":
+                return {"skills": ["chop_tree(count=8)"], "names": ["chop_tree"]}
+            if method == "skill.run":
+                self.fail("急停后的旧规划不能提交技能")
+            return {"ok": True}
+        p.engine.call = call
+        p.goals = GoalManager(engine_call=p._engine_call, llm_planner=plan)
+        task = asyncio.create_task(results(p.tool_mc_set_goal(Event(), goal="custom unknown plan")))
         await asyncio.wait_for(preparing.wait(), timeout=2)
         await results(p.cmd_stop(Event()))
         release.set()
         reply = await task
         self.assertIn("急停", reply[0])
-        self.assertEqual(p.goals.pause_calls, 2)
+        self.assertIsNone(p.goals.plan)
+        self.assertFalse(p.goals.active)
         self.assertTrue(p.life.paused)
         self.assertTrue(p._emergency_stopped)
         self.assertEqual(p._player_action_inflight, 0)

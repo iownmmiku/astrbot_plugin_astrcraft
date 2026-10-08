@@ -4,26 +4,62 @@ const names = {overview:["世界总览","看看她在哪里，正在想什么，
 const statuses = {running:"进行中",done:"已完成",failed:"失败",cancelled:"已中断",paused:"已暂停",idle:"待命",abandoned:"已放弃",queued:"排队中"};
 const actions = {connect:"进服",disconnect:"退服",stop:"急停",resume:"继续",pause:"暂停",abandon:"放弃目标",goal:"指派目标",say:"游戏发言",viewer:"开启观战"};
 const dimensions = {overworld:"主世界","minecraft:overworld":"主世界",the_nether:"下界",nether:"下界","minecraft:the_nether":"下界",the_end:"末地",end:"末地","minecraft:the_end":"末地"};
+const bridge = window.AstrBotPluginPage || null;
 let token = "", state = null, timer = null, toastTimer = null, polling = false;
+let nativeReady = false, sessionGeneration = 0;
 const pending = new Map();
-try { token = sessionStorage.getItem("astrcraft-token") || ""; } catch (_) { /* Private browser storage can be disabled. */ }
+const requests = new Set();
+if (!bridge) {
+  try { token = sessionStorage.getItem("astrcraft-token") || ""; } catch (_) { /* Private storage can be disabled. */ }
+}
+function authenticated() { return nativeReady || Boolean(token); }
+function staleSession() { const error = new Error("会话已切换"); error.name = "StaleSessionError"; return error; }
 function text(id, value) { $(id).textContent = value == null || value === "" ? "—" : String(value); }
 function element(tag, className, content) { const node = document.createElement(tag); if(className) node.className = className; if(content != null) node.textContent = String(content); return node; }
 function number(value) { return typeof value === "number" && Number.isFinite(value) ? value : null; }
 function clock(at) { return at ? new Date(at * 1000).toLocaleTimeString("zh-CN",{hour12:false}) : "—"; }
 function toast(message, error=false) { $("toast").textContent=message; $("toast").classList.toggle("error",error); $("toast").hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$("toast").hidden=true,5500); }
 function notice(message) { $("notice").hidden=!message; $("notice").textContent=message; }
-function login(message="") { clearTimeout(timer); token=""; try{sessionStorage.removeItem("astrcraft-token");}catch(_){} if(!$("login-dialog").open)$("login-dialog").showModal(); $("login-shade").hidden=true; $("login-error").hidden=!message; $("login-error").textContent=message; text("connection-label","等待登录"); $("connection-dot").className="dot"; updateButtons(); }
+function clearDisplay() {
+  state={state:null,engine:null,engine_running:false,plugin:{},life:null,goal:null,viewer:null,jobs:[],events:[],errors:[],version:"—"};
+  render();state=null;
+  ["goal-input","chat-input","item-filter"].forEach(id=>$(id).value="");
+  text("hero-server","—");text("refresh-state","尚未同步");text("connection-detail","登录后读取状态");notice("");
+}
+function newSession() {
+  sessionGeneration++;clearTimeout(timer);clearTimeout(toastTimer);$("toast").hidden=true;polling=false;pending.clear();
+  for(const controller of requests)controller.abort();requests.clear();
+}
+function login(message="") {
+  newSession();token="";clearDisplay();
+  if(bridge){nativeReady=false;$("login-shade").hidden=true;notice(message||"AstrBot 会话已失效，请重新登录管理面板后打开控制台。");updateButtons();return;}
+  try{sessionStorage.removeItem("astrcraft-token");}catch(_){}
+  if(!$("login-dialog").open)$("login-dialog").showModal();
+  $("login-shade").hidden=true;$("login-error").hidden=!message;$("login-error").textContent=message;
+  text("connection-label","等待登录");$("connection-dot").className="dot";updateButtons();
+}
 function loggedIn() { $("login-dialog").close(); $("login-shade").hidden=true; $("token-input").value=""; }
 async function request(path, options={}) {
-  const controller=new AbortController(), timeout=setTimeout(()=>controller.abort(),13000);
+  const generation=sessionGeneration, credential=token, controller=new AbortController();
+  requests.add(controller);
+  let timeout;
   try {
-    const response=await fetch(path,{...options,headers:{"Authorization":`Bearer ${token}`,"Content-Type":"application/json",...(options.headers||{})},signal:controller.signal,cache:"no-store"});
-    const data=await response.json();
-    if(!response.ok){ if(response.status===401)login(data.error); throw new Error(data.error||`HTTP ${response.status}`); }
+    const work = async () => {
+      if(bridge){
+        if(!nativeReady)throw new Error("正在连接 AstrBot 管理面板");
+        return options.method==="POST" ? bridge.apiPost("action",JSON.parse(options.body)) : bridge.apiGet("state");
+      }
+      const response=await fetch(path,{...options,headers:{"Authorization":`Bearer ${credential}`,"Content-Type":"application/json",...(options.headers||{})},signal:controller.signal,cache:"no-store"});
+      const data=await response.json();
+      if(generation!==sessionGeneration)throw staleSession();
+      if(!response.ok){if(response.status===401)login(data.error);throw new Error(data.error||`HTTP ${response.status}`);}
+      return data;
+    };
+    const data=await Promise.race([work(),new Promise((_,reject)=>{timeout=setTimeout(()=>{controller.abort();reject(new Error("控制台响应超时；已提交的操作可能仍在执行，请先查看操作回执"));},13000);})]);
+    if(generation!==sessionGeneration)throw staleSession();
     return data;
-  } catch(error) { if(error.name==="AbortError")throw new Error("控制台响应超时"); throw error; }
-  finally {clearTimeout(timeout);}
+  } catch(error) { if(generation!==sessionGeneration)throw staleSession();throw error; }
+  finally {clearTimeout(timeout);requests.delete(controller);}
 }
 function setPage(page) {
   if(!names[page])return;
@@ -36,9 +72,9 @@ function updateButtons() {
   const connected=Boolean(state?.state?.connected && state?.engine_running);
   document.querySelectorAll("[data-action]").forEach(button=>{
     const action=button.dataset.action;
-    button.disabled=!token || (busy && !["stop","disconnect"].includes(action)) || (["viewer"].includes(action)&&!connected);
+    button.disabled=!authenticated() || (busy && !["stop","disconnect"].includes(action)) || (["viewer"].includes(action)&&!connected);
   });
-  ["goal-form","chat-form"].forEach(id=>$(id).querySelector("button[type=submit]").disabled=!token||busy||!connected|| (id==="goal-form"&&state?.plugin?.emergency_stopped));
+  ["goal-form","chat-form"].forEach(id=>$(id).querySelector("button[type=submit]").disabled=!authenticated()||busy||!connected|| (id==="goal-form"&&state?.plugin?.emergency_stopped));
 }
 function bar(id, value, max=20) { $(id).style.width=`${number(value)==null?0:Math.max(0,Math.min(100,value/max*100))}%`; }
 function eventLabel(event) {
@@ -60,6 +96,20 @@ function events() {
       container.append(row);
     }
   });
+}
+function usage() {
+  const data=state?.usage, groups=data?.groups||{};
+  text("model-calls",data?.calls??0);
+  text("model-tokens",data?.total?.total??"未报告");
+  text("model-unknown",data?.unknown_calls?`${data.unknown_calls} 次未报告用量；Token 仅统计已报告部分。`:data?.reported_calls?"Token 来自模型提供方实际报告。":"等待模型调用；未报告用量时显示未知。");
+  text("model-wait",data?.latency_ms?.average==null?"—":`${(data.latency_ms.average/1000).toFixed(1)} 秒 / 次`);
+  const container=$("model-groups");container.replaceChildren();
+  const labels={autonomous:"自主行动",planning:"目标规划",perception:"环境侦察",chat:"游戏聊天"};
+  for(const [kind,label] of Object.entries(labels)){
+    const group=groups[kind]||{}, row=element("div","equipment-row");
+    const count=group.calls||0, wait=group.latency_ms?.average;
+    row.append(element("small","",label),element("span","",`${count} 次 · ${group.total?.total??"未知"} Token${wait==null?"":` · 平均 ${(wait/1000).toFixed(1)} 秒`}`));container.append(row);
+  }
 }
 function steps(id, list, current=-1, completed=false) {
   const container=$(id);container.replaceChildren();
@@ -86,6 +136,14 @@ function tasks() {
     }
   }
   if(!state.jobs?.length)$("jobs").append(element("p","empty","尚未从控制台发出操作。"));
+  const visible=new Set((state.jobs||[]).map(job=>job.id));
+  for(const [id,receipt] of pending){
+    // Only a snapshot sampled after acceptance can expire a missing receipt.
+    // An older in-flight refresh must not erase a newly submitted operation.
+    if(!visible.has(id)&&number(receipt.at)!=null&&number(state.sampled_at)!=null&&state.sampled_at>=receipt.at){
+      pending.delete(id);toast("操作回执已超过保留范围，请根据当前状态确认结果。",true);
+    }
+  }
 }
 function itemKind(name) {
   if(/pickaxe|axe|sword|shovel|hoe|bow|shield/.test(name))return ["tool","⚒"];
@@ -136,25 +194,27 @@ function render() {
   text("dimension",ready?(dimensions[s.dimension]||s.dimension||"未知维度"):"未知维度");text("coordinates",ready&&s.position?[s.position.x,s.position.y,s.position.z].map(v=>number(v)==null?"—":Math.floor(v)).join(" / "):"— / — / —");
   text("standing",ready?`脚下 ${s.standing_on||"未知"}${s.in_water?" · 在水中":""}${s.in_lava?" · 在岩浆中":""}`:"脚下地形尚未读取");text("xp",ready?s.xp?.level:null);text("weather",ready&&typeof s.is_raining==="boolean"?(s.is_raining?"下雨":"晴朗"):"—");text("environment",`光照 ${ready?s.light??"—":"—"} · 延迟 ${ready?s.ping??"—":"—"}${ready&&number(s.ping)!=null?" ms":""}`);
   text("activity",life?.activity||"暂无近期决策");text("reason",life?.reason||life?.hold_reason||"自主生活系统未初始化");text("intention",life?.intention||"尚未形成持续打算");text("life-tag",stopped?"已急停":life?.paused?"已暂停":life?.running?"自主生活":"待命");text("plan-count",life?`自主计划还剩 ${life.plan.length} 步`:"生活系统未初始化");text("hold-reason",life?.hold_reason);text("life-summary",life?.summary);
-  const viewer=state.viewer;$("viewer-link").hidden=!viewer?.running;
+  const viewer=state.viewer;$("viewer-link").hidden=!viewer?.running||Boolean(bridge);
+  $("viewer-native").hidden=true;$("viewer-address").value="";
   document.querySelector('[data-action="viewer"]').hidden=Boolean(viewer?.running);
-  if(viewer?.running){try{const url=new URL(viewer.url);if(url.protocol==="http:"&&url.port){url.hostname=location.hostname;$("viewer-link").href=url.href;}else $("viewer-link").hidden=true;}catch(_){$("viewer-link").hidden=true;}}
-  notice(state.errors.join("\n"));tasks();inventory();events();updateButtons();
+  if(viewer?.running){try{const url=new URL(viewer.url);if(url.protocol==="http:"&&url.port){url.hostname=location.hostname;if(bridge){$("viewer-native").hidden=false;$("viewer-address").value=url.href;}else $("viewer-link").href=url.href;}else $("viewer-link").hidden=true;}catch(_){$("viewer-link").hidden=true;}}
+  notice(state.errors.join("\n"));tasks();inventory();events();usage();updateButtons();
 }
 async function poll() {
-  if(!token||polling)return;clearTimeout(timer);polling=true;
+  if(!authenticated()||polling)return;clearTimeout(timer);polling=true;
+  const generation=sessionGeneration;
   try{state=await request("/api/state");loggedIn();render();}
-  catch(error){if(token){notice(`同步中断：${error.message}。页面保留上次数据，暂不能确认最新状态。`);text("connection-label","同步中断");text("refresh-state","数据可能已过期");$("connection-dot").className="dot bad";}}
-  finally{polling=false;if(token)timer=setTimeout(poll,document.hidden?10000:2000);}
+  catch(error){if(generation===sessionGeneration&&authenticated()){notice(`同步中断：${error.message}。页面保留上次数据，暂不能确认最新状态。`);text("connection-label","同步中断");text("refresh-state","数据可能已过期");$("connection-dot").className="dot bad";}}
+  finally{if(generation===sessionGeneration){polling=false;if(authenticated())timer=setTimeout(poll,document.hidden?10000:2000);}}
 }
 async function act(action, content="", input=null) {
-  try{const job=await request("/api/action",{method:"POST",body:JSON.stringify({action,text:content})});pending.set(job.id,{input,text:content});toast(`${actions[action]}已提交，正在执行…`);updateButtons();await poll();}
-  catch(error){toast(error.message,true);}
+  try{const job=await request("/api/action",{method:"POST",body:JSON.stringify({action,text:content})});pending.set(job.id,{input,text:content,at:job.at});toast(`${actions[action]}已提交，正在执行…`);updateButtons();await poll();}
+  catch(error){if(error.name!=="StaleSessionError")toast(error.message,true);}
 }
 document.querySelectorAll("[data-page]").forEach(button=>button.addEventListener("click",()=>setPage(button.dataset.page)));
 document.querySelectorAll("[data-action]").forEach(button=>button.addEventListener("click",()=>act(button.dataset.action)));
 document.querySelectorAll("[data-suggestion]").forEach(button=>button.addEventListener("click",()=>{$("goal-input").value=button.dataset.suggestion;$("goal-input").focus();}));
-$("login-form").addEventListener("submit",async event=>{event.preventDefault();token=$("token-input").value.trim();const button=event.currentTarget.querySelector("button");button.disabled=true;try{state=await request("/api/state");try{sessionStorage.setItem("astrcraft-token",token);}catch(_){}loggedIn();render();timer=setTimeout(poll,2000);}catch(error){$("login-error").textContent=error.message;$("login-error").hidden=false;}finally{button.disabled=false;}});
+$("login-form").addEventListener("submit",async event=>{event.preventDefault();newSession();token=$("token-input").value.trim();const generation=sessionGeneration;const button=event.currentTarget.querySelector("button");button.disabled=true;try{state=await request("/api/state");try{sessionStorage.setItem("astrcraft-token",token);}catch(_){}loggedIn();render();timer=setTimeout(poll,2000);}catch(error){if(generation===sessionGeneration){$("login-error").textContent=error.message;$("login-error").hidden=false;}}finally{button.disabled=false;}});
 $("goal-form").addEventListener("submit",event=>{event.preventDefault();const value=$("goal-input").value.trim();if(value)act("goal",value,"goal-input");else toast("请填写目标内容",true);});
 $("chat-form").addEventListener("submit",event=>{event.preventDefault();const value=$("chat-input").value.trim();if(value)act("say",value,"chat-input");else toast("请填写聊天内容",true);});
 $("item-filter").addEventListener("input",inventory);$("event-filter").addEventListener("change",events);
@@ -162,4 +222,13 @@ $("refresh").addEventListener("click",poll);$("logout").addEventListener("click"
 $("login-dialog").addEventListener("cancel",event=>event.preventDefault());
 $("mobile-logout").addEventListener("click",()=>{pending.clear();login();});
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)poll();});
-updateButtons();if(token)poll();else login();
+async function boot() {
+  updateButtons();
+  if(bridge){
+    $("logout").hidden=true;$("mobile-logout").hidden=true;
+    text("connection-detail","通过 AstrBot 管理面板连接");
+    try{await bridge.ready();nativeReady=true;$("login-shade").hidden=true;await poll();}
+    catch(error){login(error.message);}
+  }else if(token)poll();else login();
+}
+boot();

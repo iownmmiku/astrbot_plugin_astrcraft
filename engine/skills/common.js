@@ -558,8 +558,7 @@ function canHarvestBlockSafely(bot, point) {
  * 正确的判据是"**靠走能不能出去**"，近似成两件事：
  *   ① 头顶被堵住（有天花板）→ 在地下
  *   ② 她比周围的地面低（在坑/竖井/矿洞里）→ 在地下
- * ② 用周围几列的"地表高度"来量：如果四个方向 6 格外的地表都比她高，
- * 说明她在下面，需要往上爬。
+ * ② 多圈地形至少从三个方向包围她，才视为坑底。单侧山坡与树冠不是井口。
  */
 function isUnderground(bot) {
   if (!bot || !bot.entity) return false;
@@ -570,33 +569,39 @@ function isUnderground(bot) {
   const solid = (b) => !!b && b.boundingBox === 'block';
   // ① 有天花板
   if (solid(blockAt(bot, bx, by + 2, bz)) && solid(blockAt(bot, bx, by + 3, bz))) return true;
-  // ② 比周围地面低（竖井/坑/矿洞）
-  // **采样要更远，而且要取"最高值"**（这一轮修的关键）。
-  //
-  // 原来只采 ±6 格、要求"四个方向里至少三个比她高" —— 而**挖矿挖出来的是宽洞**：
-  // ±6 格以内也都被挖空了，于是"周围地面"变成了洞底、她就不算"在地下"，
-  // 爬升提前结束。实测症状："爬到 -52 就停了，而平台在 -49"。
-  //
-  // 现在采三圈（±6 / ±12 / ±20），这样**宽洞外面那圈没被动过的地面**也能采到；
-  // 附近地表比脚高一格也还在坑里，必须站上井口才算出来。
-  // 语义上也更对：只要附近还有比她高的地面，她就还没回到地表。
-  let sampled = 0;
-  let maxSurf = null;
-  for (const r of [6, 12, 20]) {
-    for (const [dx, dz] of [
-      [r, 0],
-      [-r, 0],
-      [0, r],
-      [0, -r],
-    ]) {
-      const surf = surfaceHeightAt(bot, bx + dx, bz + dz, by);
-      if (surf === null) continue;
-      sampled += 1;
-      if (maxSurf === null || surf > maxSurf) maxSurf = surf;
+  // Keep the distant rings: a mined chamber can be wider than six blocks.
+  // Count directions rather than the highest single sample, which confused
+  // every tree or hillside beside otherwise open, walkable ground with a pit.
+  let raisedDirections = 0;
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    for (const r of [1, 6, 12, 20]) {
+      const surf = surfaceHeightAt(bot, bx + dx * r, bz + dz * r, by);
+      if (surf !== null && surf >= by + 1) {
+        raisedDirections += 1;
+        break;
+      }
     }
   }
-  if (sampled === 0 || maxSurf === null) return false;
-  return maxSurf >= by + 1;
+  if (raisedDirections < 3) return false;
+  // An open valley can have three higher hills and still have an ordinary
+  // level exit. Require loaded sky over the current body and a continuous,
+  // safe twenty-block corridor before overriding the surrounding-rim evidence.
+  // Air above a shaft is insufficient: its corridor hits the actual wall.
+  for (let dy = 2; dy <= 40; dy++) {
+    const above = blockAt(bot, bx, by + dy, bz);
+    if (!above || above.boundingBox !== 'empty' || hasFluid(above)) return true;
+  }
+  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    let corridor = true;
+    for (let r = 1; r <= 20; r++) {
+      if (!safeStepLanding(bot, bx + dx * r, by, bz + dz * r)) {
+        corridor = false;
+        break;
+      }
+    }
+    if (corridor) return false;
+  }
+  return true;
 }
 
 /**
@@ -612,6 +617,10 @@ function surfaceHeightAt(bot, x, z, fromY) {
   for (let y = top; y >= fromY - 8; y -= 1) {
     const b = blockAt(bot, x, y, z);
     if (!b) return null; // 区块没加载
+    // Leaves and trunks stand above the terrain; using their tops invents a
+    // raised rim even in an ordinary forest. Solid roofs still count.
+    const name = String(b.name || '').replace(/^minecraft:/, '');
+    if (/_leaves$|_log$|_wood$|_stem$|_hyphae$/.test(name)) continue;
     if (b.boundingBox === 'block') return y + 1; // 站在这块上面
   }
   return null;
@@ -1079,7 +1088,7 @@ async function climbToSurface({ actions, nav, ctx, maxSteps = 24, reserveItems =
     // 真正的问题是 `isUnderground` 里"地表"的定义：
     // 它取周围 ±6 格的**中位数**，而**挖宽的洞穴里 ±6 格也都被挖空了**，
     // 于是"地表"变成了洞底、她就不算"在地下"了。
-    // 已把那里改成**取最高值 + 取样更远**（见 isUnderground），
+    // 多圈采样保留宽洞井口，并要求多个方向的地形证据（见 isUnderground），
     // 所以这里可以放心用回它。
     if (!isUnderground(bot)) {
       log.info(`爬升：判为"已经出来"了（第 ${i + 1} 轮，y=${Math.floor(bot.entity.position.y)}，共爬 ${climbed} 格）`);

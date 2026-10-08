@@ -998,7 +998,8 @@ rpc.handle(
       throw new GameError(`没有这个技能：${skill}。可用技能：${skills.names().join(' / ')}`);
     }
     engine.requireBot();
-    const task = engine.submitSkill({ skill, params: params.params || params.args || {} });
+    const task = engine.submitSkill({ skill, params: params.params || params.args || {},
+      resumeTaskId: params.resume_task_id ?? null });
     return {
       ok: true,
       task_id: task.id,

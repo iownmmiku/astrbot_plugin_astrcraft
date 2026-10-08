@@ -68,6 +68,7 @@ KNOWN_FLAKY = {
 # **需要服务器/引擎**的判据。用正则扫脚本内容，不写死清单。
 SERVER_MARKERS = [
     r"Rcon\.fromDir",
+    r"Rcon\.from_dir",
     r"""call\(\s*['"]connect['"]""",
     r"""spawn\(\s*process\.execPath""",  # 起引擎子进程
 ]

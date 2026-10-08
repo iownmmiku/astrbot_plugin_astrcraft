@@ -134,6 +134,8 @@ const DEFAULTS = {
     'mangrove_log', 'cherry_log', 'pale_oak_log', 'crimson_stem', 'warped_stem',
     // 树叶（gathering 的 collect apple 会挖橡木/深色橡木树叶）
     'oak_leaves', 'spruce_leaves', 'birch_leaves', 'dark_oak_leaves',
+    // 成熟作物（采集技能会核验 age 并补种，不破坏幼苗）
+    'wheat', 'carrots', 'potatoes', 'beetroots',
     'netherrack',
     // 矿石（mining.js 的 ORES 表；漏掉它们 = 默认配置下挖矿必然失败）
     'coal_ore', 'deepslate_coal_ore',
