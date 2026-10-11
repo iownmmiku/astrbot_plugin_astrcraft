@@ -573,6 +573,9 @@ class PromptRenderMixin:
         现在交给生存顾问：它知道"缺什么、下一步该做什么"。
         """
         drive = suggestion.get("drive")
+        if advice is not None and getattr(advice, "priority", None) == "survival" and not advice.skill:
+            return LifeDecision(activity=advice.why, drive=None, skill=None, params={}, say=None,
+                                reason="生存补给缺少安全来源，等待重新观察；不恢复无关采料")
         if advice is not None and advice.skill:
             # **顾问的建议同样要过白名单**（B3 的补口）。
             #

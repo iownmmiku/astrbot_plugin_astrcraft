@@ -50,6 +50,24 @@ class MiningReturnTests(unittest.IsolatedAsyncioTestCase):
                               task_id=task_id)
         return step
 
+    async def test_world_steer_blocks_new_work_without_losing_completed_return_proof(self):
+        for event in ("hurt", "danger", "tool_broken"):
+            with self.subTest(event=event):
+                state = snapshot()
+                loop = self.make_loop(state)
+                follow = {"skill": "make_tools", "params": {"tier": "iron"}, "why": ""}
+                loop._set_plan([follow])
+                token = loop.register_task_submission("mine_ores", state)
+                loop.bind_task_submission(token, {"task_id": "completed-mine"})
+                loop.note_world_event(event, "采集收尾时收到新的世界情况")
+                self.assertIsNone(loop.register_task_submission("chop_tree", state))
+                loop.note_task_result("mine_ores", False, "return blocked", result=report(state),
+                                      task_id="completed-mine")
+                self.assertIsNotNone(loop._mining_return)
+                self.assertEqual(loop._mining_return["target"], {"x": 0.0, "y": 64.0, "z": 0.0})
+                self.assertEqual(loop._plan, [follow])
+                self.assertEqual(loop._recent_outcomes[-1]["produced"], {"coal": 2})
+
     async def test_production_loop_rescues_and_resumes_exact_followup_without_model(self):
         state = snapshot()
         loop = self.make_loop(state)

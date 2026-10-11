@@ -5,7 +5,7 @@
 ## **先看这个：一条命令跑全部检查**
 
 ```bash
-python dev-tools/run_all.py            # 不需要服务器（约 3 分钟）
+python dev-tools/run_all.py            # 不需要服务器，耗时随环境与检查项变化
 python dev-tools/run_all.py --full     # 连需要测试服的也跑
 python dev-tools/run_all.py --only life
 python dev-tools/run_all.py -v         # 看完整输出

@@ -15,6 +15,8 @@ ActionEvent = _paths.plugin_module("action_agent")._ActionEvent
 async def main():
     from test_life_recovery import make_loop
     life, _ = make_loop()
+    life._state_provider = AsyncMock(return_value={"health": 20, "food": 20, "inventory": {},
+        "is_night": False, "nearby_entities": [], "server": "test:25565", "dimension": "overworld"})
     for _ in range(3):
         life.note_task_result("mine_stone", False, "没有镐")
     engine = SimpleNamespace(run_skill=AsyncMock(return_value={"task_id": "t1"}))

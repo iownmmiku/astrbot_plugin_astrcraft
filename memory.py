@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,6 +61,25 @@ MAX_ENTRIES = 400
 # 留证据是为了不让坐标/数字在合并时消失；但也不能无限涨——
 # 一条"走不到某处"的教训攒 50 个坐标，喂给模型反而是噪音。
 MAX_EVIDENCE = 5
+
+
+def _finite_number(value: Any, name: str) -> float:
+    """接受旧存档的数字字符串，但不让布尔值/NaN/无穷大进入排序和计数。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} 必须是有限数字")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} 必须是有限数字")
+    return number
+
+
+def _world_key(context: dict | None) -> tuple[str | None, str | None]:
+    """未知归属也有自己的键，不能把旧的无归属记录归到某个已知世界。"""
+    context = context or {}
+    world = (context.get("server"), context.get("dimension"))
+    if any(value is not None and not isinstance(value, str) for value in world):
+        raise ValueError("server/dimension 必须是字符串或未知归属")
+    return world
 
 
 def normalize_text(text: str) -> str:
@@ -118,17 +141,52 @@ class MemoryEntry:
 
     @staticmethod
     def from_json(d: dict) -> "MemoryEntry":
+        if not isinstance(d, dict):
+            raise ValueError("记忆条目必须是对象")
+        # JSON 转义也能带入孤立代理字符；校验必须覆盖实际保存用的 UTF-8 编码。
+        json.dumps(d, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        kind, text = d.get("kind", "trivial"), d.get("text", "")
+        if not isinstance(kind, str) or not isinstance(text, str):
+            raise ValueError("kind/text 必须是字符串")
+        at = _finite_number(d.get("at", time.time()), "at")
+        weight = _finite_number(d.get("weight", 1), "weight")
+        if weight < 0:
+            raise ValueError("weight 不能为负数")
+        raw_count = d.get("count") if d.get("count") is not None else 1
+        if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float, str)):
+            raise ValueError("count 必须是正整数")
+        try:
+            count = Decimal(raw_count)
+        except InvalidOperation as exc:
+            raise ValueError("count 必须是正整数") from exc
+        # 旧版把空计数和 0 回落为 1；保留这项迁移行为。
+        if not count.is_finite() or count < 0 or count != count.to_integral_value():
+            raise ValueError("count 必须是正整数")
+        count = int(count) or 1  # 大整数及整数字符串不能经过 float 后丢精度。
+        tags = d.get("tags") if d.get("tags") is not None else []
+        evidence = d.get("evidence") if d.get("evidence") is not None else []
+        for name, value in (("tags", tags), ("evidence", evidence)):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{name} 必须是字符串列表")
+        context = d.get("context") if d.get("context") is not None else {}
+        if not isinstance(context, dict):
+            raise ValueError("context 必须是对象")
+        _world_key(context)
+        # 保留 JSON 快照，避免调用方以后修改嵌套位置时改掉已有记忆的上下文。
+        context = json.loads(json.dumps(context, ensure_ascii=False, allow_nan=False))
+        first_seen = d.get("first_seen", at)
+        first_seen = _finite_number(first_seen if first_seen is not None else 0, "first_seen")
         return MemoryEntry(
-            kind=d.get("kind", "trivial"),
-            text=d.get("text", ""),
-            at=float(d.get("at", time.time())),
-            weight=float(d.get("weight", 1)),
-            tags=list(d.get("tags") or []),
-            context=dict(d.get("context") or {}),
-            count=int(d.get("count", 1) or 1),
+            kind=kind,
+            text=text,
+            at=at,
+            weight=weight,
+            tags=list(tags),
+            context=dict(context),
+            count=count,
             # 老文件没有这两个字段 → 回落成"就是这一条"（不丢已有信息）
-            first_seen=float(d.get("first_seen", d.get("at", time.time())) or 0),
-            evidence=list(d.get("evidence") or []),
+            first_seen=first_seen,
+            evidence=list(evidence),
         )
 
 
@@ -138,38 +196,114 @@ class MemoryStore:
     def __init__(self, data_dir: Path, *, max_entries: int = MAX_ENTRIES):
         self._dir = Path(data_dir)
         self._path = self._dir / "memory.json"
+        self._backup_path = self._dir / "memory.json.bak"
         self._max = max_entries
         self._entries: list[MemoryEntry] = []
         self._dirty = False
+        self._write_protected = False
+        self._preserved_corrupt: dict[Path, bytes] = {}
         self._load()
 
     # ------------------------------------------------------------ 持久化
 
-    def _load(self) -> None:
+    @staticmethod
+    def _decode(raw: bytes) -> tuple[list[MemoryEntry], list[int]]:
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            raise ValueError("记忆存档必须包含 entries 列表")
+        json.dumps({key: value for key, value in data.items() if key != "entries"}, allow_nan=False)
+        entries: list[MemoryEntry] = []
+        invalid: list[int] = []
+        for index, item in enumerate(data["entries"]):
+            try:
+                entries.append(MemoryEntry.from_json(item))
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                invalid.append(index)
+        return entries, invalid
+
+    @staticmethod
+    def _atomic_write(path: Path, raw: bytes) -> None:
+        """只替换完整且已刷盘的同目录临时文件，绝不截断已有存档。"""
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
-            if not self._path.exists():
-                return
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            raw = [MemoryEntry.from_json(d) for d in (data.get("entries") or [])]
-            # **载入时就归并一次**：老版本攒下来的重复条目（实测 392 条里
-            # 只有 173 条不同）在这里一次性合并，不用等下次 prune。
-            self._entries = self._consolidate(raw)
-            if len(self._entries) != len(raw):
-                self._dirty = True
-                logger.info(
-                    "已载入 %s 条 Minecraft 记忆（归并了 %s 条重复）",
-                    len(self._entries),
-                    len(raw) - len(self._entries),
-                )
-            else:
-                logger.info("已载入 %s 条 Minecraft 记忆", len(self._entries))
+            stream = os.fdopen(fd, "wb")
+            fd = None
+            with stream:
+                if stream.write(raw) != len(raw):
+                    raise OSError("记忆临时文件写入不完整")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                # 临时路径已经不存在，无需再次清理；原档替换结果不受影响。
+                pass
+
+    def _preserve_corrupt(self, path: Path, raw: bytes) -> bool:
+        if self._preserved_corrupt.get(path) == raw:
+            return True
+        try:
+            preserved = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+            self._atomic_write(preserved, raw)
+            self._preserved_corrupt[path] = raw
+            logger.warning("记忆坏档已保留：%s", preserved)
+            return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning("载入记忆失败（从空开始）：%s", exc)
-            self._entries = []
+            self._write_protected = True
+            logger.warning("无法保留记忆坏档，已启用写保护：%s", exc)
+            return False
+
+    def _read_file(self, path: Path) -> tuple[bytes | None, list[MemoryEntry], bool]:
+        """返回原始内容、可救回条目及整档是否有效；不可读文件一律写保护。"""
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None, [], False
+        except Exception as exc:  # noqa: BLE001
+            self._write_protected = True
+            logger.warning("无法读取记忆存档，已启用写保护：%s", exc)
+            return None, [], False
+        try:
+            entries, invalid = self._decode(raw)
+            if not invalid:
+                return raw, entries, True
+            logger.warning("记忆存档有 %s 条无效记录，保留其余 %s 条", len(invalid), len(entries))
+        except (UnicodeError, TypeError, ValueError, OverflowError, RecursionError) as exc:
+            entries = []
+            logger.warning("记忆存档格式损坏：%s", exc)
+        self._preserve_corrupt(path, raw)
+        return raw, entries, False
+
+    def _load(self) -> None:
+        raw, entries, valid = self._read_file(self._path)
+        if not valid and not entries:
+            backup_raw, backup_entries, backup_valid = self._read_file(self._backup_path)
+            if backup_valid:
+                entries = backup_entries
+                self._dirty = True
+                logger.warning("已从有效备份恢复 Minecraft 记忆")
+            elif raw is not None or backup_raw is not None or self._write_protected:
+                # 整库恢复失败，即使坏档已隔离，也不能拿空库或新记录覆盖原档。
+                self._write_protected = True
+                logger.warning("没有有效记忆备份，已启用写保护（强制保存也不会覆盖）")
+        elif not valid:
+            self._dirty = True
+        self._entries = self._consolidate(entries)
+        if len(self._entries) != len(entries):
+            self._dirty = True
+        logger.info("已载入 %s 条 Minecraft 记忆", len(self._entries))
 
     def save(self, *, force: bool = False) -> None:
         if not self._dirty and not force:
             return
+        if self._write_protected:
+            logger.warning("记忆存档处于写保护，未覆盖原档或备份")
+            return
+        self._dirty = True
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             # 只保留权重最高的若干条 + 最近的若干条，避免文件无限增长
@@ -179,7 +313,24 @@ class MemoryStore:
                 "saved_at": time.time(),
                 "entries": [e.to_json() for e in kept],
             }
-            self._path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            raw = json.dumps(payload, ensure_ascii=False, indent=1, allow_nan=False).encode("utf-8")
+            _, invalid = self._decode(raw)
+            if invalid:
+                raise ValueError("内存中的记忆含无效记录，未写入")
+            old_raw, old_entries, old_valid = self._read_file(self._path)
+            _, _, backup_valid = self._read_file(self._backup_path)
+            if old_raw is not None and not old_valid and not old_entries and not backup_valid:
+                self._write_protected = True
+            if self._write_protected:
+                logger.warning("记忆存档无法安全保存，已启用写保护")
+                return
+            # 备份只来自完整有效的主档；坏主档永远不能替换好备份。
+            if old_valid:
+                self._atomic_write(self._backup_path, old_raw)
+            elif not backup_valid:
+                # 首次保存也留下一个经验证的完整版本。
+                self._atomic_write(self._backup_path, raw)
+            self._atomic_write(self._path, raw)
             self._dirty = False
         except Exception as exc:  # noqa: BLE001
             logger.warning("保存记忆失败：%s", exc)
@@ -222,10 +373,10 @@ class MemoryStore:
         能这么改的前提是"**记忆条目本身不是摘要**"：它就是一条条原始记录，
         合并只是把重复的收拢、把证据留住，不是把它转述成更短的话。
         """
-        by_key: dict[tuple[str, str], MemoryEntry] = {}
+        by_key: dict[tuple[str, str, str | None, str | None], MemoryEntry] = {}
         out: list[MemoryEntry] = []
         for e in entries:
-            key = (e.kind, normalize_text(e.text))
+            key = (e.kind, normalize_text(e.text), *_world_key(e.context))
             first = by_key.get(key)
             if first is None:
                 by_key[key] = e
@@ -247,8 +398,7 @@ class MemoryStore:
             # 证据不能无限涨：留最近 MAX_EVIDENCE 条
             if len(first.evidence) > MAX_EVIDENCE:
                 first.evidence = first.evidence[-MAX_EVIDENCE:]
-            if not first.context and e.context:
-                first.context = e.context
+            # 代表文本及其上下文来自同一次经历；不能借用另一坐标的 context。
         return out
 
     # ------------------------------------------------------------ 写入
@@ -282,11 +432,28 @@ class MemoryStore:
         if not text:
             return None
         now = time.time()
+        try:
+            entry = MemoryEntry.from_json({
+                "kind": kind,
+                "text": text,
+                "at": now,
+                "weight": weight if weight is not None else KIND_WEIGHT.get(kind, 2),
+                "tags": [str(t) for t in (tags or [])],
+                "context": context,
+            })
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            logger.warning("忽略无法持久化的记忆：%s", exc)
+            return None
+        context = entry.context
+        world = _world_key(context)
         # 第一层：时间窗内**同 kind** 且完全相同的，直接丢。
         # （要比 kind：同一句话可能既是"死亡"又是"意外"，那是两件事，
         #   实测不加这一条会把不同类型的事件互相吃掉）
         for e in reversed(self._entries[-20:]):
-            if e.kind == kind and e.text == text and now - e.at < dedupe_window:
+            if (
+                e.kind == kind and e.text == text and _world_key(e.context) == world
+                and now - e.at < dedupe_window
+            ):
                 return None
 
         # 第二层：归一化后相同 → 合并进已有条目（不新增）
@@ -294,6 +461,8 @@ class MemoryStore:
         if norm:
             for e in reversed(self._entries):
                 if e.kind != kind:
+                    continue
+                if _world_key(e.context) != world:
                     continue
                 if normalize_text(e.text) != norm:
                     continue
@@ -315,19 +484,10 @@ class MemoryStore:
                     e.first_seen = now
                 # 反复发生的事会"变重"，但设上限避免一条噪音压过一切
                 e.weight = min(9.0, max(e.weight, float(weight) if weight is not None else e.weight) + 0.15)
-                if context:
-                    e.context = dict(context)
+                # 保留代表 text 对应的 context；本次原文仍增补到 evidence。
                 self._dirty = True
                 return e
 
-        entry = MemoryEntry(
-            kind=kind,
-            text=text,
-            at=now,
-            weight=float(weight) if weight is not None else KIND_WEIGHT.get(kind, 2),
-            tags=[str(t) for t in (tags or [])],
-            context=dict(context or {}),
-        )
         self._entries.append(entry)
         self._dirty = True
         return entry

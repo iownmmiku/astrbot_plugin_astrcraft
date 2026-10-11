@@ -67,6 +67,8 @@ class Type:
 TYPES: dict[str, Type] = {
     # 主人说的话：插话，不是恒急（急不急听发送方的）
     "owner": Type(delivery=Delivery.STEER, from_owner=True),
+    # 旁听游戏聊天只作见闻，不能抢占正在进行的动作或取得主人控制权。
+    "game_chat": Type(delivery=Delivery.FOLLOW_UP),
     # 世界事件
     "hurt": Type(delivery=Delivery.STEER, always_urgent=True),
     "danger": Type(delivery=Delivery.STEER, always_urgent=True),

@@ -479,6 +479,10 @@ async def real_handler_checks():
     from test_life_recovery import make_loop
     for from_owner in (True, False):
         life, _ = make_loop()
+        async def snapshot():
+            return {"health": 20, "food": 20, "inventory": {"stone_pickaxe": 1},
+                "is_night": False, "nearby_entities": [], "server": "test:25565", "dimension": "overworld"}
+        life._state_provider = snapshot
         for _ in range(3):
             life.note_task_result("mine_stone", False, "没有镐")
         assert not life.skill_retry_ready("mine_stone")

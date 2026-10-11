@@ -519,6 +519,9 @@ class ActionAgent:
             # Later failed/discarded replies retain the last accepted generation.
             timing["decision_revision"] = plan_revision
             timing["owner_generation"] = owner_generation
+            # Only this accepted response may use the owner input it read.
+            # A newer owner/STEER or pause still invalidates submission below.
+            event.astrcraft_owner_generation = owner_generation
 
             names = list(getattr(resp, "tools_call_name", None) or [])
             args_list = list(getattr(resp, "tools_call_args", None) or [])

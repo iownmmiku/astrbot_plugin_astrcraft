@@ -13,6 +13,7 @@ from __future__ import annotations
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 
 from .bridge_client import EngineError
+from .inbox import Delivery
 
 FAST_TIMEOUT = 20.0
 
@@ -625,29 +626,34 @@ class McSkillTools:
             return event.plain_result("机器人处于急停状态，请先由主人用 /mc继续 恢复。")
         life = getattr(self, "life", None)
         protection_state = getattr(life, "_return_boundary_state", {}) if life is not None else {}
+        supply_attempt = None
         if getattr(event, "astrcraft_autonomous", False) and life is not None:
+            owner_generation = getattr(event, "astrcraft_owner_generation", None)
             if not life.may_act():
                 return event.plain_result(f"error: 当前不能自主行动：{life.hold_explain()}")
             if not life.skill_retry_ready(skill):
                 return event.plain_result(f"error: {skill} 仍在失败冷却中，请根据已有结果换一种做法。")
             boundary = getattr(life, "_needs_work_boundary", None)
-            if (boundary(skill) if callable(boundary) else skill in ("chop_tree", "mine_stone", "mine_ores", "collect", "hunt")) and getattr(life, "_homes", []):
+            if (boundary(skill) if callable(boundary) else skill in ("chop_tree", "mine_stone", "mine_ores", "collect", "hunt")):
                 # A direct agent tool is also a plan's first step. A verified
                 # closed home must be exited through the same fresh boundary
                 # rules as mc_plan_do, rather than mining behind its door.
                 revision = life._plan_revision
-                if life._plan or life._pending_plan or life._owner_steer_pending():
+                if life._plan or life._pending_plan or not life._owner_submission_ready(owner_generation):
                     return event.plain_result("error: 已有计划或主人新指令，先按最新安排处理。")
                 try:
                     snapshot = await life._gather_state()
                 except Exception as exc:  # noqa: BLE001
                     return event.plain_result(f"error: 无法核验基地与当前状态：{exc}")
                 if (revision != life._plan_revision or not life.may_act()
-                        or life._owner_steer_pending() or not self.connected
+                        or not life._owner_submission_ready(owner_generation) or life.inbox.has_delivery(Delivery.STEER) or not self.connected
                         or getattr(self, "_emergency_stopped", False)):
                     return event.plain_result("error: 核验期间状态或主人指令已变化，重新观察后再安排。")
                 if life._plan or life._pending_plan:
                     return event.plain_result("error: 核验期间已有新计划，先按最新安排处理。")
+                if (not isinstance(snapshot.get("inventory"), dict)
+                        or snapshot.get("health") is None or snapshot.get("food") is None):
+                    return event.plain_result("error: 当前身体或背包状态尚未确认，先重新观察再安排工作。")
                 protection_state = snapshot
                 home = life._home_for_state(snapshot)
                 if home and (snapshot.get("home_status") or {}).get("safe") is True:
@@ -660,6 +666,25 @@ class McSkillTools:
                     return event.plain_result(
                         f"已保留「{label}」的原任务参数；当前仍在基地内，下一步先按真实状态补给、休息或安全出门，再继续。"
                     )
+                if (snapshot["health"] <= 8 and snapshot["food"] < 18
+                        and life._skill_needs_outdoors(skill, params, snapshot)):
+                    bounded = life._emergency_crop_params(params, snapshot) if skill == "collect" else None
+                    if bounded is None or snapshot["health"] <= 0:
+                        return event.plain_result(
+                            "error: 饱食不足，等待不能恢复生命；先用现有食物或储粮。只有白天无近敌时，才能原地少量收割成熟作物，不能残血打猎或远行。"
+                        )
+                    observation = life._supply_observation(snapshot)
+                    life._observe_rule_supply(observation)
+                    if revision != life._plan_revision:
+                        return event.plain_result("error: 上次应急取食没有实际进展，先按失败冷却重新观察。")
+                    if (not life.skill_retry_ready("collect")
+                            or life._rule_supply_stalled("collect", bounded, observation)):
+                        return event.plain_result("error: 近处应急收割仍在冷却或没有实际进展，先重新观察食物与安全路线。")
+                    params = bounded
+                    label = f"近处应急收集 {params['item']}×{params['count']}"
+                    supply_attempt = {"skill": skill, "params": dict(params), "state": observation,
+                                      "revision": life._plan_revision}
+                life._return_boundary_state = dict(snapshot)
             if skill in getattr(life, "PREPARATION_SKILLS", ()):
                 params = {**params, "safe_search": True}
             protect = getattr(life, "_protected_work_params", None)
@@ -669,12 +694,20 @@ class McSkillTools:
         if getattr(event, "astrcraft_autonomous", False) and life is not None:
             register = getattr(life, "register_task_submission", None)
             if callable(register):
-                submission = register(skill, state=protection_state)
+                submission = register(skill, state=protection_state,
+                    owner_generation=getattr(event, "astrcraft_owner_generation", None))
+                if submission is None:
+                    return event.plain_result("error: 自主行动状态已变化，重新观察后再安排。")
+        if supply_attempt is not None:
+            life._rule_supply_attempt = supply_attempt
         try:
             r = await self.engine.run_skill(skill, params)
             if submission is not None:
                 life.bind_task_submission(submission, r)
         except EngineError as exc:
+            if (supply_attempt is not None and submission is not None
+                    and submission is life._return_task_attempt and life._return_token_current(submission)):
+                life.note_task_result(skill, False, str(exc))
             if submission is not None:
                 life.bind_task_submission(submission, None)
             if exc.is_not_connected:

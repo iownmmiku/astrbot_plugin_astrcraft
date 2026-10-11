@@ -144,6 +144,17 @@ class LifeLoop(PromptRenderMixin):
     def _needs_work_boundary(cls, skill: str) -> bool:
         return skill in cls.OUTDOOR_SKILLS or skill in cls.PREPARATION_SKILLS
 
+    @staticmethod
+    def _drive_activity(skill: str, drive: str | None, activity: str) -> dict | None:
+        corresponding = {
+            "gather": {"chop_tree", "mine_stone", "mine_ores", "collect", "cook_food", "store_items"},
+            "build": {"build_shelter", "blueprint", "pave", "store_items"},
+            "social": {"interact", "move.to_player"},
+            "explore": {"move.goto", "move.to"},
+            "leisure": {"move.goto", "move.to", "interact"},
+        }
+        return {"drive": drive, "activity": activity} if skill in corresponding.get(drive, set()) else None
+
     def __init__(
         self,
         *,
@@ -454,6 +465,17 @@ class LifeLoop(PromptRenderMixin):
         """Keep the rule-action barrier until the owner's input is processed successfully."""
         return getattr(self, "_decision_owner_pending", False) or self._queued_owner_steer()
 
+    def _owner_submission_ready(self, owner_generation: int | None = None) -> bool:
+        """A model may act on exactly the owner input its accepted response read."""
+        if self.inbox.has_delivery(Delivery.STEER):
+            return False
+        if owner_generation is not None and (type(owner_generation) is not int
+                or owner_generation != self._decision_owner_generation):
+            return False
+        if not self._owner_steer_pending():
+            return True
+        return owner_generation is not None
+
     def _note_busy_round(self) -> None:
         """这一轮**有事做**（执行了计划的一步）→ 清掉"没事做"的计数。"""
         self._idle_rounds = 0
@@ -503,20 +525,25 @@ class LifeLoop(PromptRenderMixin):
     def _return_distance(a: dict, b: dict) -> float:
         return math.sqrt(sum((a[k] - b[k]) ** 2 for k in ("x", "y", "z")))
 
-    def register_task_submission(self, skill: str, state: dict | None = None) -> dict | None:
+    def register_task_submission(self, skill: str, state: dict | None = None, *,
+                                 owner_generation: int | None = None) -> dict | None:
         """Register before RPC; a completion arriving before its reply is buffered."""
-        if not self.may_act(allow_model_block=True) or self._owner_steer_pending():
+        if not self.may_act(allow_model_block=True) or not self._owner_submission_ready(owner_generation):
             return None
         previous = self._return_task_attempt
-        if previous and not previous.get("task_id") and previous["skill"] == skill:
+        if previous and not previous.get("task_id") and previous["skill"] == skill and self._return_token_current(previous):
             return previous
         snapshot = state if isinstance(state, dict) else self._return_boundary_state
         pending = self._mining_return if skill == "climb_out" else None
         token = {"skill": skill, "revision": self._plan_revision,
                  "owner": self._decision_owner_generation, "generation": self._return_control_generation,
+                 "accepted_owner": owner_generation,
                  "world": self._return_world(snapshot), "task_id": None, "early": {},
                  "pending": pending, "position": self._return_position(snapshot.get("position")),
                  "supply_return": self._mining_return if skill in ("eat", "recover") else None}
+        activity = getattr(self, "_active_agent_activity", None)
+        if activity:
+            token["drive_activity"] = self._drive_activity(skill, activity["drive"], activity["activity"])
         self._return_task_attempt = token
         if pending is not None:
             pending["attempts"] += 1
@@ -547,10 +574,16 @@ class LifeLoop(PromptRenderMixin):
                 self.note_task_result(token["skill"], ok, error, result=result, task_id=str(task_id))
 
     def _return_token_current(self, token: dict) -> bool:
+        # A physical completion is evidence, not permission for a new action.
+        # Same-task hurt/tool break events must not discard its escape duty.
+        accepted_owner = token.get("accepted_owner")
+        owner_ready = (not self._owner_steer_pending() or (
+            type(accepted_owner) is int and accepted_owner == self._decision_owner_generation
+            and not self._queued_owner_steer()))
         return (token["revision"] == self._plan_revision
                 and token["owner"] == self._decision_owner_generation
                 and token["generation"] == self._return_control_generation
-                and self.may_act(allow_model_block=True) and not self._owner_steer_pending())
+                and self.may_act(allow_model_block=True) and owner_ready)
 
     def _accept_return_completion(self, name: str, ok: bool, error: str,
                                   result: dict, task_id: str | None) -> bool | None:
@@ -732,6 +765,14 @@ class LifeLoop(PromptRenderMixin):
         if len(self._recent_outcomes) > 8:
             self._recent_outcomes = self._recent_outcomes[-8:]
 
+        if (ok and token is not None and task_id and token.get("task_id") == str(task_id)
+                and self._return_token_current(token)
+                and not (isinstance(result, dict) and result.get("ok") is False)
+                and (not name.startswith("move.") or isinstance(result, dict) and result.get("arrived") is True)):
+            activity = token.pop("drive_activity", None)
+            if activity:
+                self.drives.note_activity(**activity)
+
         if isinstance(result, dict) and isinstance(result.get("return_status"), dict):
             self._recent_outcomes[-1].update(
                 produced=dict(result.get("produced") or {}),
@@ -907,10 +948,12 @@ class LifeLoop(PromptRenderMixin):
     async def _build_advice(self, state: dict | None = None) -> object:
         """算一次生存建议。"""
         st = state if state is not None else await self._gather_state()
+        health = float(st["health"] if st.get("health") is not None else 20)
+        food = int(st["food"] if st.get("food") is not None else 20)
         adv = advise(
             st.get("inventory") or {},
-            health=float(st["health"] if st.get("health") is not None else 20),
-            food=int(st["food"] if st.get("food") is not None else 20),
+            health=health,
+            food=food,
             has_shelter=bool(st.get("has_shelter", self._has_shelter)),
             recent_failures=self._failure_counts(),
             is_night=bool(st.get("is_night", False)),
@@ -919,6 +962,14 @@ class LifeLoop(PromptRenderMixin):
             home=self._home_for_state(st),
             home_status=st.get("home_status") or {},
         )
+        if (adv.priority == "survival" and health <= 8 and food < 18
+                and self._skill_needs_outdoors(adv.skill, adv.params, st)):
+            # Do not present an impossible automatic meal as the model's
+            # mandatory fallback. Existing food/storage and indoor cooking
+            # are selected normally; unknown food requires fresh observation.
+            adv.skill, adv.params, adv.hard = None, {}, False
+            adv.why = ("饱食不足，等待不能恢复生命；先观察近处食物、储粮与安全路线，避免残血打猎和远行。"
+                       "白天且近处没有敌人时，可尝试少量成熟小麦、胡萝卜、土豆或甜菜；只核验身边三格，不找新农田")
         self._last_advice = adv
         return adv
 
@@ -1034,6 +1085,8 @@ class LifeLoop(PromptRenderMixin):
         if skill in ("cook_food", "hunt", "resupply_food"):
             return (after["food"] > before["food"] or after["ready"] > before["ready"]
                     or (skill == "hunt" and after["raw"] > before["raw"]))
+        if skill == "collect":
+            return any(after[k] > before[k] for k in ("ready", "raw", "wheat"))
         if skill == "recover":
             return after["health"] > before["health"]
         if skill == "leave_home":
@@ -1087,7 +1140,12 @@ class LifeLoop(PromptRenderMixin):
         before = stalled["state"]
         # Real improvement, new supplies or a new target can unlock a rule.
         # A further drop in hunger alone cannot make a stalled rule viable.
-        changed = (self._supply_progress(skill, before, observation) or params != stalled["params"]
+        changed_target = params != stalled["params"]
+        if skill == "collect":
+            # A different meal target can be a new strategy; changing only
+            # count/radius cannot prove that an unchanged empty crop now exists.
+            changed_target = params.get("item") != stalled["params"].get("item")
+        changed = (self._supply_progress(skill, before, observation) or changed_target
                    or any(before[k] != observation[k] for k in ("server", "dimension")))
         if skill in ("eat", "cook_food", "hunt", "resupply_food"):
             changed = changed or any(observation[k] > before[k] for k in ("ready", "raw", "wheat"))
@@ -1350,6 +1408,70 @@ class LifeLoop(PromptRenderMixin):
                 result["protected_home"] = dict(home)
         return result
 
+    def _emergency_crop_params(self, params: dict, state: dict) -> dict | None:
+        """Authorize a native reach-only harvest, never a model's claimed nearby farm."""
+        item = str(params.get("item") or "").removeprefix("minecraft:").lower()
+        entities = state.get("nearby_entities")
+        status = state.get("home_status") or {}
+        if (item not in ("wheat", "carrot", "potato", "beetroot")
+                or state.get("is_night") is not False or not isinstance(entities, list)
+                or any(e.get("hostile") is True for e in entities if isinstance(e, dict))
+                or status.get("inside") is True or status.get("safe") is True
+                or state.get("in_water") is True or state.get("in_lava") is True):
+            return None
+
+        def bounded(name: str, maximum: int) -> int:
+            try:
+                value = float(params.get(name, maximum))
+                return min(maximum, max(1, int(value))) if math.isfinite(value) else maximum
+            except (ValueError, TypeError, OverflowError):
+                return maximum
+
+        # Wheat needs one bread recipe; edible crops need only a small meal.
+        # Native harvesting checks real maturity/distance and replants, and
+        # allow_search=False forbids relocation if the crop is absent.
+        return {"item": item, "count": 3 if item == "wheat" else bounded("count", 3),
+                "radius": bounded("radius", 3), "allow_search": False,
+                "max_attempts": bounded("max_attempts", 2)}
+
+    def _wait_for_safe_supply(self, state: dict, reason: str) -> None:
+        """Rest only when the body can recover without first finding food."""
+        if state["health"] <= 8 and state["food"] < 18:
+            reason = "饱食不足，等待不能恢复生命；先重新观察近处食物、储粮与安全路线，避免残血打猎和远行"
+            self.skill_retry_ready("collect")  # Start the ordinary failure cooldown even with an empty plan.
+            self._decision_retry_at = max(self._decision_retry_at, self._failure_cooldowns.get("collect", 0.0))
+            emergency = None
+            if self._plan and self._plan[0]["skill"] == "collect":
+                emergency = self._emergency_crop_params(self._plan[0]["params"], state)
+            if emergency is not None:
+                observation = self._supply_observation(state)
+                if not self.skill_retry_ready("collect"):
+                    # Keep the concrete meal while its bounded failure cooldown
+                    # runs; do not ask the model for the same crop every tick.
+                    self._rule_supply_wait_reason = "近处应急收割仍在失败冷却中，稍后按新状态重试"
+                    return
+                if not self._rule_supply_stalled("collect", emergency, observation):
+                    self._plan[0]["params"] = emergency
+                    original = self._plan[0].get("decision")
+                    if isinstance(original, LifeDecision):
+                        original.params = dict(emergency)
+                    self._rule_supply_candidate = {"skill": "collect", "params": dict(emergency),
+                        "state": observation, "revision": self._plan_revision}
+                    return
+                # Two claimed successes without actual food are not permission
+                # to keep retrying. Continue observing with a finite replan budget.
+                self._decision_retry_at = max(self._decision_retry_at, time.time() + 30.0)
+            # Explicit shelter/escape routes remain usable at this boundary.
+            if ((self._plan and self._plan[0]["skill"] not in ("return_home", "climb_out"))
+                    or self._pending_plan):
+                self.clear_plan(reason)
+            if getattr(self, "_last_state_note", "") != reason:
+                self.state_note(reason)
+            # Leave the wait marker empty so the loop can observe/replan using
+            # its normal model budget. Native preparation safety stays intact.
+            return
+        self._rule_supply_wait_reason = reason
+
     async def _survival_step(self) -> dict | None:
         """空闲边界按真实状态补给；空计划和模型故障也能处理紧急需求。"""
         self._rule_supply_candidate = None
@@ -1378,6 +1500,9 @@ class LifeLoop(PromptRenderMixin):
             return_step = self._mining_return_step(state, advice, observation)
             if return_step is not None or self._mining_return is not None or revision != self._plan_revision:
                 return return_step
+        if advice.priority == "survival" and advice.skill is None:
+            self._wait_for_safe_supply(state, advice.why)
+            return None
         # A failed strategy remains failed while the clock is unknown or the
         # body rests. Process its bounded retry/remedy semantics before travel.
         remedy = None
@@ -1401,15 +1526,15 @@ class LifeLoop(PromptRenderMixin):
         preparation_search = (food_search and advice.skill in self.PREPARATION_SKILLS or ordinary_work
             and self._plan[0]["skill"] in self.PREPARATION_SKILLS)
         if remedy is not None and ordinary_work and (state.get("is_night") is not False or state["health"] <= 8):
-            self._rule_supply_wait_reason = "补给缺料仍需外出，保留补料步骤等待天亮和身体恢复"
+            self._wait_for_safe_supply(state, "补给缺料仍需外出，保留补料步骤等待天亮和身体恢复")
             return None
         if preparation_search and (state.get("is_night") is not False or state["health"] <= 8):
-            self._rule_supply_wait_reason = "准备技能需要外出补材料，保留计划等待天亮和身体恢复"
+            self._wait_for_safe_supply(state, "准备技能需要外出补材料，保留计划等待天亮和身体恢复")
             return None
         if home and status.get("safe") is True and (ordinary_work or food_search):
             if (state.get("is_night") is not False or state["health"] <= 8
                     or ordinary_work and remedy is None and state["food"] <= 10):
-                self._rule_supply_wait_reason = "当前仍需在基地内休息，保留计划等待可安全出门"
+                self._wait_for_safe_supply(state, "当前仍需在基地内休息，保留计划等待可安全出门")
                 return None
             if (not self._skill_is_known("leave_home") or not self.skill_retry_ready("leave_home")
                     or self._failure_counts().get("leave_home", 0) >= 2):
@@ -2321,10 +2446,15 @@ class LifeLoop(PromptRenderMixin):
             return True
         _mark("拼提示词")
         _t_model = _t.perf_counter()
-        summary, used = await agent.act(
-            prompt=prompt,
-            system=f"{system}\n\n{ACTION_PROMPT}",
-        )
+        previous_activity = getattr(self, "_active_agent_activity", None)
+        self._active_agent_activity = {"drive": suggestion.get("drive"), "activity": suggestion.get("activity", "自主工作")}
+        try:
+            summary, used = await agent.act(
+                prompt=prompt,
+                system=f"{system}\n\n{ACTION_PROMPT}",
+            )
+        finally:
+            self._active_agent_activity = previous_activity
         timing = getattr(agent, "last_timing", {}) or {}
         result_revision = timing.get("decision_revision", plan_revision)
         if result_revision != self._plan_revision:
@@ -2389,7 +2519,6 @@ class LifeLoop(PromptRenderMixin):
             )
             self.history.append(self.current)
             self.history = self.history[-20:]
-            self.drives.note_activity(drive=suggestion.get("drive"), activity=summary)
             # 说过的话要真的说出去（否则她"做了但没说"）
             if self.current.say:
                 await self._maybe_share(self.current.say)
@@ -2723,6 +2852,26 @@ class LifeLoop(PromptRenderMixin):
                     return
                 payload_params = dict(decision.params or {})
                 work_state = self._return_boundary_state
+                emergency = self._rule_supply_candidate
+                if (decision.skill == "collect" and emergency is not None
+                        and emergency["skill"] == "collect" and emergency["params"] == decision.params):
+                    # Sharing and activity callbacks can yield to a new threat,
+                    # closed shelter or owner pause after the plan boundary.
+                    state = await self._gather_state()
+                    if (plan_revision != self._plan_revision or not self.may_act(allow_model_block=allow_model_block)
+                            or self._owner_steer_pending() or self.inbox.has_delivery(Delivery.STEER)):
+                        self._wake.set()
+                        return
+                    bounded = self._emergency_crop_params(payload_params, state)
+                    if (bounded is None or not isinstance(state.get("inventory"), dict)
+                            or state.get("health") is None or state["health"] <= 0 or state.get("food") is None
+                            or self._return_world(state) != self._return_world(emergency["state"])):
+                        self._rule_supply_candidate = None
+                        self.clear_plan("提交前近处应急收割条件已变化，重新观察食物与安全路线")
+                        self._decision_retry_at = max(self._decision_retry_at, time.time() + 30.0)
+                        self._wake.set()
+                        return
+                    payload_params, work_state = bounded, state
                 if decision.skill in self.PREPARATION_SKILLS:
                     state = await self._gather_state() if self._state_provider else {}
                     work_state = state
@@ -2755,10 +2904,18 @@ class LifeLoop(PromptRenderMixin):
                 # 先登记宽限，再提交：极短任务可能在 RPC 返回前就发出完成事件。
                 # 完成事件的 wake() 清掉宽限后，不能再被旧请求覆盖。
                 self._busy_until = time.time() + 8
+                submission = self.register_task_submission(decision.skill, state=work_state)
+                if submission is not None:
+                    submission["drive_activity"] = self._drive_activity(decision.skill, decision.drive, decision.activity)
                 if str(decision.skill).startswith("move."):
-                    await self._call(decision.skill, decision.params or {})
+                    reply = await self._call(decision.skill, decision.params or {})
+                    if (isinstance(reply, dict) and reply.get("arrived") is True and not reply.get("task_id")
+                            and submission is not None and self._return_token_current(submission)):
+                        activity = self._drive_activity(decision.skill, decision.drive, decision.activity)
+                        if activity:
+                            self.drives.note_activity(**activity)
+                    self.bind_task_submission(submission, reply)
                 else:
-                    submission = self.register_task_submission(decision.skill, state=work_state)
                     reply = await self._call("skill.run", {"skill": decision.skill, "params": payload_params})
                     self.bind_task_submission(submission, reply)
                 # **不要在这里压一个长等待**。
@@ -2783,7 +2940,8 @@ class LifeLoop(PromptRenderMixin):
             # 不动手（发呆/看风景）：给一个"待着"的时间，然后重新想
             self._busy_until = time.time() + 25
 
-        self.drives.note_activity(drive=decision.drive, activity=decision.activity)
+        if not decision.skill and decision.drive in ("leisure", "social", None):
+            self.drives.note_activity(drive=decision.drive, activity=decision.activity)
         self._save_state()
 
     async def _maybe_share(self, text: str) -> None:

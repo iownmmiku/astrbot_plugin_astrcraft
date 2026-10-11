@@ -95,6 +95,21 @@ function fixture(inventory = {}, { blocks = [], smeltHook = null, craftHook = nu
     collect: (item, count = 1) => gathering.collect({ actions, nav, state, ctx, item, count, maxAttempts: 1 }) };
 }
 
+for (const item of ['dirt', 'spruce_log']) {
+  test(`${item}: crop search options preserve ordinary collection defaults`, async () => {
+    const f = fixture({}, { blocks: [item] }); const scans = [];
+    const findBlocks = f.bot.findBlocks;
+    f.bot.findBlocks = (params) => { scans.push(params.maxDistance); return findBlocks(params); };
+    const source = [...f.cells.values()].find((block) => block.name === item);
+    assert.ok(source.position.distanceTo(f.bot.entity.position) > 3);
+    const result = await skills.get('collect').run({ ...f,
+      params: { item, count: 1, radius: 3, allow_search: false, max_attempts: 1 } });
+    assert.equal(result.ok, true, result.reason); assert.equal(f.counts[item], 1);
+    if (item === 'dirt') assert.deepEqual(scans, [40]);
+    assert.equal(f.calls.filter(({ kind }) => kind === 'dig').length, 1);
+  });
+}
+
 test('an actual cow kill with beef cannot satisfy missing leather', async () => {
   const f = fixture(); f.bot.entities[1] = { id: 1, name: 'cow', position: vec3(1, 1, 0) };
   const result = await f.collect('leather', 3);

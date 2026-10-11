@@ -71,8 +71,8 @@ function wrap(fn) {
 }
 
 /** 动作类 RPC 的通用形态：立刻返回 task_id，动作在队列里执行 */
-function submitAction({ name, priority = PRIORITY.USER, params = {}, run }) {
-  const task = engine.submitAction({ name, priority, meta: { params }, run });
+function submitAction({ name, priority = PRIORITY.USER, params = {}, rpc: method, run }) {
+  const task = engine.submitAction({ name, priority, meta: { params, ...(method ? { rpc: method } : {}) }, run });
   return {
     ok: true,
     task_id: task.id,
@@ -666,6 +666,7 @@ rpc.handle(
     engine.requireBot();
     return submitAction({
       name: `移动到 (${params.x}, ${params.z})`,
+      rpc: 'move.to', params,
       run: async ({ signal, task }) => {
         task.setDetail('寻路中');
         // 先落地：出生点常在树冠/水面上，从那里出发寻路会直接失败
@@ -736,6 +737,7 @@ rpc.handle(
     if (!target) throw new GameError('缺少参数 target（玩家名）');
     return submitAction({
       name: `前往 ${target} 身边`,
+      rpc: 'move.to_player', params,
       run: async ({ signal, task }) => engine.nav.toPlayer(target, {
         signal, distance: Number(params.distance) || 3,
         timeoutMs: Number(params.timeout_ms) || 60000,

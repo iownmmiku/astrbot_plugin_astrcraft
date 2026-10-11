@@ -21,6 +21,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 
 from .bridge_client import EngineError
+from .inbox import Delivery
 
 # 快速动作的超时（秒）。超过这个时间的动作必须走异步，否则会卡住整轮对话。
 FAST_TIMEOUT = 20.0
@@ -390,19 +391,33 @@ class McPerceptionTools:
         if not self.connected:
             yield event.plain_result("机器人还没进服，先让它进服再移动")
             return
+        target_p = player.strip() or getattr(event, "_sender", "")
+        method = "move.to_player" if target_p and (x == 0 and z == 0) else "move.to"
+        params = ({"target": target_p, "timeout_ms": 60000} if method == "move.to_player"
+                  else {"x": float(x), "z": float(z), "timeout_ms": 60000})
+        life = getattr(self, "life", None)
+        if (getattr(event, "astrcraft_autonomous", False) and life is not None
+                and life.inbox.has_delivery(Delivery.STEER)):
+            yield event.plain_result("error: 有新的指令或环境变化，先重新观察后再移动。")
+            return
+        register = getattr(life, "register_task_submission", None)
+        submission = (register(method, owner_generation=getattr(event, "astrcraft_owner_generation", None))
+                      if getattr(event, "astrcraft_autonomous", False) and callable(register) else None)
+        if getattr(event, "astrcraft_autonomous", False) and callable(register) and submission is None:
+            yield event.plain_result("error: 当前自主控制状态已变化，先按最新安排重新观察。")
+            return
+        submitted = False
         try:
-            target_p = player.strip() or getattr(event, "_sender", "")
-            if target_p and (x == 0 and z == 0):
-                r = await self.engine.call(
-                    "move.to_player", {"target": target_p, "timeout_ms": 60000}, timeout=FAST_TIMEOUT
-                )
-            else:
-                r = await self.engine.call(
-                    "move.to", {"x": float(x), "z": float(z), "timeout_ms": 60000}, timeout=FAST_TIMEOUT
-                )
+            r = await self.engine.call(method, params, timeout=FAST_TIMEOUT)
+            if submission is not None:
+                life.bind_task_submission(submission, r)
+            submitted = True
         except EngineError as exc:
             yield event.plain_result(f"移动指令没能下达：{exc}。可以先用 mc_status 确认机器人是否在服里。")
             return
+        finally:
+            if submission is not None and not submitted:
+                life.bind_task_submission(submission, None)
         what = f"前往 {target_p} 身边" if target_p and (x == 0 and z == 0) else f"前往 ({x}, {z})"
         yield event.plain_result(
             f"已让机器人{what}，任务号 {r.get('task_id')}。这是长动作，可以用 mc_task_status 查进度。"

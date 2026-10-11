@@ -392,22 +392,34 @@ class EngineClient:
 
         msg_id = self._next_id
         self._next_id += 1
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        fut: asyncio.Future = loop.create_future()
         self._pending[msg_id] = fut
 
-        payload = json.dumps({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {}}, ensure_ascii=False)
-        try:
-            proc.stdin.write((payload + "\n").encode("utf-8"))
-            await proc.stdin.drain()
-        except Exception as exc:  # noqa: BLE001
-            self._pending.pop(msg_id, None)
-            raise EngineUnavailable(f"向引擎写入失败：{exc}") from exc
+        async def exchange():
+            payload = json.dumps({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {}}, ensure_ascii=False)
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError
+            try:
+                proc.stdin.write((payload + "\n").encode("utf-8"))
+                await proc.stdin.drain()
+            except Exception as exc:  # noqa: BLE001
+                raise EngineUnavailable(f"向引擎写入失败：{exc}") from exc
+            return await fut
 
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            return await asyncio.wait_for(exchange(), timeout=max(0.0, deadline - loop.time()))
         except asyncio.TimeoutError as exc:
+            raise EngineError(f"引擎调用超时（{timeout:.0f} 秒，包含写入和响应，调用 {method}）", code=ERR_TIMEOUT) from exc
+        finally:
             self._pending.pop(msg_id, None)
-            raise EngineError(f"引擎响应超时（{timeout:.0f} 秒，调用 {method}）", code=ERR_TIMEOUT) from exc
+            if not fut.done():
+                fut.cancel()
+            elif not fut.cancelled():
+                # A process exit can fail the response while drain is blocked.
+                # Retrieve that exception even if cancellation wins the race.
+                fut.exception()
 
     # ------------------------------------------------------------ 便捷方法
 

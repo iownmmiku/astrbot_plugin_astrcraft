@@ -34,7 +34,7 @@ cd <项目目录>\engine
 
 # 关键：npm 的默认缓存目录可能被系统策略拒绝写入，
 # 这时必须把缓存指到一个你有权限的目录（下面用项目内的 _npm_cache）
-npm install --cache "..\_npm_cache" --no-audit --no-fund
+npm ci --cache "..\_npm_cache" --no-audit --no-fund
 ```
 
 装完确认这三个包在 `engine\node_modules` 下：
@@ -48,6 +48,7 @@ mineflayer-pathfinder@2.4.5
 **验证引擎能独立启动**（不依赖 AstrBot）：
 
 ```powershell
+cd .. # 回到项目根目录
 node dev-tools\smoke.js
 ```
 
@@ -57,7 +58,7 @@ node dev-tools\smoke.js
 
 ## 3. 安装 AstrBot 插件
 
-发布 ZIP 可按 [README](../README.md) 解压到插件目录，保留完整 `engine/` 与 `skills_docs/`，并在该 `engine/` 下执行 `npm ci`。下面的复制方式适用于引擎留在项目目录、随后配置外置 `engine_dir` 的部署。
+发布 ZIP 可按 [README](../README.md) 解压到插件目录，保留完整 `engine/`、`skills_docs/`、`pages/` 与 `.astrbot-plugin/`，并在该 `engine/` 下执行 `npm ci`。下面的复制方式适用于引擎留在项目目录、随后配置外置 `engine_dir` 的部署。
 
 把仓库根目录里的文件复制到 AstrBot 插件目录下的一个新文件夹里：
 
@@ -65,7 +66,7 @@ node dev-tools\smoke.js
 $dst = "$env:USERPROFILE\.astrbot\data\plugins\astrbot_plugin_astrcraft"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Copy-Item *.py, _conf_schema.json, metadata.yaml $dst -Force
-Copy-Item skills_docs $dst -Recurse -Force
+Copy-Item skills_docs, pages, .astrbot-plugin $dst -Recurse -Force
 ```
 
 然后在 AstrBot WebUI → 插件管理 → 找到「Minecraft 机器人（真实客户端）」→ 启用。
@@ -159,16 +160,15 @@ AstrBot WebUI → 插件管理 → Minecraft 机器人 → 配置。
    ```powershell
    npm install prismarine-auth --cache "..\_npm_cache"
    ```
-2. 在 `engine/config/bot.config.json` 里加：
+2. 在引擎目录的上一级创建 `config/bot.config.json`（仓库布局即 `<项目目录>/config/bot.config.json`）：
    ```json
    {
      "auth": "microsoft",
-     "profilesFolder": "config/auth-cache",
      "microsoftEmail": "你的邮箱"
    }
    ```
 3. 插件配置里 `auth_method` 改成 `microsoft`。
 4. 首次启动时终端会要求访问一个设备码登录链接，登录一次即可，凭据会缓存在
-   `engine/config/auth-cache`。**该目录含登录凭据，不要提交到版本库。**
+   引擎目录上一级的 `config/auth-cache/`。使用外置 `engine_dir` 时，以外置引擎的位置为准；若设置了 `profilesFolder`，则使用该自定义路径，相对路径按引擎工作目录解析。**该目录含登录凭据，不要提交到版本库。**
 
-> 注意：这条路径没有在本次交付里做过端到端验证，属于"按官方文档配置可用"的状态。
+> 注意：这里只说明当前实现的配置路径，尚未完成 Microsoft 账号端到端登录验证。

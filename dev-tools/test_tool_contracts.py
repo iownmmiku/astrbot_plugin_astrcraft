@@ -193,12 +193,15 @@ class RpcContracts(unittest.IsolatedAsyncioTestCase):
         status = await self.await_task(task["task_id"])
         self.assertEqual(status["status"], "done", status)
         self.assertTrue(status["result"]["arrived"])
+        self.assertEqual(status["meta"]["rpc"], "move.to_player")
         self.assertEqual(status["result"]["fixture_timeout_ms"], 60000)
         self.assertEqual(status["result"]["final_position"], {"x": 4, "y": 64, "z": 6})
         # 到达后能接受下一次有限移动，而不是一直占据身体。
         await tool_text(self.host.tool_mc_goto(Event(), x=8, z=9))
         next_task = next(result for method, result in reversed(self.client.replies) if method == "move.to")
-        self.assertEqual((await self.await_task(next_task["task_id"]))["status"], "done")
+        next_status = await self.await_task(next_task["task_id"])
+        self.assertEqual(next_status["status"], "done")
+        self.assertEqual(next_status["meta"]["rpc"], "move.to")
 
     async def test_implicit_game_sender_uses_finite_goto(self):
         await tool_text(self.host.tool_mc_goto(Event("Alice")))

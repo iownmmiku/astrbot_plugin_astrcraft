@@ -1349,6 +1349,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 meta = data.get("meta") or {}
                 skill_name = meta.get("skill") if isinstance(meta, dict) else None
                 skill_name = skill_name or self._skill_name_from_task(task_name)
+                if not skill_name and isinstance(meta, dict) and meta.get("rpc") in ("move.to", "move.to_player"):
+                    skill_name = meta["rpc"]
                 result = data.get("result") or {}
                 if isinstance(result, dict):
                     if skill_name == "build_shelter" and status == "done" and result.get("ok") is True:
@@ -1462,19 +1464,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         await self._notify_subscribers(f"💬 [{sender}] {message}")
         will_reply = bool(self._cfg("reply_in_game", True) and self._should_reply(message))
 
-        # **主人说的话入队**（W4）：不管她当时在干嘛，这句话都**不会丢**。
-        #
-        # 在这之前：她跑长任务时主人说话**她听不见**——消息只走"回复"这条路
-        # （`_reply_in_game`），而那条路和她的自主循环是两套东西。
-        # 现在话会躺在队列里，等她到安全注入点（下次组装提示词）就会看到。
-        # **注意：这里不做"要不要回复"的判断**——入队是"让她知道"，
-        # 回不回复是另一回事（下面的 `_should_reply`）。
-        # 被点名的消息由聊天代理持有，避免生活循环再执行一遍同一条指令。
-        if self.life and not will_reply:
+        # 未唤醒或不允许动作的聊天只是见闻：不唤醒、不取得主人控制权，
+        # 也不能清除正在保留的采矿返程责任。明确唤醒且允许动作时，
+        # 先由聊天代理持有；只有代理未尝试动作的兜底才交给生活循环。
+        if self.life and not (will_reply and self._cfg("in_game_actions", True)):
             try:
-                self.life.note_owner_said(f"{sender} 说：{message}")
+                self.life.note_world_event(
+                    "game_chat", f"游戏聊天（仅作见闻，不是动作指令）：{sender} 说：{message}"
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.info("主人的话入队失败：%s", exc)
+                logger.info("游戏聊天见闻入队失败：%s", exc)
 
         # 社交也是经历：记下来（她是"认识这个人"的）
         if self.memory:
@@ -1510,8 +1509,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         async with self._game_reply_lock:
             try:
                 reply: str | None = None
+                allow_actions = bool(self._cfg("reply_in_game", True)
+                                     and self._cfg("in_game_actions", True)
+                                     and self._should_reply(message))
+                agent_called = False
 
-                if self._cfg("in_game_actions", True) and self.game_agent:
+                if allow_actions and self.game_agent:
+                    agent_called = True
                     try:
                         reply = await asyncio.wait_for(
                             self.game_agent.handle(sender, message),
@@ -1524,13 +1528,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                         logger.error("游戏内动作代理失败，退回纯文字：%s", exc)
                         reply = None
 
-                if (reply is None and self.game_agent
+                if (reply is None and agent_called
                         and getattr(self.game_agent, "last_request_had_action", False)):
                     # 工具可能已产生副作用，超时不能把整条指令交给另一代理重放。
                     reply = "已经尝试执行，回复暂时没能完成；先保留当前进度。"
 
                 if reply is None:
-                    if self._cfg("in_game_actions", True) and self.life:
+                    if allow_actions and self.life:
                         self.life.note_owner_said(f"{sender} 说：{message}")
                         self.life.wake(reason="游戏内代理不可用，交给自主循环处理")
                     # 兜底：纯文字聊天

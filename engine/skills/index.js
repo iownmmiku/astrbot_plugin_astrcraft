@@ -373,11 +373,15 @@ const SKILLS = {
       item: { type: 'string', required: true },
       count: { type: 'number', min: 1, max: 256, def: 1 },
       max_attempts: { type: 'number', min: 1, max: 96, def: 0 },
+      // Only crop harvesting consumes these search bounds.
+      radius: { type: 'number', min: 1, max: 96, def: 40 },
+      allow_search: { type: 'boolean', def: true },
     },
     async run({ actions, nav, state, ctx, params }) {
       const item = requireParam(params, 'item', { type: 'string' });
       const count = requireParam(params, 'count', { def: 1 });
       const rawAttempts = requireParam(params, 'max_attempts', { def: 0 });
+      const crop = wood.CROPS[item.replace(/^minecraft:/, '').toLowerCase()];
       return gathering.collect({
         actions,
         nav,
@@ -387,6 +391,10 @@ const SKILLS = {
         count,
         // 0 = 不覆盖，交给被委派的技能决定
         maxAttempts: Number(rawAttempts) > 0 ? Number(rawAttempts) : null,
+        ...(crop ? {
+          radius: requireParam(params, 'radius', { min: 1, max: 96, def: 40 }),
+          allowSearch: params.allow_search !== false,
+        } : {}),
       });
     },
   },

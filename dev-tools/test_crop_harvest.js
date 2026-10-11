@@ -10,11 +10,12 @@ const { executionContext } = require('../engine/goals');
 const { Actions } = require('../engine/actions');
 const wood = require('../engine/skills/wood');
 const gathering = require('../engine/skills/gathering');
+const skills = require('../engine/skills');
 const tests = [], test = (name, run) => tests.push({ name, run });
 const key = (p) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
 
 function field(item = 'wheat', age = wood.CROPS[item].age, options = {}) {
-  const spec = wood.CROPS[item], counts = { ...options.inventory }, cells = new Map(), calls = [];
+  const spec = wood.CROPS[item], counts = { ...options.inventory }, cells = new Map(), calls = [], scans = [];
   const controller = new AbortController(), checkpoints = new Map();
   const block = (name, p, props = {}) => ({ name, position: p, diggable: true,
     boundingBox: ['air', spec.block].includes(name) ? 'empty' : 'block', getProperties: () => props });
@@ -25,8 +26,11 @@ function field(item = 'wheat', age = wood.CROPS[item].age, options = {}) {
     _client: { state: 'play', socket: { remoteAddress: 'fixture', remotePort: 25565 } },
     game: { dimension: 'overworld' }, health: 20, food: 20, canSeeBlock: () => true,
     blockAt: (p) => cells.get(key(p)) || block(p.y < 65 ? 'stone' : 'air', p),
-    findBlocks: ({ matching, useExtraInfo }) => [...cells.values()].filter((b) =>
-      matching(b) && useExtraInfo(b)).map((b) => b.position),
+    findBlocks: ({ matching, useExtraInfo, maxDistance, count = 16 }) => {
+      scans.push({ radius: maxDistance, position: bot.entity.position.clone() });
+      return [...cells.values()].filter((b) => matching(b) && useExtraInfo(b) &&
+        b.position.distanceTo(bot.entity.position) <= maxDistance).slice(0, count).map((b) => b.position);
+    },
     async placeBlock(soil, face) {
       calls.push({ kind: 'plant', item: bot.heldItem?.name });
       if (options.rejected) return;
@@ -63,7 +67,9 @@ function field(item = 'wheat', age = wood.CROPS[item].age, options = {}) {
     return { arrived: true };
   } };
   const context = (signal = controller.signal) => new SkillContext({ signal, checkpoints, deadline: Date.now() + 10000 });
-  return { bot, actions, nav, counts, calls, cells, position, checkpoints, controller, context,
+  return { bot, actions, nav, counts, calls, scans, cells, position, checkpoints, controller, context,
+    nativeCollect: (params = {}) => skills.get('collect').run({ actions, nav, ctx: context(),
+      params: { item, count: 1, ...params } }),
     collect: (ctx = context(), extra = {}) => gathering.collect({ actions, nav, ctx, item, count: 1, maxAttempts: 1, ...extra }) };
 }
 
@@ -83,6 +89,54 @@ for (const item of Object.keys(wood.CROPS)) {
     assert.equal(f.calls.filter((c) => c.kind === 'plant').length, 1);
   });
 }
+for (const item of Object.keys(wood.CROPS)) {
+  for (const scenario of ['empty', 'immature', 'outside-radius']) {
+    test(`${item}: native bounded collect stays put with ${scenario} field`, async () => {
+      const f = field(item, scenario === 'immature' ? 0 : wood.CROPS[item].age,
+        { far: scenario === 'outside-radius' });
+      if (scenario === 'empty') f.cells.delete(key(f.position));
+      const origin = f.bot.entity.position.clone();
+      const result = await f.nativeCollect({ radius: 3, allow_search: false, max_attempts: 2 });
+      assert.equal(result.ok, false); assert.equal(result.collection_ok, false);
+      assert.deepEqual(f.calls, [], 'no digging, planting or relocation is authorized without a nearby mature crop');
+      assert.deepEqual(f.bot.entity.position, origin);
+      assert.equal(f.scans.length, 2, 'the native max_attempts bound reaches the actual crop loop');
+      assert.deepEqual(f.scans.map(({ radius }) => radius), [3, 3], 'failed scans never widen the radius');
+      assert.ok(f.scans.every(({ position }) => position.equals(origin)));
+    });
+  }
+  test(`${item}: native bounded collect harvests and replants a nearby mature crop`, async () => {
+    const f = field(item);
+    const result = await f.nativeCollect({ radius: 3, allow_search: false, max_attempts: 2 });
+    assert.equal(result.ok, true); assert.equal(result.replant_ok, true);
+    assert.deepEqual(f.scans.map(({ radius }) => radius), [3]);
+    assert.deepEqual(f.calls.map(({ kind }) => kind), ['dig', 'plant']);
+    assert.equal(f.cells.get(key(f.position)).getProperties().age, 0);
+  });
+}
+
+test('native bounded crop limits also apply to a namespaced normalized item', async () => {
+  const f = field('carrot', 0);
+  await f.nativeCollect({ item: 'minecraft:CARROT', radius: 2, allow_search: false, max_attempts: 1 });
+  assert.deepEqual(f.scans.map(({ radius }) => radius), [2]); assert.deepEqual(f.calls, []);
+});
+
+test('native crop radius rejects invalid distances before any scan or movement', async () => {
+  for (const radius of [0, 97, 'invalid']) {
+    const f = field('wheat');
+    await assert.rejects(f.nativeCollect({ radius, allow_search: false, max_attempts: 2 }), /参数 radius/);
+    assert.deepEqual(f.scans, []); assert.deepEqual(f.calls, []);
+  }
+});
+
+test('ordinary native crop collection retains the existing surface search and retry defaults', async () => {
+  const f = field('wheat', 0); const result = await f.nativeCollect();
+  assert.equal(result.ok, false);
+  assert.equal(f.scans.length, 12); assert.ok(f.scans.every(({ radius }) => radius === 40));
+  assert.equal(f.calls.length, 12);
+  assert.ok(f.calls.every(({ kind, y, allowTerrainDig }) => kind === 'nav' && y === null && allowTerrainDig === false));
+});
+
 test('missing maturity data never permits a harvest', async () => {
   const f = field('wheat', null); await f.collect();
   assert.equal(f.calls.filter((c) => c.kind === 'dig').length, 0);

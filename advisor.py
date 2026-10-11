@@ -198,6 +198,8 @@ def advise(
     # ---- 危险优先级最高：血量/饥饿
     if health <= 6:
         adv.warnings.append(f"血量只有 {health:.0f}，别去挖矿或打架，先找地方躲起来")
+    if health <= 8 and food < 18:
+        adv.warnings.append("饱食不足，等待不能恢复生命；先检查近处储粮、安全生食或农作物，避免残血打猎和远行")
     if food <= 6:
         if food_items > 0:
             adv.warnings.append("肚子很饿，先吃点东西")

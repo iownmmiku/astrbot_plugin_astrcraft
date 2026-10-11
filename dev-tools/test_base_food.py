@@ -201,7 +201,7 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted, ["resupply_food", "cook_food", "eat", "leave_home", "mine_stone"])
         self.assertEqual(loop._failure_counts(), {})
 
-    async def test_empty_shelf_daytime_search_exits_first_but_critical_body_stays(self):
+    async def test_empty_shelf_daytime_search_exits_first_but_starving_body_replans(self):
         for health in (20, 6):
             snapshot = state(inside=True, health=health)
             loop = self.make_loop(snapshot)
@@ -209,7 +209,12 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
             loop._set_plan([{"skill": "mine_stone", "params": {"count": 7}}])
             step = await loop._survival_step()
             self.assertEqual(step["skill"] if step else None, "leave_home" if health == 20 else None)
-            self.assertTrue(loop._plan, "critical body waits indoors without forgetting its established work")
+            if health == 20:
+                self.assertTrue(loop._plan)
+            else:
+                self.assertEqual(loop._plan, [], "unrelated mining must not resume while starving")
+                self.assertFalse(loop._rule_supply_wait_reason, "waiting cannot heal a starving body")
+                self.assertIn("等待不能恢复生命", loop._last_state_note)
 
     async def test_sleep_wait_then_dawn_exit_keeps_original_work(self):
         snapshot = state(food=20, inside=True)

@@ -599,7 +599,7 @@ class SupplyResumeTests(unittest.IsolatedAsyncioTestCase):
         loop._set_plan([remedy])
         return loop, state, remedy
 
-    async def test_stalled_supply_remedy_waits_inside_home_at_night_or_critical_health(self):
+    async def test_stalled_supply_remedy_waits_for_dawn_but_not_impossible_healing(self):
         for night, health in ((True, 20), (False, 6)):
             with self.subTest(night=night, health=health):
                 loop, state, remedy = self.stalled_home_remedy(night=night, health=health)
@@ -617,8 +617,12 @@ class SupplyResumeTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     await asyncio.sleep(0.04)
                     self.assertEqual(submitted, [])
-                    self.assertEqual(loop._plan[0]["params"], remedy["params"])
-                    self.assertTrue(loop._rule_supply_wait_reason)
+                    if health <= 8:
+                        self.assertEqual(loop._plan, [])
+                        self.assertFalse(loop._rule_supply_wait_reason)
+                    else:
+                        self.assertEqual(loop._plan[0]["params"], remedy["params"])
+                        self.assertTrue(loop._rule_supply_wait_reason)
                     self.assertTrue(state["home_status"]["inside"])
                 finally:
                     await loop.stop()

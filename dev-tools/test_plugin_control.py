@@ -655,20 +655,20 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         class Agent:
             async def handle(self, sender, message):
                 handled.append(message)
-                if message == "first":
+                if message == "AstrBot first":
                     started.set()
                     await release.wait()
                 return message
         p.game_agent = Agent()
-        first = asyncio.create_task(p._reply_in_game("Alice", "first"))
+        first = asyncio.create_task(p._reply_in_game("Alice", "AstrBot first"))
         await started.wait()
-        second = asyncio.create_task(p._reply_in_game("Alice", "second"))
+        second = asyncio.create_task(p._reply_in_game("Alice", "AstrBot second"))
         await asyncio.sleep(0)
         self.assertFalse(second.done())
         release.set()
         await asyncio.gather(first, second)
-        self.assertEqual(handled, ["first", "second"])
-        self.assertEqual([call.args[0] for call in p.engine.say.call_args_list], ["first", "second"])
+        self.assertEqual(handled, ["AstrBot first", "AstrBot second"])
+        self.assertEqual([call.args[0] for call in p.engine.say.call_args_list], ["AstrBot first", "AstrBot second"])
 
     async def test_addressed_chat_has_one_execution_owner(self):
         p = plugin()
@@ -678,7 +678,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.life.owners, [])
         p._reply_in_game.assert_awaited_once()
         await p._on_game_chat({"sender": "Alice", "message": "附近发现了一棵树"})
-        self.assertEqual(len(p.life.owners), 1)
+        self.assertEqual(p.life.owners, [])
 
     async def test_failed_reply_after_action_does_not_replay_instruction(self):
         p = plugin()
@@ -688,7 +688,7 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             async def handle(self, sender, message):
                 raise RuntimeError("模型在动作提交后断开")
         p.game_agent = Agent()
-        await p._reply_in_game("Alice", "砍四根木头")
+        await p._reply_in_game("Alice", "AstrBot 砍四根木头")
         self.assertEqual(p.life.owners, [])
         p.engine.say.assert_awaited_once()
 

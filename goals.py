@@ -581,18 +581,18 @@ class GoalManager:
         except json.JSONDecodeError:
             logger.warning("LLM 规划的 JSON 无法解析：%s", text[:200])
             return None
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list) or not 1 <= len(items) <= 6:
             return None
 
         known = set((skills_desc or {}).get("names", []))
         steps: list[GoalStep] = []
-        for item in items[:6]:
+        for item in items:
             if not isinstance(item, dict):
-                continue
+                return None
             skill = str(item.get("skill", "")).strip()
             if skill not in known:
-                logger.debug("LLM 规划里出现未知技能，已忽略：%s", skill)
-                continue
+                logger.warning("LLM 规划里出现未知技能，不能执行不完整计划：%s", skill)
+                return None
             params = item.get("params") if isinstance(item.get("params"), dict) else {}
             steps.append(
                 GoalStep(
@@ -600,7 +600,7 @@ class GoalManager:
                     params=params,
                     label=str(item.get("label") or skill),
                     max_attempts=2,
-                    required=len(steps) == 0,  # 只强制要求第一步，后面失败可跳过
+                    required=True,  # 模型步骤均属于目标，关键失败不能冒充完成
                 )
             )
         if not steps:

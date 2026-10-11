@@ -290,10 +290,11 @@ class Actions {
    * @param {number} o.x @param {number} o.y @param {number} o.z
    * @param {AbortSignal} [o.signal]
    * @param {boolean} [o.collect] 是否收集掉落物（默认 true）
+   * @param {boolean} [o.collectMovement] 是否允许为拾取掉落物走动（默认 true）
    * @param {boolean} [o.reach] 是否允许自己走过去（默认 false，由调用方决定，避免技能层重复寻路）
    * @param {boolean} [o.safe] 自动采料时检查液体、未知邻格和脚下坠落风险
    */
-  async dig({ x, y, z, signal = null, collect = true, reach = false, safe = false }) {
+  async dig({ x, y, z, signal = null, collect = true, collectMovement = true, reach = false, safe = false }) {
     this._requireBot();
     const bot = this._bot;
     const block = bot.blockAt(vec3(x, y, z));
@@ -402,7 +403,7 @@ class Actions {
       // **捡掉落物是"挖掘任务自己的策略"**（按「本能 vs 策略」的分层：这类行为不该是逐 tick 的反射）。
       // 反射层的自动捡东西现在只在完全空闲时才跑，所以这里必须自己捡干净——
       // 超时给 5 秒：掉落物有时会弹开一两格，3 秒不够（实测会漏）。
-      await this.collectDrops({ signal, timeoutMs: 5000, expectIncrease: true });
+      await this.collectDrops({ signal, timeoutMs: 5000, expectIncrease: true, allowMovement: collectMovement });
     }
 
     // 用"整次挖掘前后"的背包差分来报告获得物。
@@ -2746,7 +2747,8 @@ class Actions {
    * 现象是"方块挖掉了、进度却一直不涨"。所以这里允许为捡东西走一段路，
    * 并且优先捡"能走到的"那些，捡不到的记录下来如实返回，而不是假装成功。
    */
-  async collectDrops({ signal = null, timeoutMs = 8000, maxDistance = 16, maxHops = 6, expectIncrease = false } = {}) {
+  async collectDrops({ signal = null, timeoutMs = 8000, maxDistance = 16, maxHops = 6,
+    expectIncrease = false, allowMovement = true } = {}) {
     const bot = this._requireBot();
     const before = this.inventoryMap();
     const countBefore = sumCounts(before);
@@ -2795,6 +2797,15 @@ class Actions {
         }
         lastCount = nowCount;
         hops += 1;
+        continue;
+      }
+
+      if (!allowMovement) {
+        // A reach-only harvest cannot inherit the normal sixteen-block pickup
+        // walk. Keep the late-spawn / inventory confirmation wait below, but
+        // never approach an item merely because it appeared during this dig.
+        unreachable.push({ x: nearest.entity.position.x, y: nearest.entity.position.y, z: nearest.entity.position.z });
+        triedIds.add(nearest.entity.id);
         continue;
       }
 

@@ -36,12 +36,18 @@ function matureCrop(block) {
   } catch { return false; }
 }
 
-async function replantCrop({ actions, nav, ctx, position, crop }) {
+async function replantCrop({ actions, nav, ctx, position, crop, allowMovement = true }) {
   const bot = actions.bot;
   const existing = blockAt(bot, position.x, position.y, position.z);
   if (existing?.name === crop.block) return false;
   if (!existing || !['air', 'cave_air'].includes(existing.name)) throw new Error('收割位置已被占用或未加载，尚未补种');
   if (actions.countItem(crop.seed) < 1) throw new Error(`已收割但缺少 ${crop.seed}，尚未补种`);
+  const assertReach = () => {
+    if (!allowMovement && distance(bot.entity.position, position) > 4) {
+      throw new Error('应急收割后已离开补种距离，停止走动并保留待补种位置');
+    }
+  };
+  assertReach();
   if (distance(bot.entity.position, position) > 4) {
     const { executionContext } = require('../goals');
     await executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false },
@@ -53,9 +59,13 @@ async function replantCrop({ actions, nav, ctx, position, crop }) {
   if (soil?.name !== 'farmland') throw new Error('收割后的耕地已消失，尚未补种');
   await actions.holdItem({ item: crop.seed, signal: ctx.signal });
   ctx.checkAborted();
+  assertReach();
   // Actions.place deliberately accepts blocks only. Seeds require using the
   // upper farmland face, with the same scoped cancellation as other actions.
-  await actions._raceAbort(() => bot.placeBlock(soil, vec3(0, 1, 0)), ctx.signal,
+  await actions._raceAbort(() => {
+    assertReach();
+    return bot.placeBlock(soil, vec3(0, 1, 0));
+  }, ctx.signal,
     Math.min(8000, Math.max(1, (ctx.deadline || Date.now() + 8000) - Date.now())), '补种等待服务器确认超时');
   ctx.checkAborted();
   if (blockAt(bot, position.x, position.y, position.z)?.name !== crop.block) {
@@ -68,6 +78,7 @@ async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 4
   const crop = CROPS[itemName];
   if (!crop) return skillResult(false, { reason: `没有 ${itemName} 的作物收割规则` });
   const have = () => actions.countItem(itemName);
+  const reachOnly = allowSearch === false && radius <= 3;
   const checkpoint = collectionCheckpoint(ctx, ['harvestCrops', itemName, count, radius, maxAttempts, allowSearch],
     { have, want: Math.max(0, count - have()), inventory: () => actions.inventoryMap() });
   if (checkpoint.result) return checkpoint.result;
@@ -75,7 +86,7 @@ async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 4
   const pending = checkpoint.pendingPlant || (checkpoint.pendingPlant = []);
   const plantPending = async () => {
     while (pending.length) {
-      const planted = await replantCrop({ actions, nav, ctx, position: pending[0], crop });
+      const planted = await replantCrop({ actions, nav, ctx, position: pending[0], crop, allowMovement: !reachOnly });
       steps.push(planted ? `已确认补种 ${crop.block}` : `原有 ${crop.block} 仍在，无需重复补种`);
       pending.shift();
     }
@@ -94,6 +105,7 @@ async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 4
           if (!allowSearch) return false;
           return relocateSurface({ actions, nav, ctx, attempt });
         }
+        if (reachOnly && distance(actions.bot.entity.position, found) > radius) return false;
         if (distance(actions.bot.entity.position, found) > 4) {
           const { executionContext } = require('../goals');
           await executionContext.run({ ...executionContext.getStore(), allowTerrainDig: false },
@@ -110,6 +122,9 @@ async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 4
         const inherited = executionContext.getStore();
         const preparationCheck = () => {
           inherited?.preparationCheck?.();
+          if (reachOnly && distance(actions.bot.entity.position, position) > radius) {
+            throw new Error('成熟作物已超出应急收割距离，停止挖掘');
+          }
           const actual = blockAt(actions.bot, position.x, position.y, position.z);
           if (actual?.name === crop.block && !matureCrop(actual)) {
             throw new Error('作物在接近或装备期间已被重新种下，停止收割未成熟植株');
@@ -119,7 +134,7 @@ async function harvestCrops({ actions, nav, ctx, itemName, count = 1, radius = 4
         // after the server harvests but before Actions.dig returns its drops.
         pending.push(position);
         await executionContext.run({ ...inherited, preparationCheck }, () =>
-          actions.dig({ ...position, signal: ctx.signal, collect: true, reach: false, safe: true }));
+          actions.dig({ ...position, signal: ctx.signal, collect: true, collectMovement: !reachOnly, reach: false, safe: true }));
         steps.push(`收割成熟 ${crop.block}`);
         await plantPending();
         return true;

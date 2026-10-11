@@ -122,7 +122,8 @@ function countCollectedItem(actions, name) {
     .filter(([item]) => item.endsWith('_wool')).reduce((sum, [, n]) => sum + n, 0) : actions.countItem(name);
 }
 
-async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDomain = true, maxAttempts = null }) {
+async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDomain = true, maxAttempts = null,
+  radius = 40, allowSearch = true }) {
   ctx.checkAborted();
   // **null 表示"不覆盖"**：委派给 chop_tree / mine_ores / mine_stone 时，
   // 让它们各自用自己的默认重试次数（那三个的默认值并不一样：24 / 40 / 30）。
@@ -133,10 +134,10 @@ async function collectItem({ actions, nav, state, ctx, item, count = 1, autoDoma
   const steps = [];
 
   if (wood.CROPS[want]) {
-    // Crops always use surface search and verified replanting, including a
+    // Crops use a bounded surface scan and verified replanting, including a
     // resumed harvest whose inventory target was reached before interruption.
     return wood.harvestCrops({ actions, nav, ctx, itemName: want, count: target,
-      radius: 40, maxAttempts: attempts });
+      radius, maxAttempts: attempts, allowSearch });
   }
 
   const haveTarget = () => countCollectedItem(actions, want);
