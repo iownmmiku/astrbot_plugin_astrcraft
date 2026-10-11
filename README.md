@@ -1,14 +1,14 @@
 # Astrcraft
 
-**v1.3.2 · AstrBot 的 Minecraft 自主游玩插件**
+**v1.3.3 · AstrBot 的 Minecraft 自主游玩插件**
 
 让 AstrBot 的机器人以真实玩家身份进入 Minecraft：观察环境、安排工作、采集资源、制作工具、建造基地，并在饥饿、受伤或遇险时调整行动。
 
 项目目标是能够自主、连贯地生存与建设。目前已经验证多条实际生存链，开放世界长期自主生存仍需要持续实测。使用中发现卡住、重复动作或结果不符，欢迎提交 [Issue](https://github.com/iownmmiku/astrbot_plugin_astrcraft/issues)。
 
-[下载发布版](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases/latest) · [更新日志](CHANGELOG.md) · [本轮修复与验证记录](docs/UPDATE_2026-10-08.md) · [此前生存验证](docs/SURVIVAL_2026-10-02.md)
+[下载发布版](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases/latest) · [更新日志](CHANGELOG.md) · [本轮修复与验证记录](docs/UPDATE_2026-10-11.md) · [此前生存验证](docs/SURVIVAL_2026-10-02.md)
 
-当前源码的未发布修复见 [2026-10-11 修复记录](docs/UPDATE_2026-10-11.md)，包含断粮重规划、聊天控制边界、目标完成、记忆保存和真实行动反馈；发布版仍为 v1.3.2。
+v1.3.3 修复断粮重规划、聊天控制边界、目标完成、记忆保存和真实行动反馈，详细变更与验证边界见 [2026-10-11 修复记录](docs/UPDATE_2026-10-11.md)。
 
 ## 她能做什么
 
@@ -42,7 +42,7 @@ Node.js 和 npm 必须能在 **AstrBot 实际运行的环境**中执行。AstrBo
 
 ### 2. 安装完整插件
 
-可在 AstrBot 插件管理中安装本仓库，或从 [Releases](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases) 下载 `astrbot_plugin_astrcraft-v1.3.2.zip`。
+可在 AstrBot 插件管理中安装本仓库，或从 [Releases](https://github.com/iownmmiku/astrbot_plugin_astrcraft/releases) 下载 `astrbot_plugin_astrcraft-v1.3.3.zip`。
 
 手动安装时，将 ZIP 解压到：
 
@@ -185,7 +185,15 @@ mc她在干嘛
 
 新决策仍受模型响应速度影响。既定计划与部分规则补给可以减少模型往返，不能消除生产模型的网络延迟。
 
-## 1.3.2 本次更新
+## 1.3.3 本次更新
+
+- **断粮与应急采收**：残血断粮时重新安排安全食物；原地小量采收核验实际产出，重复失败有有限重试和冷却。
+- **聊天与目标控制**：普通游戏聊天只作为见闻；唤醒动作使用单一执行入口，长期目标关键步骤失败后如实报告。
+- **记忆可靠性**：逐条抢救有效记录、保留坏档、原子保存与备份，按服务器和维度归并经历。
+- **通信与行动反馈**：管道写入纳入超时，取消和异常清理等待记录；匹配任务实际成功后才更新行动需求。
+- **发布与安装**：完整 ZIP 保留原生 Pages 和国际化资源，统一依赖安装与外置引擎配置路径。
+
+## 此前 1.3.2 更新
 
 - **AstrBot 原生控制台**：官方 Pages 目录、bridge、登录会话与插件 API；独立 HTTP 模式保留，手机和亮暗主题可用。
 - **目标连续执行**：旧规划失效、单循环推进、暂停不消耗失败次数；砍树、采矿、采石恢复原追加数量与矿口，`collect` 按原库存目标补缺。修复圆石目标选错技能及重连后自主循环保持暂停的问题。
