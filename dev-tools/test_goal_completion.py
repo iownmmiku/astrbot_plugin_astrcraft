@@ -71,6 +71,11 @@ class GoalCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status, G.GOAL_DONE)
         self.assertEqual(events[-1], "goal.done")
 
+    async def test_malformed_params_are_rejected_without_default_action(self):
+        for params in ([], "count=64", 64, None):
+            with self.subTest(params=params):
+                self.assertIsNone((await self.manager([{"skill": "chop_tree", "params": params}])).plan)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

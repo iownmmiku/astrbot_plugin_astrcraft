@@ -235,6 +235,16 @@ async def main() -> int:
 
         # ---------------------------------------------------------- 驱动力
         print("\n[3] 驱动力")
+        # 默认定义是模板；新实例不能继承另一个机器人的水位或活动配置。
+        isolated_a = DriveSystem(Path(tempfile.mkdtemp()))
+        isolated_b = DriveSystem(Path(tempfile.mkdtemp()))
+        isolated_a._drives["explore"].level = 0.8
+        isolated_a._drives["explore"].activities.append("instance-only-activity")
+        if (isolated_b._drives["explore"].level == 0.0
+                and "instance-only-activity" not in isolated_b._drives["explore"].activities):
+            ok("各驱动力实例拥有独立水位与活动配置")
+        else:
+            bad("默认驱动力对象被多个实例共享")
         drives = DriveSystem(tmp)
         # 模拟过了 3 小时 → 各欲望都该涨
         drives.tick(now=time.time() + 3 * 3600)

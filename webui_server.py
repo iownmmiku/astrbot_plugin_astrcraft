@@ -323,6 +323,9 @@ class WebUI:
         elif busy:
             raise ApiError(409, "上一项控制操作还在执行；急停和退服可中断普通操作")
         if urgent:
+            # Invalidate synchronously: the queued control job may start after
+            # an old resume RPC wakes up on the event loop.
+            self.plugin._invalidate_player_goal()
             if action == "stop":
                 self.plugin._emergency_stopped = True
                 if self.plugin.life:

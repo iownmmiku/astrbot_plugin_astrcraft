@@ -4,6 +4,7 @@
 // Real mineflayer bed plugin, local server events and recorded packets only.
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const { mock } = require('node:test');
 const { Actions } = require('../engine/actions');
 const { executionContext } = require('../engine/goals');
 const { vec3, delay, CancelledError } = require('../engine/util');
@@ -276,7 +277,26 @@ function homeFixture() {
   return { ...f, run, ctx, world, key };
 }
 
-test('returnHome preserves safe arrival but exposes an unsuccessful night sleep', async () => {
+async function withControlledClock(run) {
+  // Keep the exact 40 ms caller budget, but let only scheduled time consume it.
+  // Real inspectHome CPU/OS scheduling could otherwise exhaust it before sleep.
+  // Game events, real home inspection and production timeout checks remain active.
+  mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1000000 });
+  let settled = false, failure;
+  Promise.resolve().then(run).then(() => { settled = true; }, (err) => { settled = true; failure = err; });
+  try {
+    for (let elapsed = 0; !settled && elapsed < 200; elapsed += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+      mock.timers.tick(1);
+    }
+    assert.equal(settled, true, 'home scenario must finish within the bounded logical clock');
+    if (failure) throw failure;
+  } finally {
+    mock.timers.reset();
+  }
+}
+
+test('returnHome preserves safe arrival but exposes an unsuccessful night sleep', () => withControlledClock(async () => {
   const f = homeFixture();
   f.bot.activateBlock = () => { f.sleep(); f.awake(); };
   const start = Date.now();
@@ -288,25 +308,45 @@ test('returnHome preserves safe arrival but exposes an unsuccessful night sleep'
   assert.equal(result.sleep_result.day_confirmed, false);
   assert.match(result.note, /尚未确认天亮/);
   assert(Date.now() - start < 200);
-});
+}));
 
-test('returnHome successful sleep exposes actual dawn and rechecks safety', async () => {
+test('returnHome successful sleep exposes actual dawn and rechecks safety', () => withControlledClock(async () => {
   const f = homeFixture();
   f.bot.activateBlock = () => { f.sleep(); f.awake(0); };
   const result = await f.run();
   assert.equal(result.ok, true);
   assert.equal(result.slept, true);
   assert.equal(result.sleep_result.day_confirmed, true);
-});
+}));
 
-test('returnHome without a bed caps shelter waiting to its caller budget', async () => {
+test('returnHome still rejects a budget actually exhausted during home inspection', () => withControlledClock(async () => {
+  const f = homeFixture();
+  const blockAt = f.bot.blockAt;
+  let advanced = false, bedClicks = 0;
+  f.bot.blockAt = (position) => {
+    // The first inspection precedes entryDeadline. Consume time only inside
+    // returnHome's guarded execution, using the real inspection and world blocks.
+    if (!advanced && executionContext.getStore()?.allowTerrainDig === false) {
+      advanced = true;
+      mock.timers.tick(41);
+    }
+    return blockAt(position);
+  };
+  f.bot.activateBlock = () => { bedClicks += 1; };
+  await assert.rejects(f.run(), { name: 'TimeoutError', message: '回基地进屋超时' });
+  assert.equal(advanced, true);
+  assert.equal(bedClicks, 0);
+}));
+
+test('returnHome without a bed caps shelter waiting to its caller budget', () => withControlledClock(async () => {
   const f = homeFixture(); f.world.delete(f.key(f.bed.position));
   const start = Date.now();
   const result = await f.run({ sleep: false, waitSeconds: 30 });
   assert.equal(result.ok, true);
   assert(result.waited_ms > 0 && result.waited_ms < 150);
+  assert(result.waited_ms <= 40, 'shelter waiting must keep the exact caller budget');
   assert(Date.now() - start < 200);
-});
+}));
 
 (async () => {
   for (const { name, run } of tests) {

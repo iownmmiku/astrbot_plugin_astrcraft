@@ -220,6 +220,96 @@ class GoalControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status, goals.GOAL_FAILED)
         self.assertFalse(manager.log[0].get("cancelled"))
 
+    async def test_transient_status_error_does_not_resubmit_running_task(self):
+        rpc = EngineIO()
+        original = rpc.__call__
+        polls = 0
+        async def interrupted_status(method, params, **kwargs):
+            nonlocal polls
+            if method == "task.status":
+                polls += 1
+                if polls == 1:
+                    raise TimeoutError("temporary response timeout")
+                rpc.tasks[params["task_id"]] = "done"
+            return await original(method, params, **kwargs)
+        manager = self.manager(interrupted_status)
+        await manager.start(plan=goals.GoalPlan("logs", [goals.GoalStep("chop_tree", {"count": 8})]))
+        await asyncio.wait_for(manager._task, 2)
+        self.assertEqual(manager.status, goals.GOAL_DONE)
+        self.assertEqual(len(rpc.submitted), 1)
+        self.assertEqual(manager.log[0]["attempt"], 1)
+
+    async def test_repeated_status_errors_cancel_and_stop_without_replay(self):
+        rpc = EngineIO()
+        original = rpc.__call__
+        async def unavailable_status(method, params, **kwargs):
+            if method == "task.status":
+                raise TimeoutError("response unavailable")
+            return await original(method, params, **kwargs)
+        manager = self.manager(unavailable_status)
+        await manager.start(plan=goals.GoalPlan("logs", [goals.GoalStep("chop_tree", {"count": 8})]))
+        await asyncio.wait_for(manager._task, 2)
+        self.assertEqual(manager.status, goals.GOAL_FAILED)
+        self.assertEqual(len(rpc.submitted), 1)
+        self.assertEqual(rpc.tasks["task-1"], "cancelled")
+
+    async def test_submission_timeout_does_not_repeat_unknown_side_effect(self):
+        rpc = EngineIO()
+        original = rpc.__call__
+        async def lost_submission_response(method, params, **kwargs):
+            result = await original(method, params, **kwargs)
+            if method == "skill.run":
+                raise TimeoutError("accepted task response lost")
+            return result
+        manager = self.manager(lost_submission_response)
+        await manager.start(plan=goals.GoalPlan("logs", [goals.GoalStep("chop_tree", {"count": 8})]))
+        await asyncio.wait_for(manager._task, 2)
+        self.assertEqual(manager.status, goals.GOAL_FAILED)
+        self.assertEqual(len(rpc.submitted), 1)
+
+    async def test_submission_timeout_while_paused_cannot_be_replayed_on_resume(self):
+        rpc = EngineIO()
+        rpc.submit_release = asyncio.Event()
+        original = rpc.__call__
+        async def lost_submission_response(method, params, **kwargs):
+            result = await original(method, params, **kwargs)
+            if method == "skill.run":
+                raise TimeoutError("accepted task response lost")
+            return result
+        manager = self.manager(lost_submission_response)
+        await manager.start(plan=goals.GoalPlan("logs", [goals.GoalStep("chop_tree", {"count": 8})]))
+        await rpc.entered.wait()
+        await manager.pause()
+        rpc.submit_release.set()
+        await fast_sleep(1)
+        self.assertEqual(manager.status, goals.GOAL_FAILED)
+        await manager.resume()
+        self.assertEqual(len(rpc.submitted), 1)
+
+    async def test_step_deadline_does_not_replay_unconfirmed_cancelled_task(self):
+        async def no_wait(seconds):
+            await _sleep(0)
+        for cancel_mode in ("rpc_failed", "still_running"):
+            with self.subTest(cancel_mode=cancel_mode):
+                rpc = EngineIO()
+                original = rpc.__call__
+                cancellations = []
+                async def unconfirmed_cancel(method, params, **kwargs):
+                    if method == "task.cancel":
+                        cancellations.append(params["task_id"])
+                        if cancel_mode == "rpc_failed":
+                            raise TimeoutError("cancel response unavailable")
+                        return {"ok": True}
+                    return await original(method, params, **kwargs)
+                manager = self.manager(unconfirmed_cancel)
+                await manager.start(plan=goals.GoalPlan("logs", [goals.GoalStep("chop_tree", {"count": 8})]))
+                with patch.object(goals.asyncio, "sleep", no_wait):
+                    await asyncio.wait_for(manager._task, 2)
+                self.assertEqual(manager.status, goals.GOAL_FAILED)
+                self.assertEqual(len(rpc.submitted), 1)
+                self.assertEqual(cancellations, ["task-1"])
+                self.assertEqual(rpc.tasks["task-1"], "running")
+
     async def test_verify_cannot_be_overridden_by_payload_ok(self):
         rpc = EngineIO()
         manager = self.manager(rpc)

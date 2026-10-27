@@ -45,6 +45,7 @@ def plugin():
         _auto_connect=AsyncMock(), _resume_play=AsyncMock(return_value="已恢复"),
         _pause_play=AsyncMock(return_value="已暂停"), _abandon_goal=AsyncMock(return_value="已放弃"),
         _start_player_goal=AsyncMock(return_value="已开始目标"),
+        _invalidate_player_goal=Mock(return_value=1),
     )
 
 

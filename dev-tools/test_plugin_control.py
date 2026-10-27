@@ -129,6 +129,147 @@ async def results(generator):
 
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_resume_cannot_override_new_pause_or_stop(self):
+        for action in ("pause", "stop"):
+            with self.subTest(action=action):
+                p = plugin()
+                entered, release = asyncio.Event(), asyncio.Event()
+                original_call = p.engine.call
+
+                async def delayed_resume(method, params=None, **kwargs):
+                    result = await original_call(method, params, **kwargs)
+                    if method == "safety.resume":
+                        entered.set()
+                        await release.wait()
+                    return result
+
+                p.engine.call = delayed_resume
+                old = asyncio.create_task(p._resume_play())
+                await entered.wait()
+                await (p._pause_play() if action == "pause" else p._emergency_stop())
+                release.set()
+                outcome = (await asyncio.gather(old, return_exceptions=True))[0]
+                self.assertIsInstance(outcome, Exception)
+                self.assertTrue(p.life.paused)
+                self.assertFalse(p._can_resume_autonomy())
+                self.assertTrue(p._owner_paused if action == "pause" else p._emergency_stopped)
+
+    async def test_late_resume_failure_cannot_stop_new_successful_resume(self):
+        p = plugin()
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+        original_call = p.engine.call
+
+        async def call(method, params=None, **kwargs):
+            nonlocal calls
+            if method == "safety.resume":
+                calls += 1
+                if calls == 1:
+                    entered.set()
+                    await release.wait()
+                    raise RuntimeError("old response failed")
+            return await original_call(method, params, **kwargs)
+
+        p.engine.call = call
+        old = asyncio.create_task(p._resume_play())
+        await entered.wait()
+        await p._resume_play()
+        release.set()
+        outcome = (await asyncio.gather(old, return_exceptions=True))[0]
+        self.assertIsInstance(outcome, Exception)
+        self.assertFalse(p._emergency_stopped)
+        self.assertFalse(p.life.paused)
+        self.assertFalse(p.engine.stopped)
+
+    async def test_late_stop_does_not_pause_goal_after_new_resume(self):
+        p = plugin()
+        p.goals = type("Goals", (), {"active": False, "pause": AsyncMock(),
+                                      "resume": AsyncMock(return_value="已继续")})()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def stop():
+            p.engine.stopped = True
+            entered.set()
+            await release.wait()
+            return {"cancelled": []}
+
+        p.engine.safety_stop = stop
+        old = asyncio.create_task(p._emergency_stop())
+        await entered.wait()
+        await p._resume_play()
+        release.set()
+        await asyncio.gather(old, return_exceptions=True)
+        p.goals.pause.assert_not_awaited()
+        self.assertFalse(p.life.paused)
+
+    async def test_late_pause_does_not_cancel_new_resumed_actions(self):
+        p = plugin()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def pause():
+            entered.set()
+            await release.wait()
+            return "目标已暂停"
+
+        p.goals = type("Goals", (), {"active": True, "pause": staticmethod(pause),
+                                      "resume": AsyncMock(return_value="已继续")})()
+        p.engine.call = AsyncMock(return_value={"ok": True})
+        old = asyncio.create_task(p._pause_play())
+        await entered.wait()
+        await p._resume_play()
+        release.set()
+        await asyncio.gather(old, return_exceptions=True)
+        self.assertNotIn("task.cancel", [call.args[0] for call in p.engine.call.await_args_list])
+        self.assertFalse(p._owner_paused)
+
+    async def test_late_abandon_cannot_release_new_owner_pause(self):
+        p = plugin()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def abandon():
+            entered.set()
+            await release.wait()
+            return "目标已放弃"
+
+        p.goals = type("Goals", (), {"active": False, "abandon": staticmethod(abandon),
+                                      "pause": AsyncMock(return_value="已暂停")})()
+        old = asyncio.create_task(p._abandon_goal())
+        await entered.wait()
+        await p._pause_play()
+        release.set()
+        await asyncio.gather(old, return_exceptions=True)
+        self.assertTrue(p._owner_paused)
+        self.assertTrue(p.life.paused)
+
+    async def test_web_stop_invalidates_resume_before_control_job_runs(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        WebUI = _paths.plugin_module("webui_server").WebUI
+        p = plugin()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def call(method, params=None, **kwargs):
+            if method == "safety.resume":
+                entered.set()
+                await release.wait()
+            return {"ok": True}
+
+        p.engine.call = call
+        ui = WebUI(p, version="test", token="test-secret")
+        old = asyncio.create_task(p._resume_play())
+        await entered.wait()
+        # Capture the scheduled job without starting it: submit must invalidate
+        # old controllers synchronously, before any task can run on the loop.
+        pending_job = SimpleNamespace(done=lambda: False, add_done_callback=lambda callback: None)
+        with patch.object(asyncio, "create_task", side_effect=lambda coroutine, **kwargs:
+                          (coroutine.close(), pending_job)[1]):
+            await ui.submit({"action": "stop"})
+        release.set()
+        outcome = (await asyncio.gather(old, return_exceptions=True))[0]
+        self.assertIsInstance(outcome, Exception)
+        self.assertTrue(p._emergency_stopped)
+        self.assertTrue(p.life.paused)
+
     async def test_goal_tool_resume_clears_webui_owner_pause(self):
         p = plugin()
         p._owner_paused = True

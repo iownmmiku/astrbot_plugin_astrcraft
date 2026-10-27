@@ -272,8 +272,11 @@ def main() -> int:
         elif r["status"] == "ok" and p.name in KNOWN_FLAKY:
             note = "  （这个脚本已知会偶发红，这次是好的）"
         print(f"{mark} {r['summary']}  {r['secs']:.0f}s{note}")
-        if args.verbose and r["output"]:
-            for l in r["output"].splitlines()[-25:]:
+        if r["output"] and (args.verbose or r["status"] == "fail"):
+            # A failed assertion may precede later PASS lines. Preserve the
+            # complete failure output without requiring a second, verbose run.
+            lines = r["output"].splitlines()
+            for l in lines if r["status"] == "fail" else lines[-25:]:
                 print(f"      {l}")
 
     # ---------------- 汇总
@@ -299,7 +302,7 @@ def main() -> int:
                 print(f"       {r['detail'][:100]}")
             if flaky:
                 print(f"       ⚠️ 历史偶发记录（不能据此排除本次的新问题）：{flaky}")
-        print("\n  提示：加 -v 能看到完整输出")
+        print("\n  失败脚本的完整输出已打印；加 -v 也可查看通过脚本的输出摘要")
     if other:
         print("\n超时/起不来的：")
         for r in other:

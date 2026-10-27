@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from astrbot.api import logger
@@ -125,7 +125,8 @@ class DriveSystem:
     def __init__(self, data_dir: Path, *, drives: list[Drive] | None = None, tick_seconds: float = 300.0):
         self._dir = Path(data_dir)
         self._path = self._dir / "drives.json"
-        self._drives = {d.key: d for d in (drives or DEFAULT_DRIVES)}
+        # 定义是模板。复制水位和可变活动列表，避免实例/热重载互相修改状态。
+        self._drives = {d.key: replace(d, activities=list(d.activities)) for d in (drives or DEFAULT_DRIVES)}
         self._bias: dict[str, float] = {}
         self._tick_seconds = tick_seconds
         self._last_tick = time.time()

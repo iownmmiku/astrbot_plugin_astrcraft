@@ -1811,116 +1811,110 @@ class Actions {
     }
     const entity = this._resolveEntity(target);
     if (!entity) throw new ActionError(`附近找不到目标：${target}`);
-    await this.holdItem({ item: 'bow', signal });
-    const lowHealth = retreatHealth === null ? Number(this._config.get('retreatHealth')) || 8 : retreatHealth;
+    const outcome = this._watchCombatTarget(entity);
+    try {
+      await this.holdItem({ item: 'bow', signal });
+      const lowHealth = retreatHealth === null ? Number(this._config.get('retreatHealth')) || 8 : retreatHealth;
 
-    let shots = 0;
-    const start = Date.now();
-    while (shots < maxShots) {
-      if (signal && signal.aborted) throw new CancelledError();
-      if (Date.now() - start > 90000) {
-        return { ok: false, reason: '射箭超时（90 秒）', shots, target: entity.name };
-      }
-      if (bot.health <= lowHealth) {
-        return { ok: false, reason: `血量降到 ${bot.health}，主动撤退（低于阈值 ${lowHealth}）`, shots };
-      }
-      const live = bot.entities[entity.id];
-      if (!live) return { ok: true, killed: true, shots, target: entity.name };
-
-      const dist = distance(bot.entity.position, live.position);
-      if (dist > 48) {
-        return { ok: false, reason: `目标在 ${dist.toFixed(0)} 格外，太远了（弓的射程约 48 格）`, shots };
-      }
-      // 太近就别射了——箭没拉开就打，伤害还不如直接砍
-      if (dist < 3.5) {
-        return { ok: false, reason: `目标已经贴到 ${dist.toFixed(1)} 格，太近了，改用近战（mc_attack）`, shots };
-      }
-
-      // **预判 + 抬枪**：箭速约 40 格/秒，重力约 20 格/秒²
-      const t = dist / 40;
-      const vel = live.velocity || { x: 0, y: 0, z: 0 };
-      const aimX = live.position.x + (vel.x || 0) * t;
-      const aimZ = live.position.z + (vel.z || 0) * t;
-      const aimY = live.position.y + (live.height ? live.height * 0.6 : 0.9) + (vel.y || 0) * t + 0.5 * 20 * t * t;
-
-      try {
-        await bot.lookAt(vec3(aimX, aimY, aimZ), true);
-      } catch (err) {
-        log.info(`瞄准失败：${err.message}`);
-      }
-
-      // 拉弓 → 等蓄力 → 放
-      try {
-        bot.activateItem();
-        await delay(chargeMs, { signal });
-        bot.deactivateItem();
-        shots += 1;
-      } catch (err) {
-        throw new ActionError(`射箭失败：${describeFailure(err)}`);
-      }
-      // 射完等一会儿再看结果。
-      //
-      // **判断"死了没"踩过两个坑，都记在这里**：
-      //   1. 只看 `!bot.entities[id]` 会误判——实体被击中时 mineflayer 会短暂
-      //      把它从实体表里摘掉再放回，"看不到"被当成"死了"。
-      //   2. 兜底的"按名字找附近"半径写小了也会误判——实测半径 8，
-      //      而目标在 10 格外，于是**每一箭都被当成射死了**。
-      // 现在：先按 id 查（在就是活着）；id 没了再按名字在**整个射程内**找；
-      // 而且要**连续 3 次都看不到**才算死（约 1.5 秒）。
-      // 宁可多说"还没打死"，也不要虚报战果——虚报会让模型以为赢了、不再补刀。
-      let gone = false;
-      for (let i = 0; i < 3; i += 1) {
-        await delay(500, { signal });
-        if (this._targetAlive(entity.id, entity.name, 48)) {
-          gone = false;
-          break;
+      let shots = 0;
+      const start = Date.now();
+      while (shots < maxShots) {
+        if (signal && signal.aborted) throw new CancelledError();
+        outcome.check();
+        if (outcome.dead) return { ok: true, killed: true, shots, target: entity.name };
+        if (Date.now() - start > 90000) {
+          return { ok: false, reason: '射箭超时（90 秒）', shots, target: entity.name };
         }
-        gone = true;
+        if (bot.health <= lowHealth) {
+          return { ok: false, reason: `血量降到 ${bot.health}，主动撤退（低于阈值 ${lowHealth}）`, shots };
+        }
+        const live = bot.entities[entity.id];
+        if (!live) return { ok: false, killed: false, target_lost: true, shots, target: entity.name,
+          reason: '目标已离开可见范围，未确认死亡' };
+
+        const dist = distance(bot.entity.position, live.position);
+        if (dist > 48) {
+          return { ok: false, reason: `目标在 ${dist.toFixed(0)} 格外，太远了（弓的射程约 48 格）`, shots };
+        }
+        // 太近就别射了——箭没拉开就打，伤害还不如直接砍
+        if (dist < 3.5) {
+          return { ok: false, reason: `目标已经贴到 ${dist.toFixed(1)} 格，太近了，改用近战（mc_attack）`, shots };
+        }
+
+        // **预判 + 抬枪**：箭速约 40 格/秒，重力约 20 格/秒²
+        const t = dist / 40;
+        const vel = live.velocity || { x: 0, y: 0, z: 0 };
+        const aimX = live.position.x + (vel.x || 0) * t;
+        const aimZ = live.position.z + (vel.z || 0) * t;
+        const aimY = live.position.y + (live.height ? live.height * 0.6 : 0.9) + (vel.y || 0) * t + 0.5 * 20 * t * t;
+
+        try {
+          await bot.lookAt(vec3(aimX, aimY, aimZ), true);
+        } catch (err) {
+          if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+          log.info(`瞄准失败：${err.message}`);
+        }
+
+        // 拉弓 → 等蓄力 → 放
+        try {
+          outcome.check();
+          bot.activateItem();
+          await delay(chargeMs, { signal });
+          outcome.check();
+          bot.deactivateItem();
+          shots += 1;
+        } catch (err) {
+          if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+          throw new ActionError(`射箭失败：${describeFailure(err)}`);
+        }
+        // entityGone also means tracking range/chunk loss. Only the selected
+        // entity's server death event confirms a kill; a same-name peer is unrelated.
+        for (let i = 0; i < 3; i += 1) {
+          if (outcome.dead) return { ok: true, killed: true, shots, target: entity.name };
+          await delay(500, { signal });
+          outcome.check();
+          if (outcome.dead) return { ok: true, killed: true, shots, target: entity.name };
+          if (bot.entities[entity.id]) break;
+        }
+        if (!bot.entities[entity.id]) return { ok: false, killed: false, target_lost: true,
+          shots, target: entity.name, reason: '目标已离开可见范围，未确认死亡' };
+        // 箭用完了就停
+        if (this.countItem('arrow') === 0) {
+          return { ok: false, reason: `箭用完了（射了 ${shots} 次）`, shots, target: entity.name };
+        }
       }
-      if (gone) {
-        return { ok: true, killed: true, shots, target: entity.name };
-      }
-      // 箭用完了就停
-      if (this.countItem('arrow') === 0) {
-        return { ok: false, reason: `箭用完了（射了 ${shots} 次）`, shots, target: entity.name };
-      }
+      outcome.check();
+      return {
+        ok: outcome.dead,
+        killed: outcome.dead,
+        shots,
+        target: entity.name,
+        reason: outcome.dead ? undefined : `射了 ${shots} 次还没确认击杀（可能要靠近点，或换更好的弓）`,
+      };
+    } finally {
+      outcome.close();
     }
-    const stillAlive = this._targetAlive(entity.id, entity.name, 48);
-    return {
-      ok: !stillAlive,
-      killed: !stillAlive,
-      shots,
-      target: entity.name,
-      reason: stillAlive ? `射了 ${shots} 次还没打死（可能要靠近点，或换更好的弓）` : undefined,
+  }
+
+  /** Track server-confirmed death for this exact combat target and body. */
+  _watchCombatTarget(entity) {
+    const bot = this._requireBot();
+    const body = bot.entity;
+    const client = bot._client;
+    const dimension = bot.game?.dimension;
+    const epoch = this._controlEpoch;
+    const ownsBody = () => this._controlEpoch === epoch && bot.entity === body &&
+      bot._client === client && bot.game?.dimension === dimension;
+    let dead = false;
+    const onDeath = (reported) => {
+      if (!ownsBody()) return;
+      if (reported === entity || (reported && Number.isInteger(entity.id) && reported.id === entity.id &&
+          (!entity.uuid || reported.uuid === entity.uuid))) dead = true;
     };
-  }
-
-  /**
-   * 目标还活着吗？
-   *
-   * 先按实体 id 查（在就是活着）；id 没了再按名字在给定半径内找一遍。
-   * 半径要**大于交战距离**——见 attackRanged 里的说明（写成 8 会误判）。
-   */
-  _targetAlive(entityId, name, radius = 48) {
-    const bot = this._requireBot();
-    if (entityId !== undefined && entityId !== null && bot.entities[entityId]) return true;
-    return this._entityStillNearby(name, radius);
-  }
-
-  /**
-   * 附近还有没有这个类型的实体？（比"查实体表里那个 id 在不在"可靠）
-   */
-  _entityStillNearby(name, radius = 8) {
-    const bot = this._requireBot();
-    const want = String(name || '').toLowerCase();
-    if (!want || !bot.entity) return false;
-    const me = bot.entity.position;
-    for (const e of Object.values(bot.entities || {})) {
-      if (!e || !e.position || e === bot.entity) continue;
-      if (String(e.name || '').toLowerCase() !== want) continue;
-      if (distance(me, e.position) <= radius) return true;
-    }
-    return false;
+    bot.on?.('entityDead', onDeath);
+    return { get dead() { return dead; }, ownsBody,
+      check: () => { if (!ownsBody()) throw new CancelledError('战斗的身体或控制已切换'); },
+      close: () => bot.removeListener?.('entityDead', onDeath) };
   }
 
   /**
@@ -1951,72 +1945,91 @@ class Actions {
     const bot = this._requireBot();
     const entity = this._resolveEntity(target);
     if (!entity) throw new ActionError(`附近找不到目标：${target}`);
+    const outcome = this._watchCombatTarget(entity);
+    try {
+      await this.equipBestWeapon({ signal });
 
-    await this.equipBestWeapon({ signal });
+      const lowHealth = retreatHealth === null ? Number(this._config.get('retreatHealth')) || 8 : retreatHealth;
+      let attacks = 0;
+      const start = Date.now();
 
-    const lowHealth = retreatHealth === null ? Number(this._config.get('retreatHealth')) || 8 : retreatHealth;
-    let attacks = 0;
-    const start = Date.now();
-
-    while (attacks < maxAttacks) {
-      if (signal && signal.aborted) throw new CancelledError();
-      if (Date.now() - start > 60000) {
-        return { ok: false, reason: '战斗超时（60 秒）', attacks, target: entity.name };
-      }
-      // 血量太低就撤，别送死
-      if (bot.health <= lowHealth) {
-        return { ok: false, reason: `血量降到 ${bot.health}，主动撤退（低于阈值 ${lowHealth}）`, attacks, target: entity.name };
-      }
-      const live = bot.entities[entity.id];
-      if (!live) {
-        return { ok: true, killed: true, attacks, target: entity.name };
-      }
-      const d = distance(bot.entity.position, live.position);
-      if (d > REACH - 0.6) {
-        try {
-          await this._nav.goTo({ x: live.position.x, y: live.position.y, z: live.position.z, range: 2, signal, timeoutMs: 8000 });
-        } catch (err) {
-          if (err instanceof CancelledError) throw err;
-          await delay(200, { signal });
+      while (attacks < maxAttacks) {
+        if (signal && signal.aborted) throw new CancelledError();
+        outcome.check();
+        if (outcome.dead) return { ok: true, killed: true, attacks, target: entity.name };
+        if (Date.now() - start > 60000) {
+          return { ok: false, reason: '战斗超时（60 秒）', attacks, target: entity.name };
+        }
+        // 血量太低就撤，别送死
+        if (bot.health <= lowHealth) {
+          return { ok: false, reason: `血量降到 ${bot.health}，主动撤退（低于阈值 ${lowHealth}）`, attacks, target: entity.name };
+        }
+        const live = bot.entities[entity.id];
+        if (!live) {
+          return { ok: false, killed: false, target_lost: true, attacks, target: entity.name,
+            reason: '目标已离开可见范围，未确认死亡' };
+        }
+        const d = distance(bot.entity.position, live.position);
+        if (d > REACH - 0.6) {
+          try {
+            await this._nav.goTo({ x: live.position.x, y: live.position.y, z: live.position.z, range: 2, signal, timeoutMs: 8000 });
+          } catch (err) {
+            if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+            await delay(200, { signal });
+            continue;
+          }
           continue;
         }
-        continue;
-      }
-      try {
-        // 必须用 Vec3 构造瞄点：entity.position 上的 offset 在部分版本不存在。
-        // 攻击目标时也渐进转头（真人打架是转头瞄准，不是瞬间锁定）
-        const aim = vec3(live.position.x, live.position.y + (live.height ? live.height * 0.85 : 1), live.position.z);
-        if (this._config.get('humanize') === false) {
-          await bot.lookAt(aim, true);
-        } else {
-          await smoothLookAt(bot, aim, { signal, durationMs: 90 });
-        }
-      } catch {
-        /* ignore */
-      }
-      try {
-        bot.attack(live);
-        attacks += 1;
-      } catch (err) {
-        log.info(`攻击失败：${err.message}`);
-      }
-      // **走位：像真人那样侧移绕圈**，而不是站着对砍。
-      // 站着不动对砍在 MC 里很吃亏（怪会连续命中），而且看着也不像人在打架。
-      // 每 2~3 下换一次方向，保持"绕圈"而不是"来回抖"。
-      if (attacks % 2 === 0) {
         try {
-          const side = Math.random() < 0.5 ? 'left' : 'right';
-          bot.setControlState(side, true);
-          await delay(180 + Math.random() * 220, { signal });
-          bot.setControlState(side, false);
-        } catch {
-          /* 走位失败不影响攻击 */
+          // 必须用 Vec3 构造瞄点：entity.position 上的 offset 在部分版本不存在。
+          // 攻击目标时也渐进转头（真人打架是转头瞄准，不是瞬间锁定）
+          const aim = vec3(live.position.x, live.position.y + (live.height ? live.height * 0.85 : 1), live.position.z);
+          if (this._config.get('humanize') === false) {
+            await bot.lookAt(aim, true);
+          } else {
+            await smoothLookAt(bot, aim, { signal, durationMs: 90 });
+          }
+        } catch (err) {
+          if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+          /* ordinary aiming failure does not prevent a reachable attack */
         }
+        try {
+          outcome.check();
+          bot.attack(live);
+          attacks += 1;
+        } catch (err) {
+          if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+          log.info(`攻击失败：${err.message}`);
+        }
+        // **走位：像真人那样侧移绕圈**，而不是站着对砍。
+        // 站着不动对砍在 MC 里很吃亏（怪会连续命中），而且看着也不像人在打架。
+        // 每 2~3 下换一次方向，保持"绕圈"而不是"来回抖"。
+        if (attacks % 2 === 0) {
+          const side = Math.random() < 0.5 ? 'left' : 'right';
+          try {
+            outcome.check();
+            bot.setControlState(side, true);
+            await delay(180 + Math.random() * 220, { signal });
+          } catch (err) {
+            if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
+            /* ordinary footwork failure does not prevent a reachable attack */
+          } finally {
+            // Release our own movement key even when its signal was aborted.
+            // A superseding owner/body performs its own cleanup and must be left alone.
+            if (outcome.ownsBody()) require('./goals').executionContext.exit(() => {
+              try { bot.setControlState(side, false); } catch { /* best effort release */ }
+            });
+          }
+        }
+        // 原版攻击冷却约 0.6 秒，太快会被服务器判定无效
+        await delay(this._config.get('slowMode') ? 900 : 620, { signal });
       }
-      // 原版攻击冷却约 0.6 秒，太快会被服务器判定无效
-      await delay(this._config.get('slowMode') ? 900 : 620, { signal });
+      outcome.check();
+      return { ok: outcome.dead, killed: outcome.dead,
+        reason: outcome.dead ? undefined : `攻击次数达到上限（${maxAttacks}），未确认击杀`, attacks, target: entity.name };
+    } finally {
+      outcome.close();
     }
-    return { ok: false, reason: `攻击次数达到上限（${maxAttacks}），目标可能太强或打不中`, attacks, target: entity.name };
   }
 
   async equipBestWeapon({ signal = null } = {}) {

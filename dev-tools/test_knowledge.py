@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import json
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
@@ -97,6 +100,69 @@ def main() -> None:
     # 7) 持久化
     kb2 = KnowledgeBase(tmp)
     check("重启后教训还在", len(kb2.lessons()) == 4, f"{len(kb2.lessons())} 条")
+
+    # 存档可能被截断或混入单条坏数据；读取和后续保存不能毁掉其余经验。
+    damaged_dir = Path(tempfile.mkdtemp())
+    damaged_path = damaged_dir / "knowledge" / "lessons.json"
+    damaged_path.parent.mkdir()
+    valid = {"text": "iron mining requires a stone pickaxe", "tags": ["iron"], "used": 1}
+    raw = json.dumps([valid, {**valid, "tags": [1]}, {**valid, "used": "broken"},
+                      {**valid, "text": 123}, {**valid, "at": float("nan")},
+                      {**valid, "used_at": "bad time"}, {**valid, "tags": ["\ud800"]}],
+                     ensure_ascii=True).encode("utf-8")
+    damaged_path.write_bytes(raw)
+    recovered = KnowledgeBase(damaged_dir)
+    check("单条坏教训不会污染有效记录", len(recovered.lessons()) == 1)
+    try:
+        recall_ok = "stone pickaxe" in recovered.recall("iron")
+    except (TypeError, ValueError, AttributeError):
+        recall_ok = False
+    check("抢救后的教训可以正常召回", recall_ok)
+    check("抢救前保留损坏原档", any(p.read_bytes() == raw for p in damaged_path.parent.glob("lessons.json.corrupt-*")))
+
+    blocked_dir = Path(tempfile.mkdtemp())
+    blocked_path = blocked_dir / "knowledge" / "lessons.json"
+    blocked_path.parent.mkdir()
+    blocked_path.write_bytes(raw)
+    with patch.object(os, "replace", side_effect=OSError("cannot preserve corruption")):
+        blocked = KnowledgeBase(blocked_dir)
+    result = blocked.add_lesson("furnace fuel must be reserved before smelting")
+    check("坏档留存失败时后续写入也不能覆盖原档", blocked_path.read_bytes() == raw and "记住了" not in result)
+
+    with patch.object(Path, "read_bytes", side_effect=PermissionError("cannot read original")):
+        unreadable = KnowledgeBase(blocked_dir)
+    result = unreadable.add_lesson("torches must be prepared before night travel")
+    check("原档读取受阻时禁止用空库覆盖", blocked_path.read_bytes() == raw and "记住了" not in result)
+
+    corrupt_dir = Path(tempfile.mkdtemp())
+    corrupt_path = corrupt_dir / "knowledge" / "lessons.json"
+    corrupt_path.parent.mkdir()
+    corrupt_raw = b'[{"text": "unfinished'
+    corrupt_path.write_bytes(corrupt_raw)
+    corrupt = KnowledgeBase(corrupt_dir)
+    result = corrupt.add_lesson("digging stone requires an actual pickaxe")
+    check("整档不可恢复时不以新记录覆盖坏档", corrupt_path.read_bytes() == corrupt_raw)
+    check("无法保存时不会声称已经记住", "记住了" not in result)
+
+    atomic_dir = Path(tempfile.mkdtemp())
+    atomic = KnowledgeBase(atomic_dir)
+    atomic.add_lesson("stone mining requires a pickaxe", tags=["stone"])
+    atomic_path = atomic_dir / "knowledge" / "lessons.json"
+    atomic_raw = atomic_path.read_bytes()
+    with patch.object(os, "replace", side_effect=OSError("injected replacement failure")):
+        result = atomic.add_lesson("cooking raw beef requires a furnace", tags=["beef"])
+    check("替换失败保留原教训库", atomic_path.read_bytes() == atomic_raw)
+    check("替换失败反馈未持久化", "记住了" not in result)
+    check("替换失败清理临时文件", not list(atomic_path.parent.glob(".*.tmp")))
+
+    with patch.object(os, "fsync", side_effect=OSError("injected flush failure")):
+        result = atomic.add_lesson("wheat crafting needs three actual items", tags=["wheat"])
+    check("刷盘失败保留原教训库", atomic_path.read_bytes() == atomic_raw and "记住了" not in result)
+
+    unicode_dir = Path(tempfile.mkdtemp())
+    unicode_kb = KnowledgeBase(unicode_dir)
+    result = unicode_kb.add_lesson("unencodable lesson \ud800")
+    check("无法编码的新教训不污染内存和后续保存", not unicode_kb.lessons() and "记住了" not in result)
 
     # 8) 上限与淘汰
     # 注意：这 140 条必须**真的各不相同**——第一版我写成"第 N 条很不一样的独特经验内容N号"，

@@ -33,7 +33,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -103,6 +106,7 @@ class KnowledgeBase:
         self._data_dir = Path(data_dir) if data_dir else None
         self._docs_dir = Path(docs_dir) if docs_dir else Path(__file__).resolve().parent / "skills_docs"
         self._lessons: list[dict] = []
+        self._write_protected = False
         self._load()
 
     # ------------------------------------------------------------ 持久化
@@ -115,31 +119,108 @@ class KnowledgeBase:
     def _notes_path(self) -> Path | None:
         return (self._data_dir / "knowledge" / "notes.md") if self._data_dir else None
 
-    def _load(self) -> None:
-        path = self._lessons_path
-        if not path or not path.exists():
-            return
-        try:
-            data = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception as exc:  # noqa: BLE001
-            logger.info("读取教训库失败：%s", exc)
-            return
-        if isinstance(data, list):
-            self._lessons = [d for d in data if isinstance(d, dict) and d.get("text")]
-            logger.info("她记得 %d 条自己总结的教训", len(self._lessons))
+    @staticmethod
+    def _validated_lesson(value: dict) -> dict:
+        """只让可召回、排序和 UTF-8 保存的记录进入内存。"""
+        if not isinstance(value, dict) or not isinstance(value.get("text"), str) or not value["text"].strip():
+            raise ValueError("教训必须包含非空文本")
+        row = dict(value)
+        row["tags"] = value.get("tags") if value.get("tags") is not None else []
+        if not isinstance(row["tags"], list) or any(not isinstance(tag, str) for tag in row["tags"]):
+            raise ValueError("教训标签必须为字符串列表")
+        row["tags"] = list(row["tags"])
+        used = value.get("used", 0)
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            raise ValueError("教训使用次数必须为非负整数")
+        row["used"] = used
+        for key in ("at", "used_at"):
+            number = value.get(key, 0)
+            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+                raise ValueError("教训时间必须为有限数字")
+            row[key] = number
+        json.dumps(row, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return row
 
-    def _save(self) -> None:
+    @staticmethod
+    def _atomic_write(path: Path, raw: bytes) -> None:
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            stream = os.fdopen(fd, "wb")
+            fd = None
+            with stream:
+                if stream.write(raw) != len(raw):
+                    raise OSError("教训库临时文件写入不完整")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                # 替换成功后临时路径已不存在，无需再次清理。
+                pass
+
+    def _preserve_corrupt(self, path: Path, raw: bytes) -> bool:
+        try:
+            preserved = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+            self._atomic_write(preserved, raw)
+            logger.warning("教训库坏档已保留：%s", preserved)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("无法保留教训库坏档，将禁止覆盖原档：%s", exc)
+            return False
+
+    def _load(self) -> None:
         path = self._lessons_path
         if not path:
             return
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(self._lessons[-MAX_LESSONS:], ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return  # 尚未创建教训库，允许第一次保存。
         except Exception as exc:  # noqa: BLE001
-            logger.info("保存教训库失败：%s", exc)
+            self._write_protected = True
+            logger.warning("无法读取教训库，已启用写保护：%s", exc)
+            return
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(data, list):
+                raise ValueError("教训库必须为列表")
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            self._write_protected = True
+            self._preserve_corrupt(path, raw)
+            logger.warning("教训库无法恢复，已启用写保护：%s", exc)
+            return
+        invalid = 0
+        for item in data:
+            try:
+                self._lessons.append(self._validated_lesson(item))
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                invalid += 1
+        if invalid:
+            preserved = self._preserve_corrupt(path, raw)
+            self._write_protected = not preserved or not self._lessons
+            logger.warning("教训库隔离 %d 条无效记录，保留 %d 条", invalid, len(self._lessons))
+        logger.info("她记得 %d 条自己总结的教训", len(self._lessons))
+
+    def _save(self) -> bool:
+        path = self._lessons_path
+        if not path:
+            return True  # 无数据目录的知识库继续支持仅内存使用。
+        if self._write_protected:
+            logger.warning("教训库处于写保护，未覆盖原档")
+            return False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rows = [self._validated_lesson(row) for row in self._lessons[-MAX_LESSONS:]]
+            raw = json.dumps(rows, ensure_ascii=False, indent=1, allow_nan=False).encode("utf-8")
+            self._atomic_write(path, raw)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存教训库失败，原档保持不变：%s", exc)
+            return False
 
     # ------------------------------------------------------------ 攻略（人写的）
 
@@ -178,22 +259,27 @@ class KnowledgeBase:
             return "教训太短了，写清楚「什么情况下该怎么做」才有用"
         if len(body) > MAX_LESSON_CHARS:
             body = body[:MAX_LESSON_CHARS] + "…"
+        try:
+            entry = self._validated_lesson({
+                "text": body,
+                "tags": [str(t).strip() for t in (tags or []) if str(t).strip()][:6],
+                "source": str(source or "")[:60],
+                "at": time.time(),
+                "used": 0,
+                "used_at": 0.0,
+            })
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            logger.warning("忽略无法保存的新教训：%s", exc)
+            return "教训包含无法保存的数据，未记入"
         # 句式相近且具体事实一致才去重：铁矿/石镐和钻石矿/铁镐必须各自留下。
         facts = _lesson_facts(body)
         for old in self._lessons:
             old_text = old.get("text", "")
             if _lesson_facts(old_text) == facts and _similar(old_text, body) >= 0.35:
                 old["used_at"] = time.time()
-                self._save()
+                if not self._save():
+                    return "暂时未能保存教训，请检查数据目录或损坏存档"
                 return f"这条和已有的很像，就不重复记了：{old['text'][:40]}…"
-        entry = {
-            "text": body,
-            "tags": [str(t).strip() for t in (tags or []) if str(t).strip()][:6],
-            "source": str(source or "")[:60],
-            "at": time.time(),
-            "used": 0,
-            "used_at": 0.0,
-        }
         self._lessons.append(entry)
         # 超上限就淘汰"最久没用过"的那些（而不是简单丢最早的）
         if len(self._lessons) > MAX_LESSONS:
@@ -201,7 +287,8 @@ class KnowledgeBase:
             dropped = self._lessons[MAX_LESSONS:]
             self._lessons = self._lessons[:MAX_LESSONS]
             logger.info("教训库满了，淘汰 %d 条最久没用的", len(dropped))
-        self._save()
+        if not self._save():
+            return "暂时未能保存教训，请检查数据目录或损坏存档"
         logger.info("她学到一条教训：%s", body[:60])
         return f"记住了：{body}"
 

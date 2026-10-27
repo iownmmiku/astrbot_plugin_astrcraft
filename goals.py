@@ -394,7 +394,12 @@ class GoalManager:
                 result = await self._execute_step(step, interruption)
                 if generation != self._run_generation or self._cancel_requested:
                     return
-                if result.get("interrupted") or (interruption != self._interruption_generation and not result.get("ok")):
+                # An unconfirmed submission cannot become replayable merely
+                # because a pause arrived while its response was outstanding.
+                interrupted = result.get("interrupted") or (
+                    interruption != self._interruption_generation and not result.get("ok")
+                )
+                if interrupted and not result.get("fatal"):
                     self.attempt = max(0, self.attempt - 1)
                     self.log.append({"step": step.describe(), "ok": False, "cancelled": True,
                                      "summary": "用户暂停，恢复后继续", "at": time.time(), "attempt": self.attempt})
@@ -479,12 +484,14 @@ class GoalManager:
         try:
             started = await self._call("skill.run", payload)
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "fatal": bool(payload.get("resume_task_id")), "reason": f"提交技能失败：{exc}"}
+            # A lost response does not prove that the engine rejected the action.
+            # Replaying the step could queue another full batch behind the first.
+            return {"ok": False, "fatal": True, "reason": f"提交技能结果未确认，未重复提交：{exc}"}
 
         task_id = (started or {}).get("task_id")
         self.current_task_id = task_id
         if not task_id:
-            return {"ok": False, "reason": "引擎没有返回 task_id"}
+            return {"ok": False, "fatal": True, "reason": "引擎没有返回 task_id，未重复提交技能"}
         if self._interruption_generation != interruption or self.status == GOAL_PAUSED:
             self._resume_task_id = task_id
             await self._safe_cancel_current()
@@ -493,6 +500,7 @@ class GoalManager:
         # 轮询直到结束。技能可能跑几分钟，所以轮询间隔逐渐拉长。
         interval = 1.5
         waited = 0.0
+        status_errors = 0
         while True:
             if self._cancel_requested:
                 await self._safe_cancel_current()
@@ -507,7 +515,14 @@ class GoalManager:
             try:
                 st = await self._call("task.status", {"task_id": task_id})
             except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "reason": f"查询任务状态失败：{exc}"}
+                status_errors += 1
+                if status_errors >= 3 or waited > 900:
+                    await self._safe_cancel_current()
+                    return {"ok": False, "fatal": True, "reason": f"连续查询任务状态失败，已请求停止且未重复提交：{exc}"}
+                logger.warning("目标任务 %s 状态暂时不可读，继续核对原任务：%s", task_id, exc)
+                continue
+
+            status_errors = 0
 
             status = (st or {}).get("status")
             if status in ("done", "failed", "cancelled"):
@@ -524,7 +539,7 @@ class GoalManager:
 
             if waited > 900:  # 单步上限 15 分钟
                 await self._safe_cancel_current()
-                return {"ok": False, "reason": "单步执行超过 15 分钟，已中止"}
+                return {"ok": False, "fatal": True, "reason": "单步执行超过 15 分钟，已请求停止且未重复提交"}
 
     async def _safe_cancel_current(self) -> None:
         task_id = self.current_task_id
@@ -593,7 +608,10 @@ class GoalManager:
             if skill not in known:
                 logger.warning("LLM 规划里出现未知技能，不能执行不完整计划：%s", skill)
                 return None
-            params = item.get("params") if isinstance(item.get("params"), dict) else {}
+            params = item.get("params", {})
+            if not isinstance(params, dict):
+                logger.warning("LLM 规划的技能参数不是对象，不能用默认参数替代：%s", skill)
+                return None
             steps.append(
                 GoalStep(
                     skill=skill,

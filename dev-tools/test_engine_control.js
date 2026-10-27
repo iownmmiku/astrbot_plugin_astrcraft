@@ -223,6 +223,192 @@ test('shield activation propagates an independent cancellation object unchanged'
   await assert.rejects(actions.raiseShield({ holdMs: 300 }), (error) => error === cancelled);
 });
 
+function combatTargetFixture(ranged = false) {
+  const bot = fakeBot();
+  const target = { id: 7, name: 'cow', position: vec3(ranged ? 10 : 2, 1, 0), height: 1.4 };
+  const sword = { name: 'iron_sword', count: 1, slot: 36 };
+  const bow = { name: 'bow', count: 1, slot: 10 };
+  bot.entities = { 7: target };
+  bot.inventory.items = () => [sword, bow, { name: 'arrow', count: 12, slot: 11 }];
+  bot.heldItem = sword;
+  bot.equip = async (item) => { bot.heldItem = { ...item, slot: 36 }; };
+  const attacks = [];
+  const shots = [];
+  bot.attack = (entity) => attacks.push(entity.id);
+  bot.activateItem = () => shots.push('draw');
+  bot.deactivateItem = () => shots.push('release');
+  const actions = new Actions({ bot, config, navigator: { stop() {} } });
+  return { bot, actions, target, attacks, shots };
+}
+
+test('melee target leaving tracking during equipment is not reported as killed', async () => {
+  const { bot, actions, attacks } = combatTargetFixture();
+  bot.heldItem = null;
+  bot.equip = async (item) => { bot.heldItem = item; delete bot.entities[7]; };
+  const result = await actions.attack({ target: 7, maxAttacks: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.killed, false);
+  assert.equal(result.target_lost, true);
+  assert.deepEqual(attacks, []);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('melee confirms a target death even while its death animation remains tracked', async () => {
+  const { bot, actions, target, attacks } = combatTargetFixture();
+  bot.attack = (entity) => { attacks.push(entity.id); bot.emit('entityDead', target); };
+  const result = await actions.attack({ target: 7, maxAttacks: 1 });
+  assert.equal(result.ok, true);
+  assert.equal(result.killed, true);
+  assert.deepEqual(attacks, [7]);
+  assert.equal(bot.entities[7], target, 'death animation can remain in the entity registry');
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('a different same-name entity dying cannot complete melee combat', async () => {
+  const { bot, actions, attacks } = combatTargetFixture();
+  bot.attack = (entity) => { attacks.push(entity.id); bot.emit('entityDead', { id: 8, name: 'cow' }); };
+  const result = await actions.attack({ target: 7, maxAttacks: 1 });
+  assert.equal(result.ok, false);
+  assert.notEqual(result.killed, true);
+  assert.deepEqual(attacks, [7]);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('ranged target leaving tracking during equipment is not reported as killed', async () => {
+  const { bot, actions, shots } = combatTargetFixture(true);
+  bot.equip = async (item) => { bot.heldItem = item; delete bot.entities[7]; };
+  const result = await actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.killed, false);
+  assert.equal(result.target_lost, true);
+  assert.deepEqual(shots, []);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('ranged kill confirmation belongs to the selected entity and ignores a live same-name peer', async () => {
+  const { bot, actions, target } = combatTargetFixture(true);
+  bot.entities[8] = { id: 8, name: 'cow', position: vec3(12, 1, 0) };
+  bot.deactivateItem = () => bot.emit('entityDead', target);
+  const result = await actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1 });
+  assert.equal(result.ok, true);
+  assert.equal(result.killed, true);
+  assert.equal(result.shots, 1);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('ranged target removal without death evidence cannot report a kill', async () => {
+  const { bot, actions } = combatTargetFixture(true);
+  bot.deactivateItem = () => { delete bot.entities[7]; };
+  const result = await actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.killed, false);
+  assert.equal(result.target_lost, true);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('ranged charge cancellation retains its cancellation type and removes death listeners', async () => {
+  const { bot, actions } = combatTargetFixture(true);
+  const controller = new AbortController();
+  bot.activateItem = () => { controller.abort(); };
+  await assert.rejects(actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 300,
+    signal: controller.signal }), CancelledError);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('ranged aiming cancellation cannot be swallowed and fire a shot', async () => {
+  const { bot, actions, shots } = combatTargetFixture(true);
+  const cancelled = new CancelledError('targeting superseded');
+  bot.lookAt = async () => { throw cancelled; };
+  await assert.rejects(actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1 }),
+    (error) => error === cancelled);
+  assert.deepEqual(shots, []);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('melee aiming cancellation cannot be swallowed and attack anyway', async () => {
+  const { bot, actions, attacks } = combatTargetFixture();
+  const cancelled = new CancelledError('aim superseded');
+  bot.lookAt = async () => { throw cancelled; };
+  await assert.rejects(actions.attack({ target: 7, maxAttacks: 1 }), (error) => error === cancelled);
+  assert.deepEqual(attacks, []);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('melee attack cancellation cannot be swallowed and retried', async () => {
+  const { bot, actions } = combatTargetFixture();
+  const cancelled = new CancelledError('attack superseded');
+  let attempts = 0;
+  bot.attack = () => { if (++attempts === 1) throw cancelled; };
+  await assert.rejects(actions.attack({ target: 7, maxAttacks: 1 }), (error) => error === cancelled);
+  assert.equal(attempts, 1);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('melee footwork cancellation cannot be swallowed after swinging', async () => {
+  const { bot, actions, attacks } = combatTargetFixture();
+  const cancelled = new CancelledError('footwork superseded');
+  bot.setControlState = () => { throw cancelled; };
+  await assert.rejects(actions.attack({ target: 7, maxAttacks: 2 }), (error) => error === cancelled);
+  assert.deepEqual(attacks, [7, 7]);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('cancelling melee footwork releases its held strafe key', async () => {
+  const { bot, actions } = combatTargetFixture();
+  const controller = new AbortController();
+  bot.setControlState = (key, value) => { bot.controls[key] = value; if (value) controller.abort(); };
+  await assert.rejects(actions.attack({ target: 7, maxAttacks: 2, signal: controller.signal }), CancelledError);
+  assert.ok(Object.values(bot.controls).every((value) => value === false));
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+test('old melee footwork cleanup cannot clear the new owners control', async () => {
+  const { bot, actions } = combatTargetFixture();
+  const controller = new AbortController();
+  let heldSide;
+  bot.setControlState = (key, value) => {
+    bot.controls[key] = value;
+    if (value) {
+      heldSide = key;
+      actions.stopCurrent();
+      bot.controls[key] = true; // New owner's movement after stopCurrent cleared the old body.
+      controller.abort();
+    }
+  };
+  await assert.rejects(actions.attack({ target: 7, maxAttacks: 2, signal: controller.signal }), CancelledError);
+  assert.equal(bot.controls[heldSide], true);
+  assert.equal(bot.listenerCount('entityDead'), 0);
+});
+
+for (const ranged of [false, true]) {
+  test(`${ranged ? 'ranged' : 'melee'} equipment cannot continue combat after the body changes`, async () => {
+    const { bot, actions, attacks, shots } = combatTargetFixture(ranged);
+    bot.heldItem = null;
+    bot.equip = async (item) => { bot.heldItem = item; bot.entity = { ...bot.entity }; };
+    const run = ranged ? actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1 }) :
+      actions.attack({ target: 7, maxAttacks: 1 });
+    await assert.rejects(run, CancelledError);
+    assert.deepEqual(attacks, []);
+    assert.deepEqual(shots, []);
+    assert.equal(bot.listenerCount('entityDead'), 0);
+  });
+
+  test(`${ranged ? 'ranged' : 'melee'} resolved aiming cannot act after its explicit signal aborts`, async () => {
+    const { bot, actions, attacks, shots } = combatTargetFixture(ranged);
+    const controller = new AbortController();
+    // Resolve normally after aborting, so only the action's explicit-signal
+    // contract and real native-method guards can prevent the next side effect.
+    bot.lookAt = async () => { controller.abort(); };
+    const run = ranged ? actions.attackRanged({ target: 7, maxShots: 1, chargeMs: 1,
+      signal: controller.signal }) : actions.attack({ target: 7, maxAttacks: 1,
+      signal: controller.signal });
+    await assert.rejects(run, CancelledError);
+    assert.deepEqual(attacks, []);
+    assert.deepEqual(shots, []);
+    assert.equal(bot.listenerCount('entityDead'), 0);
+  });
+}
+
 function protectedDigFixture() {
   const bot = fakeBot();
   bot.game = { dimension: 'overworld' };

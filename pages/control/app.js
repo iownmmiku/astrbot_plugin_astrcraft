@@ -2,7 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const names = {overview:["世界总览","看看她在哪里，正在想什么，又准备去做什么。"],tasks:["行动与目标","了解她的计划，也可以一起决定下一步。"],inventory:["随身背包","走过的路，采集的物资，都装在这里。"],events:["世界记录","那些聊天、发现与行动，组成她的日常。"]};
 const statuses = {running:"进行中",done:"已完成",failed:"失败",cancelled:"已中断",paused:"已暂停",idle:"待命",abandoned:"已放弃",queued:"排队中"};
-const actions = {connect:"进服",disconnect:"退服",stop:"急停",resume:"继续",pause:"暂停",abandon:"放弃目标",goal:"指派目标",say:"游戏发言",viewer:"开启观战"};
+const actions = {connect:"进服",disconnect:"退服",stop:"急停",resume:"继续",pause:"暂停自主行动",abandon:"放弃目标",goal:"指派目标",say:"游戏发言",viewer:"开启观战"};
 const dimensions = {overworld:"主世界","minecraft:overworld":"主世界",the_nether:"下界",nether:"下界","minecraft:the_nether":"下界",the_end:"末地",end:"末地","minecraft:the_end":"末地"};
 const bridge = window.AstrBotPluginPage || null;
 let token = "", state = null, timer = null, toastTimer = null, polling = false;

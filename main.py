@@ -49,7 +49,7 @@ from .webui_server import WebUI
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
-PLUGIN_VERSION = "1.3.3"
+PLUGIN_VERSION = "1.3.4"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
@@ -74,7 +74,7 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
 给她派活（也可以，但不是必须）
   /mc目标 <要做什么>   交代一件事，例如：/mc目标 挖 10 个铁矿
   /mc进度              查看目标进度
-  /mc暂停 /mc继续      暂停或继续当前目标
+  /mc暂停 /mc继续      暂停或继续目标与自主行动
   /mc放弃              放弃当前目标
 
 其它
@@ -574,18 +574,23 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             invalidate()
         return self._player_goal_revision
 
+    def _check_control_revision(self, revision: int) -> None:
+        if revision != getattr(self, "_player_goal_revision", 0):
+            raise EngineError("控制请求已被较新的指令取代")
+
     async def _emergency_stop(self) -> dict:
         """命令与工具共享急停状态，先收回自主权，再取消引擎动作。"""
         self._emergency_stopped = True
-        self._invalidate_player_goal()
+        revision = self._invalidate_player_goal()
         if self.life:
             self.life.pause(reason="急停", max_seconds=0)
         running = bool(self.engine and self.engine.running)
         try:
             result = await self.engine.safety_stop() if running else {"cancelled": []}
         finally:
-            if self.goals:
+            if self.goals and revision == getattr(self, "_player_goal_revision", 0):
                 await self.goals.pause()
+        self._check_control_revision(revision)
         return {**(result or {}), "engine_running": running}
 
     async def _start_player_goal(self, goal: str) -> str:
@@ -2260,33 +2265,40 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         try:
             yield event.plain_result(await self._pause_play())
         except Exception as exc:
-            yield event.plain_result(f"暂停动作失败，自主行动保持暂停：{exc}")
+            yield event.plain_result(f"暂停请求未完成：{exc}")
 
     async def _pause_play(self) -> str:
         self._owner_paused = True
-        self._invalidate_player_goal()
+        revision = self._invalidate_player_goal()
         if self.life:
             self.life.pause(reason="用户暂停", max_seconds=0)
         msg = await self.goals.pause() if self.goals else ""
+        self._check_control_revision(revision)
         if self.engine and self.engine.running:
             await self.engine.call("task.cancel", {}, timeout=10.0)
+        self._check_control_revision(revision)
         return msg if self.goals and self.goals.active else "自主行动已暂停，发送 /mc继续 恢复"
 
     async def _resume_play(self) -> str:
         """Shared recovery path for chat and WebUI; failed recovery stays stopped."""
+        revision = self._invalidate_player_goal()
         try:
             if self.engine and self.engine.running:
                 await self.engine.call("safety.resume", {}, timeout=10.0)
+            self._check_control_revision(revision)
             self._emergency_stopped = False
             self._owner_paused = False
             msg = await self.goals.resume() if self.goals else ""
-            if self.life and not (self.goals and self.goals.active):
+            self._check_control_revision(revision)
+            if self.life and self._can_resume_autonomy():
                 self.life.resume()
                 self.life.retry_decision_now()
                 self.life.wake(reason="用户继续自主游玩")
                 msg = "已恢复自主游玩"
             return msg or "已解除急停"
         except Exception:
+            # An old failure cannot undo a newer successful control request.
+            self._check_control_revision(revision)
             self._emergency_stopped = True
             if self.life:
                 self.life.pause(reason="恢复失败", max_seconds=0)
@@ -2304,7 +2316,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         try:
             yield event.plain_result(await self._resume_play())
         except Exception as exc:  # noqa: BLE001
-            yield event.plain_result(f"恢复失败，仍保持暂停：{exc}")
+            yield event.plain_result(f"恢复请求未完成：{exc}")
 
     @filter.command("mc放弃", alias={"mcabandon"})
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2313,8 +2325,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         yield event.plain_result(await self._abandon_goal())
 
     async def _abandon_goal(self) -> str:
-        self._invalidate_player_goal()
+        revision = self._invalidate_player_goal()
         msg = await self.goals.abandon() if self.goals else "目标系统未初始化"
+        self._check_control_revision(revision)
         self._owner_paused = False
         # 任务结束了 → 让她继续过自己的日子
         if self.life and self._can_resume_autonomy():
