@@ -266,9 +266,13 @@ class McSkillTools:
         yield await self._submit_skill(event, "blueprint", params, f"照图纸建造「{name}」")
 
     @filter.llm_tool(name="mc_store_items")
-    async def tool_mc_store_items(self, event: AstrMessageEvent) -> MessageEventResult:
-        """让机器人把背包里的东西存进箱子（附近没有箱子就自己做一个放下来）。"""
-        return await self._submit_skill(event, "store_items", {}, "把物资存进箱子")
+    async def tool_mc_store_items(self, event: AstrMessageEvent, profile: str = "nearby") -> MessageEventResult:
+        """按下次工作的携带预算保留物资，把余量存进箱子。
+
+        Args:
+            profile(string): nearby 近处工作、travel 远行、mining 采矿，默认 nearby
+        """
+        return await self._submit_skill(event, "store_items", {"profile": profile}, "按携带预算存入多余物资")
 
     @filter.llm_tool(name="mc_cook_food")
     async def tool_mc_cook_food(
@@ -405,9 +409,43 @@ class McSkillTools:
         )
 
     @filter.llm_tool(name="mc_supply")
-    async def tool_mc_supply(self, event: AstrMessageEvent) -> MessageEventResult:
-        """让机器人做一次生存补给：准备食物 + 补齐工具 + 做火把。适合出远门前用。"""
-        return await self._submit_skill(event, "food_chain", {}, "做一次生存补给")
+    async def tool_mc_supply(self, event: AstrMessageEvent, profile: str = "nearby") -> MessageEventResult:
+        """按工作类型准备食物、可用镐和火把；未补齐会如实报告。
+
+        Args:
+            profile(string): nearby 近处工作（4份食物/4火把）、travel 远行（8/8）、mining 采矿（8/16）
+        """
+        return await self._submit_skill(event, "food_chain", {"profile": profile}, "按任务预算做一次生存补给")
+
+    @filter.llm_tool(name="mc_explore_nearby")
+    async def tool_mc_explore_nearby(self, event: AstrMessageEvent, radius: int = 24) -> MessageEventResult:
+        """在当前世界基地附近做一次有限探索，不挖路或搭桥，实际抵达后结束。
+
+        Args:
+            radius(number): 以基地为中心的探索半径，8 到 32 格，默认 24
+        """
+        state = await self._life_state_snapshot()
+        home = state.get("home")
+        if not home:
+            return event.plain_result("当前世界没有已登记基地，暂不安排基地周边探索。")
+        return await self._submit_skill(event, "explore_nearby", {"home": home, "radius": int(radius)}, "探索基地附近")
+
+    @filter.llm_tool(name="mc_tend_farm")
+    async def tool_mc_tend_farm(self, event: AstrMessageEvent, plots: int = 4) -> MessageEventResult:
+        """照料当前基地附近的小麦田：天然水源旁耕地播种，成熟后收割并补种。
+
+        需要当前世界的基地记录；最多 8 格，只使用近处种子或草和现成制锄材料，不引水或站着等待生长。
+
+        Args:
+            plots(number): 要维护的小麦田格数，默认 4，范围 1 到 8
+        """
+        state = await self._life_state_snapshot()
+        home = state.get("home")
+        if not home:
+            return event.plain_result("当前世界没有已登记基地，先建立基地再安排农田。")
+        return await self._submit_skill(event, "tend_farm", {
+            "home": home, "farm": home.get("farm"), "plots": int(plots),
+        }, f"照料基地附近 {plots} 格小麦田")
 
     # ============================================================ 任务查询
 

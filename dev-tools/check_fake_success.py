@@ -51,7 +51,9 @@ KEEP = 92
 # (规则, 文件名, 块内须含子串, 块内须不含子串或空) → 复核理由
 # 「块」= 命中行 + 其后 3 行（多行 skillResult 的 note/param 都在这个范围里）
 EXEMPT: dict[tuple[str, str, str, str], str] = {
-    # ============ 规则 A：动作返回值没人接（3 条，都是「故意不接、用状态判」的正例） ============
+    # ============ 规则 A：动作返回值没人接，复核实际状态判据 ============
+    ("A", "farming.js", "item: 'wooden_hoe', count: 1", ""):
+        "ensureHoe 先检查实际库存无锄头，合成后重新以 HOES.find(countItem) 查库存；未获得锄头即抛错。播种前另核验 heldItem、土壤和服务端方块，不能以 craft 返回或任务结束冒充完成",
     ("A", "building.js", "item: 'chest', count: 1", ""):
         "下一行 chestCount=countItem('chest') 验产出、steps.ok=chestCount>0 —— 判据是实际状态，故意不接返回值",
     ("A", "building.js", "_bed`", ""):
@@ -60,6 +62,8 @@ EXEMPT: dict[tuple[str, str, str, str], str] = {
         "本分支先确认背包无工作台，合成后用实际 countItem('crafting_table')>0 验产出，随后 _ensureCraftingTable 核验放置。test_smelt_control 覆盖不产出及放台失败，Paper collection 验证实际台炉铁锭链",
 
     # ============ 规则 B：skillResult(true) ============
+    ("B", "exploration.js", "已实际到达基地附近的新安全落点", ""):
+        "导航返回后 check 再核验身体/世界、日间、生命饥饿和危险；实际位置离目标超过1.5格或当前脚下不安全立即返回false。test_exploration 验证假到达、未加载落点、危险变化和导航取消，true仅表示实际抵达",
     ("B", "building.js", "home_status: status, slept, sleep_result: sleepResult, waited_ms: waitedMs", ""):
         "returnHome 末次 inspectHome 后先以 !status.safe 返回失败；safe 要求真实人在完整房内、门关闭且无室内敌人/水火危险。导航假到达、未确认关门、休息中屋顶被拆均不能到达 true；test_home_control 验证这些失败分支，slept/waited_ms 如实描述可选休息结果",
     ("B", "building.js", "已从基地实际出门并确认门已关闭，可以继续工作", ""):

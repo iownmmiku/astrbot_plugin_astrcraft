@@ -15,6 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+from .runtime_status import waiting_status
 
 
 class ApiError(Exception):
@@ -270,6 +271,7 @@ class WebUI:
                                "username": p._cfg("bot_username", "AstrBot")},
                     "life": {"running": life.running, "paused": life.paused,
                              "hold": life.current_hold().value, "hold_reason": life.hold_explain(),
+                             "waiting": waiting_status(life, emergency=p._emergency_stopped),
                              "intention": life._intention, "activity": current.activity if current else "",
                              "reason": current.reason if current else "", "summary": life.describe(),
                              "plan": [{"skill": step.get("skill"), "why": step.get("why", "")} for step in life._plan],
@@ -280,6 +282,8 @@ class WebUI:
                              "log": goals.log[-10:]} if goals else None,
                     "events": p._event_buffer[-40:],
                     "usage": ledger().snapshot(),
+                    "flow": p._runtime_metrics().snapshot() if callable(getattr(p, "_runtime_metrics", None)) else None,
+                    "supplies": getattr(life, "_supply_budget_status", None) if life else None,
                     "jobs": list(self.jobs.values())}
 
     async def _read_engine(self):

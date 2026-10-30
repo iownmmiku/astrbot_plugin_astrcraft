@@ -39,6 +39,8 @@ class McEngine {
       onTaskAborted: () => this._stopBody(),
       onTaskStarted: (task) => {
         this.state.setCurrentTaskText(`${task.name}${task._detail() ? `（${task._detail()}）` : ''}`);
+        this._emit('task.started', { task_id: task.id, name: task.name, kind: task.kind,
+          status: task.status, meta: task.meta, started_at: task.startedAt });
       },
     });
     this._reflexTimer = null;

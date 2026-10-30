@@ -20,11 +20,20 @@ const mining = require('./mining');
 const building = require('./building');
 const gathering = require('./gathering');
 const supply = require('./supply');
+const farming = require('./farming');
+const exploration = require('./exploration');
 const blueprint = require('./blueprint');
 const traverse = require('./traverse');
 const { delay, CancelledError, describeFailure } = require('../util');
 const { MissingItemError } = require('../actions');
 const log = require('../log');
+const { budgetFor } = require('../supply_budget');
+
+function supplyProfile(params) {
+  const profile = params.profile ?? 'nearby';
+  if (!['nearby', 'travel', 'mining'].includes(profile)) throw new Error('profile 必须是 nearby、travel 或 mining');
+  return profile;
+}
 
 /** 参数校验小工具 */
 function requireParam(params, name, { type = 'number', min = null, max = null, def = null } = {}) {
@@ -464,7 +473,7 @@ const SKILLS = {
   store_items: {
     label: '存东西',
     description: '把背包里的东西存进箱子；给 home 时先回当前世界128格内的完整基地、进屋关门后使用屋内真实箱子，resume_work=true 时再安全出门关门继续工作；否则寻找附近或记忆容器（没有箱子就做一个）',
-    params: { items: { type: 'array', def: null }, keep: { type: 'array', def: null }, home: { type: 'object', def: null }, resume_work: { type: 'boolean', def: false } },
+    params: { items: { type: 'array', def: null }, keep: { type: 'array', def: null }, home: { type: 'object', def: null }, resume_work: { type: 'boolean', def: false }, profile: { type: 'string', def: 'nearby' } },
     async run({ actions, nav, state, ctx, config, params }) {
       return gathering.storeItems({
         actions,
@@ -474,6 +483,7 @@ const SKILLS = {
         config,
         home: params.home ?? null,
         resumeWork: params.resume_work === true,
+        profile: supplyProfile(params),
         items: params.items ? requireParam(params, 'items', { type: 'array' }) : null,
         keep: params.keep ? requireParam(params, 'keep', { type: 'array' }) : null,
       });
@@ -555,37 +565,61 @@ const SKILLS = {
     },
   },
 
+  tend_farm: {
+    label: '照料基地小麦田',
+    description: '在当前主世界基地24格内已有天然水源旁建立1到8格小麦田；有限打草取种、用现成木料制锄、核验耕地播种，成熟时收割并补种；不引水、不等待作物生长，不动基地结构',
+    params: { home: { type: 'object', required: true }, farm: { type: 'object', def: null }, plots: { type: 'number', min: 1, max: 8, def: 4 } },
+    async run({ actions, nav, state, ctx, config, params }) {
+      return farming.tendFarm({ actions, nav, state, ctx, config,
+        home: requireParam(params, 'home', { type: 'object' }), farm: params.farm ?? params.home?.farm ?? null,
+        plots: requireParam(params, 'plots', { min: 1, max: 8, def: 4 }) });
+    },
+  },
+
+  explore_nearby: {
+    label: '基地附近探索',
+    description: '在当前世界完整基地周围8到32格内选择已加载安全落点进行一次有限探索；不挖路或搭桥，夜晚/饥饿/遇敌停止，不重复刚尝试过的落点，核验实际抵达',
+    params: { home: { type: 'object', required: true }, radius: { type: 'number', min: 8, max: 32, def: 24 } },
+    async run({ actions, nav, state, ctx, config, params }) {
+      return exploration.exploreNearby({ actions, nav, state, ctx, config,
+        home: requireParam(params, 'home', { type: 'object' }),
+        radius: requireParam(params, 'radius', { min: 8, max: 32, def: 24 }) });
+    },
+  },
+
   food_chain: {
     label: '生存补给',
-    description: '离开基地前准备至少4份现成食物、一把可用镐和4根火把；优先现有材料，只补缺少的镐，缺料或部分产出如实报告',
-    params: {},
-    async run({ actions, nav, state, ctx }) {
+    description: '按nearby近处、travel远行或mining采矿预算补齐现成食物、可用镐和火把；默认4食物4火把，远行8/8，采矿8/16；缺料或部分产出如实报告',
+    params: { profile: { type: 'string', def: 'nearby' } },
+    async run({ actions, nav, state, ctx, params = {} }) {
       ctx.checkAborted();
+      const profile = supplyProfile(params), budget = budgetFor(profile);
+      const foodTarget = budget.food_target, torchTarget = budget.torch_target;
       const steps = [];
       const before = actions.inventoryMap();
       const child = (stage) => typeof ctx.child === 'function' ? ctx.child(['food_chain', stage]) : ctx;
       const foodReady = () => gathering.READY_FOOD.reduce((sum, name) => sum + actions.countItem(name), 0);
       const finish = (failure = null, dependency = null) => {
         const food = foodReady(), pick = mining.bestPickaxeTier(actions), torches = actions.countItem('torch');
-        const missing = [...(food < 4 ? ['food'] : []), ...(!pick ? ['pickaxe'] : []), ...(torches < 4 ? ['torch'] : [])];
+        const missing = [...(food < foodTarget ? ['food'] : []), ...(!pick ? ['pickaxe'] : []), ...(torches < torchTarget ? ['torch'] : [])];
         const after = actions.inventoryMap();
         const ok = !failure && missing.length === 0;
         return skillResult(ok, { steps, produced: positiveOnly(wood.diffOf(before, after)),
           consumed: positiveOnly(wood.diffOf(after, before)),
-          note: `${ok ? '补给已备好' : '补给尚未齐全'}：食物 ${food}/4 份，镐 ${pick || '无'}，火把 ${torches}/4 根`,
+          note: `${ok ? '补给已备好' : '补给尚未齐全'}：食物 ${food}/${foodTarget} 份，镐 ${pick || '无'}，火把 ${torches}/${torchTarget} 根`,
           reason: ok ? null : failure || `还缺 ${missing.join('、')}，补齐后再继续原任务`,
-          extra: { food_ready: food, pickaxe_tier: pick, torch_count: torches, missing,
+          extra: { food_ready: food, pickaxe_tier: pick, torch_count: torches, missing, profile, budget,
             // A nested food/tool dependency may have gathered furnace material
             // without returning safely. The outer result must let LifeLoop
             // rescue that body before it can resume any dependent work.
             ...(dependency?.return_status ? { return_status: dependency.return_status, collection_ok: ok,
               material_collection_ok: dependency.material_collection_ok === true || dependency.collection_ok === true } : {}) } });
       };
-      const food = await gathering.cookFood({ actions, nav, state, ctx: child('food'), count: 4 });
+      const food = await gathering.cookFood({ actions, nav, state, ctx: child('food'), count: foodTarget });
       ctx.checkAborted();
       steps.push(...food.steps);
-      if (!food.ok || foodReady() < 4 || food.return_status?.ok === false) {
-        return finish(food.reason || food.return_status?.reason || '食物还不足 4 份，先补齐食物再准备工具', food);
+      if (!food.ok || foodReady() < foodTarget || food.return_status?.ok === false) {
+        return finish(food.reason || food.return_status?.reason || `食物还不足 ${foodTarget} 份，先补齐食物再准备工具`, food);
       }
       if (!mining.bestPickaxeTier(actions)) {
         const tier = actions.countItem('cobblestone') >= 3 ? 'stone' : 'wooden';
@@ -596,10 +630,10 @@ const SKILLS = {
           return finish(tools.reason || tools.return_status?.reason || '没有做出可用的镐', tools);
         }
       }
-      if (actions.countItem('torch') < 4) {
+      if (actions.countItem('torch') < torchTarget) {
         if (actions.countItem('coal') + actions.countItem('charcoal') <= 0) return finish('还缺火把与煤或木炭燃料，现有食物和镐已保留');
         try {
-          const deficit = 4 - actions.countItem('torch');
+          const deficit = torchTarget - actions.countItem('torch');
           const sticksNeeded = Math.ceil(deficit / 4);
           if (actions.countItem('stick') < sticksNeeded) {
             const sticks = await wood.makeSticks({ actions, nav, state, ctx: child('torch_sticks'),
@@ -610,7 +644,7 @@ const SKILLS = {
           }
           const torchResult = await actions.craft({ item: 'torch', count: deficit, signal: ctx.signal });
           ctx.checkAborted();
-          if (!torchResult.ok || actions.countItem('torch') < 4) return finish(torchResult.note || '服务端未确认足够的火把');
+          if (!torchResult.ok || actions.countItem('torch') < torchTarget) return finish(torchResult.note || '服务端未确认足够的火把');
           steps.push('合成并确认火把');
         } catch (err) {
           ctx.checkAborted();

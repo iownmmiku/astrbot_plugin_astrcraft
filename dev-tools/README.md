@@ -58,6 +58,18 @@ python dev-tools/run_all.py -v         # 看完整输出
 
 ## 怎么用
 
+Windows 上可从仓库根目录安装引擎依赖：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File dev-tools/install.ps1
+```
+
+脚本检查 Node.js 22+ 与完整锁文件，然后在 `engine/` 执行 `npm.cmd ci`，
+缓存放在项目内 `_npm_cache/`。它只安装引擎依赖，不复制插件或修改 AstrBot 数据。
+其他平台在 `engine/` 执行 `npm ci`。
+`python dev-tools/test_install.py` 在临时目录用假的 Node/npm 执行安装流程，
+检查版本拒绝、锁定安装、路径与失败回报；不会联网或实际安装依赖。
+
 大部分需要一台测试服务器（默认 `127.0.0.1:25566`，RCON `25576`）：
 
 ```bash
@@ -113,7 +125,7 @@ python dev-tools/test_goal_resume_live.py --collect # 总库存目标 13 煤，�
 必须使用独立、自然生成的 `online-mode=false` 测试世界；默认运行 60 分钟。
 脚本使用全新随机离线玩家，要求生存模式、空背包；不改地形、昼夜或难度，不赠送补给。
 RCON 只查询 `doDaylightCycle`、`naturalRegeneration`、`doMobSpawning`、`keepInventory`
-与难度；要求前三项开启、死亡掉物品、难度非和平，不满足时终止评测。
+与难度，并通过只读 `seed` 查询生成种子指纹（不保存原始种子）；要求前三项开启、死亡掉物品、难度非和平，不满足时终止评测。
 首次核验前保持引擎急停并关闭自主循环，生存模式、存活身体与空背包核验通过后才启动。
 重新进服、死亡、重生、换维度和引擎断开沿用当前插件的生产生命周期方法，
 避免评测遗漏恢复事件而把正常的重新进服误判成永久停滞；初始化失败或取消同样关闭子进程。
@@ -126,6 +138,7 @@ $env:ASTRCRAFT_EVAL_API_KEY='<环境中的 API 密钥>'
 $env:ASTRCRAFT_EVAL_RCON_PASSWORD='<专用测试服 RCON 密码>'
 python dev-tools/survival_eval.py --test-host 127.0.0.1 --test-port 25566 --rcon-port 25576 --minutes 60
 python dev-tools/test_survival_eval.py  # 汇总规则、生命周期和失败清理离线验证，不连接服务器/模型
+python dev-tools/test_survival_acceptance.py  # 验收与多种子报告汇总离线验证
 ```
 
 实际运行请使用安装 AstrBot 的 Python。服务器地址和端口没有默认值，
@@ -140,6 +153,57 @@ python dev-tools/test_survival_eval.py  # 汇总规则、生命周期和失败�
 漏读与断线期间不推断饥饿时长；provider 未报告 Token 显示未知，累计数只含已报告部分。
 `completed` 表示测量运行结束，不表示生存能力通过。任何中断/失败都会保留汇总并清理子进程。
 Python 与引擎的数据使用临时目录，评测结束删除，不覆盖插件的生产记忆或家园。
+
+#### 有界基础生存验收
+
+报告另有 `acceptance.status`：`passed`（达到这份基准）、`failed`（观察到不满足的条件）、
+`inconclusive`（证据不足）。默认不改变旧的进程退出语义；加 `--require-pass` 后，
+验收通过返回 0，失败返回 1，证据不足返回 2。普通测量结束返回 0 不能作为通过标记。
+
+基础档是可调整的初始目标，不是已有的实服成绩：
+
+| 条件 | 默认值 |
+|---|---|
+| 有效连接观测 | 至少 1800 秒，覆盖请求时长的 90% |
+| 饱食度数据覆盖 | 有效连接观测的 90% |
+| 昼夜 | 连续观测到两次主世界“白天 → 夜晚 → 白天”；断线、漏读与换维度不跨段推断 |
+| 死亡、挨饿至零、人工干预 | 均为 0 |
+| 饥饿时间占比 | 饱食度 ≤ 6 的时间不超过 10% |
+| 连续同技能第三次起的失败次数 | 不超过 5 |
+| 技能提交衔接间隔 P95 | 至少 5 个样本，P95 不超过 20 秒；从技能结束到后继提交，包含模型思考与正常等待，不含提交后的排队时间 |
+| 实物里程碑 | 观察到石镐或更高采掘等级的镐、真实已加载且验收安全的住所 |
+| 普通食物净增长 | 最终随身食物比初始多至少 4 份；不计应急金苹果，不等同于基地总库存或农田可持续产量 |
+
+必须传 `--natural-world` 声明使用专用自然生成世界，并在运行前准备空的人工记录文件，
+通过 `--interventions` 持续记录干预；缺少声明、读不到种子、记录缺失/读取失败或末尾库存过期，
+不会获得完整通过结论。自然生成与完整记录依赖操作者如实声明，脚本不会假装能证明没有任何服外干预。
+文件被截短或历史行被改写会记为异常干预证据。已知死亡、救援等仍可在观察不足时判失败，
+但短时测量未造房、未获得工具等成长条件只判证据不足。
+
+可用 `--acceptance-profile <JSON文件>` 覆盖阈值；未知字段、非法类型、负值和非有限数会被拒绝。
+例如 `{"minimum_observed_seconds":3600,"minimum_day_cycles":3,"minimum_food_gain":8}`。
+所有最终阈值随报告保存，不根据跑出的成绩自动放宽。
+报告中的 `runtime_flow` 另保留与控制台一致的生产读快照和连续计划实际开始事件计时；
+它与上述评测提交间隔的口径不同，不相互替代。评测同样订阅生产状态失效与农田记录事件，
+不会另走一套忽略背包变化或不保存田地的执行路径。
+
+#### 多种子重复与汇总
+
+每个专用测试世界由操作者事先准备；脚本不重建、不重置、不修改世界。
+建议至少三个不同自然种子各两轮，并逐轮使用不同 `--report` 文件；新一轮仍用空背包随机玩家，
+但同世界中前轮的建筑不会自动清除，严格比较应由操作者另备相同种子的独立自然世界。
+同一构建与模型配置保持一致；报告保存源码和模型配置指纹，不保存模型凭据。
+完成实际运行后，离线汇总已有报告：
+
+```powershell
+python dev-tools/survival_acceptance.py .testserver/seed-a-1.json .testserver/seed-a-2.json .testserver/seed-b-1.json .testserver/seed-b-2.json .testserver/seed-c-1.json .testserver/seed-c-2.json --output .testserver/survival-summary.json
+```
+
+汇总按当前基础档重新核验每轮数据；要统一使用其他阈值，传 `--profile <JSON文件>`。
+默认要求三种子、每种子两轮，可通过 `--minimum-seeds`、`--runs-per-seed` 调整。
+复制同一报告的 `run_id` 不算新轮数；缺少种子、混用源码/模型、轮数不足不能汇总通过。
+任何一轮失败都会保留在汇总中。汇总命令仅读取文件，退出码同样为通过 0、失败 1、证据不足 2。
+当前新增验收流程只完成离线测试，尚无这份基准下的真实模型多种子达标结果。
 
 如需人工救援、赠物、传送或输入指令，请追加 JSONL 人工记录并传入
 `--interventions <文件路径>`，每行例如 `{"kind":"rescue"}`；
@@ -157,7 +221,7 @@ Python 与引擎的数据使用临时目录，评测结束删除，不覆盖插�
 `MC_TEST_PORT=25566` 启用真实进服。再设置 `MC_TEST_DEATH=1` 可在项目测试服杀死测试机器人，
 验证重生解除死亡停牌、急停保持；插件数据使用临时目录隔离。
 
-> 这些脚本需要 `engine/node_modules`（在 `engine/` 里执行过 `npm install`）。
+> 这些脚本需要 `engine/node_modules`（在 `engine/` 里执行过 `npm ci`）。
 > 没装依赖时凡是 `require('mineflayer')` 的脚本都会报 `Cannot find module`——
 > 那是环境没装好，不是脚本坏了。
 

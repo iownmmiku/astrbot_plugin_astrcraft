@@ -569,6 +569,14 @@ rpc.handle('state.get', (params = {}) => {
   return engine.state.snapshot(detail);
 });
 
+rpc.handle('state.survival', wrap((params = {}) =>
+  require('./survival_snapshot').survivalSnapshot(engine, params.homes)));
+
+rpc.handle('farm.inspect', wrap(({ home, farm = null }) => {
+  engine.requireBot();
+  return require('./skills/farming').inspectFarm({ actions: engine.actions, config: engine.config, home, farm });
+}));
+
 rpc.handle('state.brief', (params = {}) => {
   const includeGoal = params.goal || null;
   return { text: engine.state.brief({ maxLength: params.max_length || 800, includeGoal }) };
@@ -1233,6 +1241,7 @@ log.info(`Minecraft 引擎已启动（pid=${process.pid}，node=${process.versio
 // 启动即上报一次能力清单，插件侧可以用于自检
 rpc.notify('engine.ready', {
   version: require('./package.json').version,
+  features: ['survival_snapshot_v1'],
   skills: skills.names(),
   pid: process.pid,
 });

@@ -127,7 +127,8 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
             return {"task_id": str(len(submitted))}
         loop._call = engine
         await S.SupplyResumeTests.run_until(self, loop, complete)
-        self.assertEqual([p["skill"] for p in submitted], ["resupply_food", "eat", "recover", "leave_home", "mine_stone"])
+        self.assertEqual([p["skill"] for p in submitted], ["resupply_food", "eat", "recover", "resupply_food", "leave_home", "mine_stone"])
+        self.assertEqual(submitted[3]['params']['count'], 8, 'after eating, replenish the mining reserve before departure')
         assert_protected_params(self, submitted[-1]["params"], plan[0]["params"])
         self.assertEqual(loop._rule_supply_stalls, {})
 
@@ -218,6 +219,7 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sleep_wait_then_dawn_exit_keeps_original_work(self):
         snapshot = state(food=20, inside=True)
+        snapshot['inventory']['bread'] = 4  # Door-only scenario: carry the minimum mining reserve.
         loop = self.make_loop(snapshot)
         loop._set_plan([{"skill": "mine_ores", "params": {"ore": "iron", "count": 5}}])
         snapshot["is_night"] = True
@@ -261,6 +263,7 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_exit_cannot_pop_outdoor_mining_behind_closed_door(self):
         snapshot = state(food=20, inside=True)
+        snapshot['inventory']['bread'] = 4
         loop = self.make_loop(snapshot)
         loop._set_plan([{"skill": "mine_stone", "params": {"count": 7}}])
         for _ in range(2): loop.note_task_result("leave_home", False, "door blocked")
@@ -269,6 +272,7 @@ class BaseFoodTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_two_noop_exit_successes_stop_instead_of_looping(self):
         snapshot = state(food=20, inside=True)
+        snapshot['inventory']['bread'] = 4
         loop = self.make_loop(snapshot)
         loop._set_plan([{"skill": "mine_stone", "params": {"count": 7}}])
         for _ in range(2):
@@ -332,6 +336,7 @@ class AgentHomeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_agent_outdoor_skill_passes_home_boundary_before_original_task(self):
         snapshot = state(food=20, inside=True)
+        snapshot['inventory']['bread'] = 4
         p = self.make_plugin(snapshot)
         original = {"ore": "iron", "count": 7, "radius": 9}
         result = await p._submit_skill(self.auto_event(), "mine_ores", original, "挖铁")

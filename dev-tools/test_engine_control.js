@@ -1261,24 +1261,16 @@ test('food preparation without new supplies cannot pretend to make progress', as
 });
 
 test('default storage keeps tools and food but explicit item selection is honored', async () => {
+  const { fixture } = require('./test_storage_memory');
   for (const items of [null, ['stone_pickaxe']]) {
-    const bot = fakeBot();
-    const chest = { name: 'chest', position: vec3(1, 1, 0) };
-    bot.findBlock = ({ matching, useExtraInfo }) => matching({ name: chest.name }) &&
-      (typeof useExtraInfo !== 'function' || useExtraInfo(chest)) ? chest : null;
-    bot.blockAt = () => chest;
-    const inv = { stone_pickaxe: 1, bread: 4, cobblestone: 64 };
-    const actions = { bot, inventoryMap: () => ({ ...inv }), deposit: async ({ keep, items: selection }) => {
-      assert.equal(keep.includes('stone_pickaxe'), items === null);
-      assert.equal(keep.includes('bread'), items === null);
-      assert.equal(keep.includes('cobblestone'), false);
-      const stored = {};
-      for (const [name, count] of Object.entries(inv)) if (!keep.includes(name) && (!selection || selection.includes(name))) {
-        stored[name] = count; delete inv[name];
-      }
-      return { stored, total: Object.values(stored).reduce((sum, count) => sum + count, 0) };
-    } };
-    assert.equal((await gathering.storeItems({ actions, items, ctx: new skills.SkillContext({ signal: null }) })).ok, true);
+    // Run the real budget and transfer layers; only the Minecraft window is fake.
+    const f = fixture({ stone_pickaxe: 1, bread: 4, cobblestone: 64 }); f.put('chest', 1);
+    const result = await f.run({ items });
+    assert.equal(result.ok, true, result.reason);
+    assert.deepEqual(result.consumed, items === null ? { cobblestone: 64 } : { stone_pickaxe: 1 });
+    assert.deepEqual(f.inventory, items === null ? { stone_pickaxe: 1, bread: 4, cobblestone: 0 } :
+      { stone_pickaxe: 0, bread: 4, cobblestone: 64 });
+    assert.deepEqual(f.containers.get('1,1,0').items, result.consumed);
   }
 });
 

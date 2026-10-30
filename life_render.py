@@ -501,6 +501,7 @@ class PromptRenderMixin:
         n = fails.get(skill, 0)
         if n < 3:
             return decision
+        revision = self._plan_revision
 
         logger.info("她想做的「%s」最近失败 %d 次，把这件事告诉她、让她重新考虑", skill, n)
         retry_prompt = (
@@ -516,8 +517,12 @@ class PromptRenderMixin:
                 raw2, _ = await self.perception.decide(prompt=retry_prompt, system=system)
             except Exception:  # noqa: BLE001
                 raw2 = None
+        if revision != self._plan_revision:
+            return decision  # The caller discards the superseded decision.
         if raw2 is None:
             raw2 = await self._llm(retry_prompt, system)
+        if revision != self._plan_revision:
+            return decision  # Do not let parsing overwrite the new owner's queue.
         second = self._parse_decision(raw2, suggestion)
         if second is None:
             return decision
@@ -526,6 +531,10 @@ class PromptRenderMixin:
             return second
         # 她坚持原选择：尊重她的决定（但失败太多时兜底，避免死循环）
         if n >= 5 and self._last_advice and self._last_advice.skill and self._last_advice.skill != skill:
+            # Replacing the prerequisite also invalidates its dependent tail.
+            # The next boundary will observe the fallback's actual result and
+            # plan again instead of treating unexecuted work as completed.
+            self._pending_plan = []
             # **顾问的建议也要过技能名白名单**（B3 的补口）。
             #
             # 这条路径绕过了 _set_plan / _parse_decision，是当初 `craft`

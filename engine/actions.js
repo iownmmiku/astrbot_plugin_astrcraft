@@ -2587,7 +2587,10 @@ class Actions {
   }
 
   /** 把背包里的物品存进箱子（可指定只存某些） */
-  async deposit({ x, y, z, items = null, keep = null, signal = null, reach = true }) {
+  async deposit({ x, y, z, items = null, keep = null, keepCounts = null, keepBestTools = false, budgetProfile = null, signal = null, reach = true }) {
+    if (keepCounts !== null && (typeof keepCounts !== 'object' || Array.isArray(keepCounts) ||
+      Object.values(keepCounts).some((n) => !Number.isSafeInteger(n) || n < 0))) throw new ActionError('存物保留数量必须是非负整数');
+    if (budgetProfile !== null && !['nearby', 'travel', 'mining'].includes(budgetProfile)) throw new ActionError('自动存物预算类型无效');
     const container = await this.openContainer({ x, y, z, signal, reach });
     const win = container.win;
     const moved = {};
@@ -2601,15 +2604,48 @@ class Actions {
     try {
       const keepSet = new Set((keep || []).map((k) => String(k).replace(/^minecraft:/, '')));
       const wantSet = items ? new Set(items.map((k) => String(k).replace(/^minecraft:/, ''))) : null;
-      for (const item of win.items()) {
+      // Modern servers carry durability/enchantments in components, not NBT.
+      const variant = (item) => JSON.stringify([item.name, item.metadata ?? null, item.nbt ?? null,
+        item.components ?? null, item.removedComponents ?? null]);
+      const { preferredTools, storageBudget, TOOL } = require('./supply_budget');
+      const protectedVariants = new Set(keepBestTools ? preferredTools(win.items()).map(variant) : []);
+      for (const item of [...win.items()]) {
         check();
         if (wantSet && !wantSet.has(item.name)) continue;
         if (keepSet.has(item.name)) continue;
-        const n = item.count;
+        // Opening a window and earlier transfers can overlap food consumption
+        // or pickups. Only automatic storage recalculates this live reserve.
+        const reserveCounts = budgetProfile === null ? keepCounts : storageBudget(win.items().reduce((counts, entry) => {
+          counts[entry.name] = (counts[entry.name] || 0) + entry.count; return counts;
+        }, {}), budgetProfile);
         const inventoryBefore = countIn(win.items(), item.name);
+        let n = Math.min(item.count, Math.max(0, inventoryBefore - (reserveCounts?.[item.name] || 0)));
+        if (protectedVariants.has(variant(item))) {
+          const variantCount = win.items().filter((other) => variant(other) === variant(item)).reduce((sum, other) => sum + other.count, 0);
+          n = Math.min(n, Math.max(0, variantCount - 1));
+        }
+        if (!n) continue;
         const containerBefore = countIn(win.containerItems(), item.name);
         try {
-          await win.deposit(item.type, null, n);
+          if (keepBestTools && TOOL.test(item.name) && typeof this._bot.transfer === 'function' &&
+              Number.isInteger(item.slot) && item.slot >= win.inventoryStart && item.slot < win.inventoryEnd) {
+            // Native deposit's null NBT is a wildcard, including on component-based
+            // versions. Restrict the source slot so it cannot pick the kept tool.
+            if (win.selectedItem || variant(win.slots[item.slot] || {}) !== variant(item)) {
+              throw new ActionError('工具槽位或光标发生变化，停止这件工具的存放');
+            }
+            await this._bot.transfer({ window: win, itemType: item.type, metadata: item.metadata ?? null,
+              count: n, nbt: item.nbt ?? undefined, sourceStart: item.slot, sourceEnd: item.slot + 1,
+              destStart: 0, destEnd: win.inventoryStart });
+          } else {
+            // Fail closed when a restricted source is unavailable and the native
+            // NBT wildcard could select a protected item of the same type.
+            if (keepBestTools && item.nbt == null && win.items().some((other) =>
+              other.type === item.type && protectedVariants.has(variant(other)) && variant(other) !== variant(item))) {
+              throw new ActionError('容器不能精确区分同类工具，保留工具后继续整理其他物品');
+            }
+            await win.deposit(item.type, item.metadata ?? null, n, item.nbt ?? undefined);
+          }
         } catch (err) {
           if (signal?.aborted || err instanceof CancelledError || err.name === 'CancelledError' || err.name === 'AbortError') throw err;
           log.info(`存入 ${item.name} 失败：${err.message}`);

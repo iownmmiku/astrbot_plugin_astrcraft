@@ -1,48 +1,67 @@
-# 安装 Node 引擎依赖。
+﻿# 安装 Node 引擎依赖。
 #
-# 为什么不用普通的 npm install：
+# 使用 npm ci 按发布包的锁文件安装：
 # npm 默认把缓存与日志写到 %LOCALAPPDATA%\npm-cache，在受限环境（沙箱、企业策略、
 # 只读用户目录）下会直接 EPERM 失败。这里把缓存显式指到项目内目录，绕开这个问题。
 #
-# 用法：powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+# 用法：powershell -ExecutionPolicy Bypass -File dev-tools\install.ps1
 
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$botDir = Join-Path $repoRoot 'bot'
+$engineDir = Join-Path $repoRoot 'engine'
 $cacheDir = Join-Path $repoRoot '_npm_cache'
 
 Write-Host "=== 安装 Minecraft 引擎依赖 ===" -ForegroundColor Cyan
-Write-Host "引擎目录: $botDir"
+Write-Host "引擎目录: $engineDir"
 Write-Host "npm 缓存: $cacheDir"
 Write-Host ""
 
-if (-not (Test-Path $botDir)) {
-    Write-Host "找不到引擎目录：$botDir" -ForegroundColor Red
+if (-not (Test-Path -LiteralPath $engineDir -PathType Container)) {
+    Write-Host "找不到引擎目录：$engineDir" -ForegroundColor Red
     exit 1
+}
+foreach ($manifest in @('package.json', 'package-lock.json')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $engineDir $manifest) -PathType Leaf)) {
+        Write-Host "引擎缺少 $manifest，请重新下载完整插件包。" -ForegroundColor Red
+        exit 1
+    }
 }
 
-# 确认 node 可用
-$node = Get-Command node -ErrorAction SilentlyContinue
+# 锁定的 Mineflayer 版本要求 Node.js 22+；旧版本不能开始安装。
+$node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
 if (-not $node) {
-    Write-Host "找不到 node。请先安装 Node.js 18+：https://nodejs.org/" -ForegroundColor Red
+    Write-Host "找不到 node。请先安装 Node.js 22+：https://nodejs.org/" -ForegroundColor Red
     exit 1
 }
-Write-Host "Node.js: $(& node --version)"
+$nodeVersion = & $node.Source --version
+if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v?(\d+)\.\d+\.\d+(?:[-+].*)?$') {
+    Write-Host "无法读取 Node.js 版本，请检查 Node.js 22+ 安装。" -ForegroundColor Red
+    exit 1
+}
+if ([int]$Matches[1] -lt 22) {
+    Write-Host "当前 Node.js 为 $nodeVersion，需要 Node.js 22+：https://nodejs.org/" -ForegroundColor Red
+    exit 1
+}
+# 直接调用 npm.cmd，避开 npm.ps1 的执行策略，同时保持目录参数的独立引用。
+$npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue
+if (-not $npm) {
+    Write-Host "找不到 npm.cmd，请检查 Node.js 与 npm 是否已加入 PATH。" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Node.js: $nodeVersion"
 Write-Host ""
 
 New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 
-Push-Location $botDir
+Push-Location -LiteralPath $engineDir
 try {
-    # npm 在 PowerShell 里是 npm.ps1，可能被 ExecutionPolicy 拦住，所以走 cmd
-    & cmd /c "npm install --cache `"$cacheDir`" --no-audit --no-fund 2>&1"
+    & $npm.Source ci --cache $cacheDir --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
-        Write-Host "npm install 失败（退出码 $LASTEXITCODE）" -ForegroundColor Red
+        Write-Host "npm ci 失败（退出码 $LASTEXITCODE）" -ForegroundColor Red
         Write-Host "可以尝试：" -ForegroundColor Yellow
-        Write-Host "  1) 换一个缓存目录：npm install --cache D:\npm-cache"
-        Write-Host "  2) 换镜像源：npm install --registry https://registry.npmmirror.com"
+        Write-Host "  在 engine 目录检查 npm 输出，重试：npm.cmd ci --cache D:\npm-cache"
         exit 1
     }
 } finally {
@@ -50,12 +69,12 @@ try {
 }
 
 # 校验关键依赖真的装上了
-$required = @('mineflayer', 'minecraft-data', 'mineflayer-pathfinder')
+$required = @('canvas', 'mineflayer', 'minecraft-data', 'mineflayer-pathfinder')
 $missing = @()
 foreach ($pkg in $required) {
-    $p = Join-Path $botDir "node_modules\$pkg\package.json"
-    if (Test-Path $p) {
-        $ver = (Get-Content $p -Raw | ConvertFrom-Json).version
+    $p = Join-Path $engineDir "node_modules\$pkg\package.json"
+    if (Test-Path -LiteralPath $p -PathType Leaf) {
+        $ver = (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json).version
         Write-Host ("  [OK] {0}@{1}" -f $pkg, $ver) -ForegroundColor Green
     } else {
         $missing += $pkg
@@ -71,5 +90,4 @@ if ($missing.Count -gt 0) {
 
 Write-Host ""
 Write-Host "依赖安装完成。下一步自检：" -ForegroundColor Cyan
-Write-Host "  cd bot"
-Write-Host "  node tools/smoke.js"
+Write-Host "  node `"$(Join-Path $repoRoot 'dev-tools\smoke.js')`""

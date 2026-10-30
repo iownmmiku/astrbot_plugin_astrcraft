@@ -456,11 +456,12 @@ class RunnerContracts(unittest.TestCase):
         output = io.StringIO()
         with patch.object(sys, "argv", ["run_all.py"]), \
                 patch.object(self.runner, "discover", return_value=[Path(name)]), \
-                patch.object(self.runner, "port_open", return_value=False), \
+                patch.object(self.runner, "port_open", return_value=False) as probe, \
                 patch.object(self.runner, "needs_server", return_value=False), \
                 patch.object(self.runner, "run_one", return_value=result), \
                 contextlib.redirect_stdout(output):
             code = self.runner.main()
+            probe.assert_not_called()
         return code, output.getvalue()
 
     def test_failed_or_unfinished_scripts_always_fail_suite(self):

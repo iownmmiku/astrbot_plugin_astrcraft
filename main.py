@@ -46,10 +46,11 @@ from .llm_tools_core import McPerceptionTools
 from .llm_tools_skills import McSkillTools
 from .llm_tools_life import McLifeTools
 from .webui_server import WebUI
+from .runtime_status import RuntimeMetrics
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
-PLUGIN_VERSION = "1.3.4"
+PLUGIN_VERSION = "1.3.5"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
@@ -569,6 +570,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     def _invalidate_player_goal(self) -> int:
         """Stop pending plans synchronously, before a control request awaits RPC."""
         self._player_goal_revision = getattr(self, "_player_goal_revision", 0) + 1
+        self._runtime_metrics().reset_handoff()
         invalidate = getattr(self.goals, "invalidate_pending", None)
         if callable(invalidate):
             invalidate()
@@ -948,6 +950,18 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     async def _on_any_engine_event(self, payload: dict) -> None:
         event = payload.get("event", "")
         self._remember(event, payload.get("data") or {})
+        data = payload.get("data") or {}
+        if event in {"bot.spawn", "bot.death", "bot.respawn", "bot.disconnect", "bot.world_changed",
+                     "bot.world_ready", "bot.hurt", "bot.hungry", "bot.inventory"} or event.startswith("task."):
+            self._observation_revision = getattr(self, "_observation_revision", 0) + 1
+        metrics = self._runtime_metrics()
+        if event in {"bot.spawn", "bot.death", "bot.respawn", "bot.disconnect", "bot.world_changed"}:
+            metrics.reset_handoff()
+        continuing = bool(self.life and not self.life.paused and not self._emergency_stopped
+                          and not self._manual_disconnect_requested and
+                          (event == "task.started" or getattr(self.life, "_plan", None)
+                           or getattr(self.life, "_pending_plan", None)))
+        metrics.task_event(event, data, continuing=continuing)
 
     async def _on_engine_disconnected(self, reason: str) -> None:
         self.connected = False
@@ -1228,7 +1242,44 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 return skill
         return None
 
+    def _runtime_metrics(self) -> RuntimeMetrics:
+        if not isinstance(getattr(self, "_runtime_measurements", None), RuntimeMetrics):
+            self._runtime_measurements = RuntimeMetrics()
+        return self._runtime_measurements
+
+    def _observation_key(self):
+        return (self.engine, getattr(self.engine, "_proc", None), self.connected,
+                getattr(self, "_bot_lifecycle_id", 0), getattr(self, "_world_transition_id", None),
+                getattr(self, "_observation_revision", 0), self._manual_disconnect_requested,
+                getattr(self, "_terminating", False))
+
     async def _life_state_snapshot(self) -> dict:
+        key = self._observation_key()
+        pending = getattr(self, "_survival_read", None)
+        metrics = self._runtime_metrics()
+        if pending and not pending.done() and getattr(self, "_survival_read_key", None) == key:
+            metrics.shared_reads += 1
+        else:
+            async def read():
+                started = time.monotonic()
+                try:
+                    return await self._read_life_state_snapshot()
+                finally:
+                    metrics.observations.append((time.monotonic() - started) * 1000)
+            pending = self._spawn_background(read(), name="mc-survival-snapshot")
+            if pending is None:
+                return {"has_shelter": False}
+            self._survival_read, self._survival_read_key = pending, key
+        result = await asyncio.shield(pending)
+        if key != self._observation_key():
+            metrics.discarded_reads += 1
+            return {"has_shelter": False}
+        if self.life and isinstance(result.get("home"), dict) and isinstance(result.get("home_status"), dict):
+            self.life.note_home_status(result["home"], result["home_status"])
+        self._survival_observation = result
+        return dict(result)
+
+    async def _read_life_state_snapshot(self) -> dict:
         """给「过日子」的生存顾问取真实状态（背包/血量/饥饿/是否夜晚/背包占用）。
 
         顾问据此判断她在哪个生存阶段、下一步该做什么。
@@ -1237,8 +1288,14 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         out: dict = {"has_shelter": False}
         if not self.engine or not self.engine.running or not self.connected:
             return out
+        info = getattr(self.engine, "engine_info", {})
+        unified = isinstance(info, dict) and "survival_snapshot_v1" in (info.get("features") or [])
         try:
-            st = await self.engine.call("state.get", {"detail": "normal"}, timeout=8.0)
+            if unified:
+                homes = list(getattr(self.life, "_homes", []))[-8:]
+                st = await self.engine.call("state.survival", {"homes": homes}, timeout=8.0)
+            else:
+                st = await self.engine.call("state.get", {"detail": "normal"}, timeout=8.0)
         except Exception as exc:  # noqa: BLE001
             logger.info("取状态快照失败：%s", exc)
             return out
@@ -1247,6 +1304,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if st.get("connected") is False or st.get("ready") is False:
             return out
         out["health"] = st.get("health", 20)
+        out["observed_at"] = st.get("observed_at", time.time())
         out["food"] = st.get("food", 20)
         out["server"] = st.get("server") or f"{self._cfg('server_host', '127.0.0.1')}:{self._cfg('server_port', 25565)}"
         out["dimension"] = str(st.get("dimension") or "").removeprefix("minecraft:")
@@ -1261,10 +1319,12 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         if isinstance(inv_summary, dict):
             out["inventory_slots_used"] = int(inv_summary.get("used_slots") or 0)
         try:
-            inv = await self.engine.call("inventory.get", {}, timeout=8.0)
+            inv = ({"items": st.get("inventory_items"), "slots": st.get("inventory_slots", [])} if unified
+                   else await self.engine.call("inventory.get", {}, timeout=8.0))
             items = (inv or {}).get("items") if isinstance(inv, dict) else None
             if isinstance(items, dict):
                 out["inventory"] = items
+                out["inventory_slots"] = inv.get("slots") or []
                 if not out.get("inventory_slots_used"):
                     out["inventory_slots_used"] = len(items)
         except Exception as exc:  # noqa: BLE001
@@ -1275,11 +1335,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             out["home"] = home
             out["home_status"] = {"condition": "unknown", "safe": False, "loaded": False}
             try:
-                status = await self.engine.call("home.inspect", {"home": home}, timeout=3.0)
+                status = (st.get("home_status") if unified and (st.get("home") or {}).get("origin") == home.get("origin")
+                          else None if unified else await self.engine.call("home.inspect", {"home": home}, timeout=3.0))
                 if isinstance(status, dict):
                     out["home_status"] = status
                     out["has_shelter"] = bool(status.get("safe"))
-                    self.life.note_home_status(home, status)
+                if unified and (st.get("home") or {}).get("origin") == home.get("origin") and isinstance(st.get("farm_status"), dict):
+                    out["farm_status"] = st["farm_status"]
             except Exception as exc:  # noqa: BLE001
                 logger.info("基地暂不能核验，保留位置：%s", exc)
         return out
@@ -1358,6 +1420,10 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     skill_name = meta["rpc"]
                 result = data.get("result") or {}
                 if isinstance(result, dict):
+                    if skill_name == "tend_farm" and status in ("done", "failed") and isinstance(result.get("farm"), dict):
+                        note_farm = getattr(self.life, "note_home_farm", None)
+                        if callable(note_farm):
+                            note_farm(result.get("home") or (meta.get("params") or {}).get("home") or {}, result["farm"])
                     if skill_name == "build_shelter" and status == "done" and result.get("ok") is True:
                         remember_home = getattr(self.life, "remember_home", None)
                         if callable(remember_home):

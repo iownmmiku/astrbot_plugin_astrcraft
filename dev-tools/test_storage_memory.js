@@ -186,6 +186,26 @@ test('an unloaded remembered chest is reached and verified before physical trans
   assert.deepEqual(f.crafts, []);
 });
 
+test('automatic reserves follow food consumed and picked up during travel, opening and container fallback', async () => {
+  for (const changeAt of ['route', 'open-window', 'full-container']) {
+    const f = fixture({ bread: 4, cobblestone: 16 }); f.put('chest', 48); f.remember('chest', 48);
+    const changeFood = () => { f.inventory.bread = 0; f.inventory.cooked_beef = 4; };
+    if (changeAt === 'route') {
+      const goTo = f.nav.goTo; let changed = false;
+      f.nav.goTo = async (target) => { if (!changed) { changed = true; changeFood(); } return goTo(target); };
+    } else if (changeAt === 'open-window') {
+      const open = f.bot.openContainer;
+      f.bot.openContainer = async (block) => { const win = await open(block); changeFood(); return win; };
+    } else {
+      f.put('barrel', 3, 1, 0, { behavior: () => { changeFood(); throw new Error('container is full'); } });
+    }
+    const result = await f.run();
+    assert.equal(result.ok, true, result.reason); assert.deepEqual(result.consumed, { cobblestone: 16 });
+    assert.equal(f.inventory.cooked_beef, 4); assert.equal(f.inventory.bread, 0);
+    assert.equal(f.containers.get('48,1,0').items.cooked_beef || 0, 0);
+  }
+});
+
 test('a still-unloaded container is retained without creating another chest', async () => {
   const f = fixture({ cobblestone: 16, oak_planks: 16 });
   const position = f.put('chest', 48); f.remember('chest', 48); f.unloaded.add(key(position));
@@ -312,7 +332,7 @@ test('container gain without a matching inventory loss cannot count as storage',
   assert.equal(f.inventory.cobblestone, 16);
 });
 
-test('default storage keeps survival supplies and stores ordinary materials', async () => {
+test('default storage keeps bounded survival reserves and stores excess supplies', async () => {
   const supplies = { coal: 8, charcoal: 4, dried_kelp_block: 1, blaze_rod: 2, lava_bucket: 1, water_bucket: 1,
     iron_pickaxe: 1, netherite_helmet: 1, white_bed: 1, shield: 1, trident: 1, shears: 1,
     torch: 16, soul_torch: 4, stick: 8, wheat: 6, cooked_beef: 4, beef: 3, potato: 2,
@@ -320,8 +340,10 @@ test('default storage keeps survival supplies and stores ordinary materials', as
   const f = fixture({ ...supplies, cobblestone: 32, oak_log: 8, raw_iron: 4 }); f.put('chest', 3);
   const result = await f.run();
   assert.equal(result.ok, true);
-  assert.deepEqual(result.consumed, { cobblestone: 32, oak_log: 8, raw_iron: 4 });
-  for (const [name, count] of Object.entries(supplies)) assert.equal(f.inventory[name], count, name);
+  const excess = { cobblestone: 32, oak_log: 8, charcoal: 4, dried_kelp_block: 1, blaze_rod: 2, torch: 12, soul_torch: 4 };
+  assert.deepEqual(result.consumed, excess);
+  for (const [name, count] of Object.entries(supplies)) assert.equal(f.inventory[name], count - (excess[name] || 0), name);
+  assert.equal(f.inventory.raw_iron, 4, 'keep a bounded iron reserve instead of repeatedly mining after every deposit');
 });
 
 test('explicit items and keep lists can store supplies and match namespaced names', async () => {

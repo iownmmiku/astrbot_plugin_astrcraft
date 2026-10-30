@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -24,6 +25,24 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _paths
+from survival_acceptance import AcceptanceProfile, assess, seed_fingerprint
+
+ORDINARY_FOOD = frozenset(("bread", "apple", "cooked_beef", "cooked_porkchop", "cooked_chicken",
+    "cooked_mutton", "cooked_rabbit", "cooked_cod", "cooked_salmon", "baked_potato", "carrot",
+    "melon_slice", "sweet_berries", "golden_carrot", "rabbit_stew", "mushroom_stew", "beetroot_soup",
+    "pumpkin_pie", "cookie", "glow_berries", "dried_kelp", "beetroot"))
+
+
+def build_fingerprint():
+    digest = hashlib.sha256()
+    files = list(_paths.REPO.glob("*.py")) + list(_paths.ENGINE_DIR.glob("*.js")) + list((_paths.ENGINE_DIR / "skills").glob("*.js"))
+    files += list(_paths.ENGINE_DIR.glob("*.json")) + list(_paths.REPO.glob("*.json"))
+    for path in sorted(files):
+        if path.name == "data_location.json":
+            continue
+        digest.update(path.relative_to(_paths.REPO).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def distribution(values):
@@ -63,6 +82,24 @@ class SurvivalMetrics:
         self._previous = None
         self._first_daytime = None
         self.daylight_changed = False
+        self.observed_day_cycles = 0
+        self._day_seen = self._night_seen = False
+        self.vitals_seconds = 0.0
+        self._initial_food = self._final_food = None
+        self._stone_tool = False
+        self._shelter = False
+        self._shelter_checks = 0
+        self._final_inventory_observed = False
+
+    def sample_failed(self):
+        self.read_errors += 1
+        self._previous = None
+        self._day_seen = self._night_seen = False
+        self._final_inventory_observed = False
+
+    def finish(self, at):
+        self._final_inventory_observed = bool(self._previous and self._previous["connected"]
+            and 0 <= at - self._previous["at"] <= self.poll_seconds * 2.5)
 
     def task_submitted(self, task_id, at):
         if not task_id or task_id in self._started_ids:
@@ -106,7 +143,7 @@ class SurvivalMetrics:
             self._failure_streak = 0
             self._last_failed_skill = None
 
-    def sample(self, at, body, inventory, *, working=False, model_waiting=False):
+    def sample(self, at, body, inventory, *, working=False, model_waiting=False, home_status=None):
         self.samples += 1
         connected = body.get("connected") is True and body.get("ready") is not False
         food, health, position = body.get("food"), body.get("health"), body.get("position")
@@ -124,12 +161,35 @@ class SurvivalMetrics:
         dt = max(0, at - previous["at"]) if previous else 0
         # 断线和漏读不推断饥饿；取样间隔过长不按已观察覆盖时间计算。
         covered = previous and connected and previous["connected"] and dt <= self.poll_seconds * 2.5
+        valid_food = lambda value: type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 20
         if covered:
             self.connected_seconds += dt
-            if isinstance(previous["food"], (int, float)):
+            if valid_food(previous["food"]) and valid_food(food):
+                self.vitals_seconds += dt
                 self.hungry_seconds += dt if previous["food"] <= 6 else 0
                 self.starving_seconds += dt if previous["food"] <= 0 else 0
             self.model_wait_seconds += dt if previous["model_waiting"] else 0
+        world = (body.get("server"), str(body.get("dimension", "")).removeprefix("minecraft:"))
+        if (not covered or previous.get("world") != world):
+            self._day_seen = self._night_seen = False
+        if connected and world[1] == "overworld" and type(daytime) in (int, float) and 0 <= daytime < 24000:
+            night = 13000 <= daytime <= 23000
+            if night and self._day_seen:
+                self._night_seen = True
+            elif not night:
+                if self._night_seen:
+                    self.observed_day_cycles += 1
+                    self._night_seen = False
+                self._day_seen = True
+        if connected:
+            count = sum(value for name, value in inventory.items() if name in ORDINARY_FOOD and type(value) is int and value >= 0)
+            if self._initial_food is None:
+                self._initial_food = count
+            self._final_food = count
+            self._stone_tool |= any(inventory.get(f"{tier}_pickaxe", 0) > 0 for tier in ("stone", "iron", "diamond", "netherite"))
+            if isinstance(home_status, dict) and home_status.get("condition") in ("absent", "intact", "missing"):
+                self._shelter_checks += 1
+                self._shelter |= home_status.get("safe") is True and home_status.get("loaded") is True and home_status.get("condition") == "intact"
         stationary = False
         if covered and working and previous["working"] and isinstance(position, dict):
             old_pos = previous["position"]
@@ -149,7 +209,7 @@ class SurvivalMetrics:
             self._stationary_since, self._stationary_reported = None, False
         self._previous = {"at": at, "connected": connected, "food": food,
                           "position": copy.deepcopy(position), "inventory": dict(inventory),
-                          "working": working, "model_waiting": model_waiting}
+                          "working": working, "model_waiting": model_waiting, "world": world}
 
     def summary(self):
         return {
@@ -169,6 +229,13 @@ class SurvivalMetrics:
             "external_chat_events": self.external_chat_events,
             "manual_interventions": dict(self.manual_interventions),
             "daylight_changed": self.daylight_changed,
+            "observed_day_cycles": self.observed_day_cycles,
+            "observed_vitals_seconds": round(self.vitals_seconds, 3),
+            "milestones": {"stone_or_better_pickaxe": self._stone_tool,
+                "verified_shelter": self._shelter, "shelter_observation_complete": self._shelter_checks > 0,
+                "initial_carried_food": self._initial_food, "final_carried_food": self._final_food,
+                "carried_food_net_gain": None if self._initial_food is None or self._final_food is None else self._final_food - self._initial_food,
+                "final_inventory_observed": self._final_inventory_observed},
         }
 
 
@@ -177,6 +244,36 @@ def model_environment():
     values = [os.environ.get(name, "").strip() for name in names]
     missing = [name for name, value in zip(names, values) if not value]
     return values, missing
+
+
+class InterventionLog:
+    def __init__(self, path, metrics):
+        self.path, self.metrics = path, metrics
+        self.lines = []
+        self.complete = path is not None
+
+    def poll(self):
+        if self.path is None:
+            return
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            self.complete = False
+            return
+        if lines[:len(self.lines)] != self.lines:
+            self.complete = False
+            self.metrics.manual_interventions["changed_log"] += 1
+            self.lines = lines
+            return
+        for line in lines[len(self.lines):]:
+            try:
+                kind = json.loads(line).get("kind", "other")
+            except (ValueError, AttributeError):
+                kind = "invalid_record"
+            if kind not in ("command", "give", "teleport", "rescue", "pause", "other", "invalid_record"):
+                kind = "other"
+            self.metrics.manual_interventions[kind] += 1
+        self.lines = lines
 
 
 class EvaluationLifecycle:
@@ -192,6 +289,11 @@ class EvaluationLifecycle:
         host.life.pause(reason="等待初始自然生存验证", max_seconds=0)
         host.engine.on_disconnected = host._on_engine_disconnected
         host.engine.on("bot.spawn", self.spawn)
+        # Keep the production observation invalidation and runtime metrics path.
+        # Started notices update that path only; evaluation submission counters
+        # are still recorded exactly once from the skill.run receipt.
+        host.engine.on("*", self.guarded(host._on_any_engine_event))
+        host.engine.on("task.finished", self.guarded(host._on_task_finished))
         for event, handler in (
             ("bot.respawn", host._on_bot_respawn), ("bot.death", host._on_bot_death),
             ("bot.hurt", host._on_bot_hurt), ("bot.hungry", host._on_bot_hungry),
@@ -300,13 +402,19 @@ async def run(args, model_values):
     tokens = _paths.plugin_module("tokens")
     tokens.reset()
     metrics = SurvivalMetrics(poll_seconds=args.poll_seconds, stationary_seconds=args.stationary_seconds)
+    intervention_log = InterventionLog(args.interventions, metrics)
+    intervention_log.poll()
+    profile = getattr(args, "acceptance_profile", AcceptanceProfile())
     endpoint, model, api_key = model_values
     provider = None
     host = None
     started = time.monotonic()
-    report = {"schema_version": 1, "status": "starting", "stage": "rules_verification", "requested_minutes": args.minutes,
+    report = {"schema_version": 2, "run_id": uuid.uuid4().hex, "status": "starting", "stage": "rules_verification", "requested_minutes": args.minutes,
               "real_model": True, "fixed_answers": False, "supplies_granted": False,
               "rules_modified": False, "manual_log_provided": bool(args.interventions),
+              "natural_world_declared": getattr(args, "natural_world", False),
+              "seed_fingerprint": None, "model_fingerprint": hashlib.sha256((endpoint + "\0" + model).encode()).hexdigest(),
+              "build_fingerprint": build_fingerprint(),
               "interpretation": "stationary_work_candidates 为疑似停滞，不能单独认定卡住；Token 只统计已报告部分"}
     rcon = Rcon(args.test_host, args.rcon_port, os.environ["ASTRCRAFT_EVAL_RCON_PASSWORD"])
     try:
@@ -323,6 +431,11 @@ async def run(args, model_values):
         if not match or not all(rules[k] for k in ("doDaylightCycle", "naturalRegeneration", "doMobSpawning")) or rules["keepInventory"]:
             raise RuntimeError("natural_survival_rules_required")
         report["rules"] = {**rules, "difficulty": match[1].lower()}
+        # Seed identity is read-only and hashed; no raw seed or server address in reports.
+        try:
+            report["seed_fingerprint"] = seed_fingerprint(await asyncio.to_thread(rcon.command, "seed"))
+        except Exception:
+            pass  # Missing seed evidence makes acceptance inconclusive, not an invented identity.
         report["stage"] = "provider_initialization"
         provider = ProviderOpenAIOfficial({
             "id": "astrcraft-eval", "type": "openai_chat_completion", "key": [api_key],
@@ -384,7 +497,6 @@ async def run(args, model_values):
                 return callback
 
             engine.on("task.finished", finished)
-            engine.on("task.finished", host._on_task_finished)
             for event, name in (("bot.death", "deaths"), ("bot.hurt", "hurt_events"), ("bot.hungry", "hungry_events")):
                 engine.on(event, counted(name))
             engine.on("chat", lambda payload: setattr(metrics, "external_chat_events", metrics.external_chat_events +
@@ -403,13 +515,14 @@ async def run(args, model_values):
                 # 完全自主的生存任务由真实模型形成，没有预先安排的动作清单。
                 await lifecycle.start_verified(initial, inventory)
                 started = time.monotonic()
+                metrics.sample(started, initial, inventory.get("items") or {})
                 deadline = started + args.minutes * 60
-                intervention_lines = 0
                 next_progress = started
                 report["status"] = "running"
                 report["stage"] = "survival"
                 while time.monotonic() < deadline:
                     try:
+                        revision = lifecycle.body_revision
                         body, inv, status = await asyncio.gather(
                             engine.call("state.get", {"detail": "normal"}, timeout=8),
                             engine.call("inventory.get", {}, timeout=8), engine.call("status", {}, timeout=8))
@@ -417,21 +530,23 @@ async def run(args, model_values):
                         # 休息/睡眠不是移动卡住；长任务静止仅标记候选。
                         skill = (current.get("meta") or {}).get("skill")
                         working = bool(current) and skill not in ("sleep", "rest", "wait", "cook_food", "smelt")
-                        metrics.sample(time.monotonic(), body, inv.get("items") or {}, working=working, model_waiting=inflight > 0)
+                        items = inv.get("items")
+                        if not isinstance(items, dict) or any(type(value) is not int or value < 0 for value in items.values()):
+                            raise ValueError("inventory_unobserved")
+                        home = host.life.home_for_world(body)
+                        home_status = {"condition": "absent"} if home is None else None
+                        if home:
+                            try:
+                                home_status = await engine.call("home.inspect", {"home": home}, timeout=3)
+                            except Exception:
+                                pass  # Unknown/unloaded house cannot become verified shelter.
+                        if revision != lifecycle.body_revision:
+                            raise ValueError("body_changed_during_sample")
+                        metrics.sample(time.monotonic(), body, items, working=working, model_waiting=inflight > 0, home_status=home_status)
                         host.connected = body.get("connected") is True
                     except Exception:
-                        metrics.read_errors += 1
-                    if args.interventions and args.interventions.exists():
-                        lines = args.interventions.read_text(encoding="utf-8").splitlines()
-                        for line in lines[intervention_lines:]:
-                            try:
-                                kind = json.loads(line).get("kind", "other")
-                            except (ValueError, AttributeError):
-                                kind = "invalid_record"
-                            if kind not in ("command", "give", "teleport", "rescue", "pause", "other", "invalid_record"):
-                                kind = "other"
-                            metrics.manual_interventions[kind] += 1
-                        intervention_lines = len(lines)
+                        metrics.sample_failed()
+                    intervention_log.poll()
                     now = time.monotonic()
                     if now >= next_progress:
                         print(f"评测运行 {int((now - started) / 60)} 分钟；死亡 {metrics.deaths}；模型请求 {tokens.ledger().requests}", flush=True)
@@ -445,6 +560,7 @@ async def run(args, model_values):
                 report["status"] = "failed"
                 report["error_type"] = type(exc).__name__
             finally:
+                metrics.finish(time.monotonic())
                 host._terminating = True
                 host._manual_disconnect_requested = True
                 # 截止后的急停只负责清理，不作为测量期间的任务取消/死亡。
@@ -470,6 +586,8 @@ async def run(args, model_values):
         report["status"] = "failed"
         report["error_type"] = type(exc).__name__
     finally:
+        intervention_log.poll()
+        report["manual_log_complete"] = intervention_log.complete
         rcon.close()
         if provider:
             try:
@@ -478,13 +596,19 @@ async def run(args, model_values):
                 report["provider_cleanup_failed"] = True
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         report["survival"] = metrics.summary()
+        report["runtime_flow"] = host._runtime_metrics().snapshot() if host else None
         report["model"] = tokens.ledger().snapshot()
         report["successful_model_requests"] = (report["model"]["calls"] - report["model"]["failed_calls"]
                                                 - report["model"]["cancelled_calls"])
+        report["acceptance"] = assess(report, profile)
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-        print(f"评测 {report['status']}；汇总已写入 {args.report}", flush=True)
-    return 0 if report["status"] == "completed" else 1
+        print(f"评测 {report['status']}；验收 {report['acceptance']['status']}；汇总已写入 {args.report}", flush=True)
+    if report["status"] != "completed":
+        return 1
+    if getattr(args, "require_pass", False):
+        return 0 if report["acceptance"]["status"] == "passed" else 1 if report["acceptance"]["status"] == "failed" else 2
+    return 0
 
 
 def main():
@@ -499,7 +623,14 @@ def main():
     parser.add_argument("--model-timeout", type=float, default=120)
     parser.add_argument("--report", type=Path, default=_paths.REPO / ".testserver" / "real-survival.json")
     parser.add_argument("--interventions", type=Path, help="人工干预 JSONL，仅记录 kind，不收正文")
+    parser.add_argument("--natural-world", action="store_true", help="声明这是专用自然生成世界；工具不会创建或改写世界")
+    parser.add_argument("--acceptance-profile", type=Path, help="验收阈值 JSON；省略使用基础档")
+    parser.add_argument("--require-pass", action="store_true", help="验收失败返回 1、证据不足返回 2；默认保持运行成功返回 0")
     args = parser.parse_args()
+    try:
+        args.acceptance_profile = AcceptanceProfile.parse(json.loads(args.acceptance_profile.read_text(encoding="utf-8"))) if args.acceptance_profile else AcceptanceProfile()
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     values, missing = model_environment()
     if missing:
         print("SKIP：没有显式真实模型配置，未连接服务器、未进行生存实测；缺少 " + ", ".join(missing))

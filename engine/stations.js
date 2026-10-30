@@ -30,6 +30,14 @@ const MAX_PER_KIND = 8;
 // 认为"这个位置还在"的检查半径（方块可能被换掉）
 const KINDS = ['crafting_table', 'furnace', 'chest', 'trapped_chest', 'barrel', 'bed'];
 const kindOf = (name) => String(name || '').replace(/^minecraft:/, '').endsWith('_bed') ? 'bed' : String(name || '').replace(/^minecraft:/, '');
+const isObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+
+function storedEntry(entry) {
+  if (!isObject(entry) || !['x', 'y', 'z'].every((axis) => Number.isFinite(entry[axis])) ||
+      (entry.usedAt !== undefined && (!Number.isFinite(entry.usedAt) || entry.usedAt < 0))) return null;
+  // Only retain known fields: an injected `kind` must not override all()'s kind.
+  return { x: entry.x, y: entry.y, z: entry.z, usedAt: entry.usedAt ?? 0 };
+}
 
 class StationMemory {
   constructor({ file = null } = {}) {
@@ -38,42 +46,100 @@ class StationMemory {
     this._byKind = new Map();
     this._scopes = new Map([['legacy', this._byKind]]);
     this._scopeProvider = null;
+    this._writeProtected = false;
     this.load();
   }
 
   load() {
     if (!this._file) return;
+    let bytes;
     try {
-      if (!fs.existsSync(this._file)) return;
-      const raw = JSON.parse(fs.readFileSync(this._file, 'utf8'));
-      const scopes = raw.version === 2 && raw.scopes && typeof raw.scopes === 'object' ? raw.scopes : { legacy: raw };
-      for (const [scope, data] of Object.entries(scopes)) {
-        const byKind = new Map();
-        for (const kind of KINDS) {
-          const list = data && Array.isArray(data[kind]) ? data[kind] : [];
-          if (list.length) {
-            byKind.set(kind, list.filter((e) => e && Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.z)).slice(0, MAX_PER_KIND));
-          }
-        }
-        this._scopes.set(scope, byKind);
-      }
-      this._byKind = this._scopes.get('legacy') || new Map();
-      const n = [...this._byKind.values()].reduce((s, l) => s + l.length, 0);
-      if (n) log.info(`工作站记忆：记得 ${n} 个位置（重启后直接走回去用）`);
+      bytes = fs.readFileSync(this._file);
     } catch (err) {
-      log.debug(`读工作站记忆失败（忽略）：${err.message}`);
+      if (err.code === 'ENOENT') return;
+      this._writeProtected = true;
+      log.warn(`读取工作站记忆失败，已启用写保护：${err.message}`);
+      return;
+    }
+    try {
+      const raw = JSON.parse(bytes.toString('utf8'));
+      if (!isObject(raw) || (raw.version !== undefined && (raw.version !== 2 || !isObject(raw.scopes)))) {
+        throw new Error('工作站记忆格式无效或版本不受支持');
+      }
+      const scopes = raw.version === 2 ? raw.scopes : { legacy: raw };
+      const restored = new Map();
+      let damaged = false, count = 0;
+      for (const [scope, data] of Object.entries(scopes)) {
+        if (!isObject(data)) { damaged = true; continue; }
+        const byKind = new Map();
+        for (const [kind, list] of Object.entries(data)) {
+          if (!KINDS.includes(kind) || !Array.isArray(list)) { damaged = true; continue; }
+          const valid = list.map(storedEntry).filter(Boolean);
+          if (valid.length !== list.length) damaged = true;
+          valid.sort((a, b) => b.usedAt - a.usedAt);
+          if (valid.length) byKind.set(kind, valid.slice(0, MAX_PER_KIND));
+          count += Math.min(valid.length, MAX_PER_KIND);
+        }
+        restored.set(scope, byKind);
+      }
+      if (damaged) {
+        const preserved = this._preserveCorrupt(bytes);
+        this._writeProtected = !preserved || count === 0;
+        log.warn(`工作站记忆有损坏记录，保留 ${count} 个有效位置${this._writeProtected ? '，已启用写保护' : ''}`);
+      }
+      this._scopes = restored;
+      this._byKind = this._scopes.get('legacy') || new Map();
+      if (!this._scopes.has('legacy')) this._scopes.set('legacy', this._byKind);
+      if (count) log.info(`工作站记忆：记得 ${count} 个位置（重启后直接走回去用）`);
+    } catch (err) {
+      this._writeProtected = true;
+      this._preserveCorrupt(bytes);
+      log.warn(`工作站记忆无法恢复，已启用写保护：${err.message}`);
+    }
+  }
+
+  _preserveCorrupt(bytes) {
+    const backup = `${this._file}.corrupt-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    try {
+      fs.writeFileSync(backup, bytes, { flag: 'wx' });
+      log.warn(`损坏的工作站记忆已保留：${backup}`);
+      return true;
+    } catch (err) {
+      log.warn(`无法保留损坏的工作站记忆，禁止覆盖原档：${err.message}`);
+      return false;
     }
   }
 
   save() {
-    if (!this._file) return;
+    if (!this._file || this._writeProtected) return false;
+    let temporary = null, fd = null;
     try {
       fs.mkdirSync(path.dirname(this._file), { recursive: true });
-      const out = { version: 2, scopes: {} };
-      for (const [scope, byKind] of this._scopes.entries()) out.scopes[scope] = Object.fromEntries(byKind);
-      fs.writeFileSync(this._file, JSON.stringify(out, null, 1), 'utf8');
+      const out = { version: 2, scopes: Object.fromEntries([...this._scopes].map(
+        ([scope, byKind]) => [scope, Object.fromEntries(byKind)])) };
+      const text = JSON.stringify(out, null, 1);
+      const candidate = `${this._file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      fd = fs.openSync(candidate, 'wx');
+      temporary = candidate;
+      fs.writeFileSync(fd, text, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      fs.renameSync(temporary, this._file);
+      temporary = null;
+      return true;
     } catch (err) {
-      log.debug(`存工作站记忆失败（忽略）：${err.message}`);
+      log.warn(`工作站记忆未保存，保留原档：${err.message}`);
+      return false;
+    } finally {
+      if (fd !== null) {
+        try { fs.closeSync(fd); }
+        catch (err) { log.warn(`关闭工作站记忆临时文件失败：${err.message}`); }
+      }
+      if (temporary) {
+        try { fs.unlinkSync(temporary); }
+        catch (err) { log.warn(`清理工作站记忆临时文件失败：${err.message}`); }
+      }
     }
   }
 
@@ -104,6 +170,7 @@ class StationMemory {
     );
     if (same) {
       same.usedAt = Date.now();
+      list.sort((a, b) => (b.usedAt || 0) - (a.usedAt || 0));
       this._byKind.set(k, list);
       this.save();
       return true;

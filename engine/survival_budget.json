@@ -1,0 +1,5 @@
+{
+  "nearby": {"food_min": 2, "food_target": 4, "torch_min": 0, "torch_target": 4, "fuel_keep": 8, "block_keep": 0},
+  "travel": {"food_min": 4, "food_target": 8, "torch_min": 4, "torch_target": 8, "fuel_keep": 16, "block_keep": 16},
+  "mining": {"food_min": 4, "food_target": 8, "torch_min": 8, "torch_target": 16, "fuel_keep": 16, "block_keep": 32}
+}

@@ -234,7 +234,7 @@ def main() -> int:
     if args.only:
         scripts = [p for p in scripts if args.only in p.name]
 
-    server_up = port_open(SERVER_PORT) and port_open(RCON_PORT)
+    server_up = args.full and port_open(SERVER_PORT) and port_open(RCON_PORT)
     will_skip_server = not (args.full and server_up)
 
     todo, skipped = [], []

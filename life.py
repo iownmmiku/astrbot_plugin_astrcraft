@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 from astrbot.api import logger
 
 from .advisor import FOODS, RAW_FOODS, WOOD_NAMES, advise, advise_for_prompt
+from .supply_budget import budget_for, work_profile, EMERGENCY_FOOD
 from .drives import DriveSystem
 from .memory import MemoryStore
 from .life_types import HOLD_RELEASE, HOLD_WHY, Hold, LifeDecision
@@ -138,7 +139,7 @@ class LifeLoop(PromptRenderMixin):
     """
 
     PREPARATION_SKILLS = frozenset(("make_tools", "cook_food", "food_chain", "smelt", "craft"))
-    OUTDOOR_SKILLS = frozenset(("chop_tree", "mine_stone", "mine_ores", "collect", "hunt"))
+    OUTDOOR_SKILLS = frozenset(("chop_tree", "mine_stone", "mine_ores", "collect", "hunt", "tend_farm", "explore_nearby"))
 
     @classmethod
     def _needs_work_boundary(cls, skill: str) -> bool:
@@ -261,6 +262,7 @@ class LifeLoop(PromptRenderMixin):
         self._rule_supply_candidate: dict | None = None
         self._rule_supply_attempt: dict | None = None
         self._rule_supply_wait_reason = ""
+        self._supply_budget_status = None
         self._rule_supply_stalls: dict[str, dict] = {}
         # Historical failures inform the model; rule retries have a separate,
         # bounded budget that only fresh, verified supplies can renew.
@@ -961,6 +963,8 @@ class LifeLoop(PromptRenderMixin):
             nearby_entities=st.get("nearby_entities") or [],
             home=self._home_for_state(st),
             home_status=st.get("home_status") or {},
+            next_work=self._plan[0] if self._plan else None,
+            farm_status=st.get('farm_status') or {},
         )
         if (adv.priority == "survival" and health <= 8 and food < 18
                 and self._skill_needs_outdoors(adv.skill, adv.params, st)):
@@ -1056,6 +1060,41 @@ class LifeLoop(PromptRenderMixin):
                 self._save_state()
                 break
 
+    def note_home_farm(self, home: dict, farm: dict) -> bool:
+        """Retain only a bounded wheat field belonging to an already verified home."""
+        if not self._valid_home(home) or not isinstance(farm, dict) or farm.get('kind') != 'wheat':
+            return False
+        dimension = str(home['dimension']).removeprefix('minecraft:')
+        if (farm.get('server') != home['server'] or str(farm.get('dimension')).removeprefix('minecraft:') != dimension
+                or farm.get('home_origin') != home['origin']):
+            return False
+        plots = farm.get('plots')
+        if not isinstance(plots, list) or not 1 <= len(plots) <= 8:
+            return False
+        origin, size = home['origin'], home['size']
+        center = {'x': origin['x'] + size // 2, 'y': origin['y'] - 1, 'z': origin['z'] + size // 2}
+        clean = []
+        for plot in plots:
+            if not isinstance(plot, dict) or any(type(plot.get(k)) is not int for k in ('x', 'y', 'z')):
+                return False
+            if any(abs(plot[k]) >= 32000000 for k in ('x', 'y', 'z')):
+                return False
+            if sum((plot[k] - center[k]) ** 2 for k in ('x', 'z')) > 24 ** 2 or abs(plot['y'] - center['y']) > 3:
+                return False
+            if origin['x'] - 1 <= plot['x'] <= origin['x'] + size and origin['z'] - 1 <= plot['z'] <= origin['z'] + size:
+                return False
+            point = {k: plot[k] for k in ('x', 'y', 'z')}
+            if point in clean:
+                return False
+            clean.append(point)
+        for record in self._homes:
+            if (record['server'], record['dimension'], record['origin']) == (home['server'], dimension, origin):
+                record['farm'] = {'kind': 'wheat', 'server': home['server'], 'dimension': dimension,
+                                  'home_origin': dict(origin), 'plots': clean}
+                self._save_state()
+                return True
+        return False
+
     def _supply_observation(self, state: dict) -> dict:
         inv = state["inventory"]
         count = lambda names: sum(int(inv.get(name, 0) or 0) for name in names)
@@ -1068,6 +1107,7 @@ class LifeLoop(PromptRenderMixin):
             "inside_home": (state.get("home_status") or {}).get("inside"),
             "food": state["food"], "health": state["health"],
             "ready": count(FOODS), "raw": count(RAW_FOODS), "wheat": count(("wheat",)),
+            "torches": count(('torch',)),
             "wood": count(WOOD_NAMES) + count(name for name in inv if name.endswith("_planks")),
             "fuel": count(("coal", "charcoal")),
             "stations": count(("crafting_table", "furnace", "smoker", "blast_furnace"))
@@ -1087,6 +1127,8 @@ class LifeLoop(PromptRenderMixin):
                     or (skill == "hunt" and after["raw"] > before["raw"]))
         if skill == "collect":
             return any(after[k] > before[k] for k in ("ready", "raw", "wheat"))
+        if skill == "craft":
+            return after.get('torches', 0) > before.get('torches', 0)
         if skill == "recover":
             return after["health"] > before["health"]
         if skill == "leave_home":
@@ -1368,9 +1410,10 @@ class LifeLoop(PromptRenderMixin):
             inputs = [item] if item else list(blast_inputs | food_inputs | {"sand", "cobblestone"})
             return smelt_search(inputs)
         if skill == "food_chain":
-            if food_search(4):
+            target = budget_for(params.get('profile', 'nearby'))
+            if food_search(target['food_target']):
                 return True
-            if count(FOODS) < 4:
+            if count(FOODS) < target['food_target']:
                 # The first stage can make a partial meal and stops there when
                 # fewer than four are ready; tools must not trigger an early trip.
                 return False
@@ -1386,8 +1429,9 @@ class LifeLoop(PromptRenderMixin):
                 stick_batches = (max(0, 2 - remaining_sticks) + 3) // 4
                 remaining_sticks += stick_batches * 4 - 2
                 remaining_wood -= stick_batches * 2 + (3 if tier == "wooden" else 0) + (0 if table else 4)
-            if inv.get("torch", 0) < 4 and count(("coal", "charcoal")) > 0:
-                return remaining_sticks < 1 and remaining_wood < 2
+            if inv.get("torch", 0) < target['torch_target'] and count(("coal", "charcoal")) > 0:
+                sticks = (target['torch_target'] - inv.get('torch', 0) + 3) // 4
+                return remaining_sticks < sticks and remaining_wood < ((sticks - remaining_sticks + 3) // 4) * 2
         return False
 
     def _preparation_params(self, skill: str, params: dict, state: dict) -> dict:
@@ -1484,6 +1528,7 @@ class LifeLoop(PromptRenderMixin):
                 or self.inbox.has_delivery(Delivery.STEER) or self._owner_steer_pending()):
             return None
         if not isinstance(state.get("inventory"), dict) or state.get("food") is None or state.get("health") is None:
+            self._supply_budget_status = None
             if self._mining_return is not None:
                 self._rule_supply_wait_reason = "采矿后尚未取得完整身体状态，保留计划等待核验"
             if self._plan and self._plan[0]["skill"] in self.PREPARATION_SKILLS:
@@ -1492,6 +1537,14 @@ class LifeLoop(PromptRenderMixin):
         if state["health"] <= 0:
             self.note_dead(True)
             return None
+        upcoming = self._plan[0] if self._plan else {}
+        profile = work_profile(upcoming.get('skill'), upcoming.get('params'))
+        budget = budget_for(profile)
+        inventory = state['inventory']
+        food_have = sum(int(inventory.get(name, 0) or 0) for name in set(FOODS) - EMERGENCY_FOOD)
+        torch_have = int(inventory.get('torch', 0) or 0)
+        self._supply_budget_status = {**budget, 'profile': profile, 'food_have': food_have, 'torch_have': torch_have,
+            'summary': f"{profile} 补给：普通食物 {food_have}/{budget['food_target']}，火把 {torch_have}/{budget['torch_target']}"}
         observation = self._supply_observation(state)
         self._return_boundary_state = dict(state)
         self._observe_rule_supply(observation)
@@ -1561,7 +1614,7 @@ class LifeLoop(PromptRenderMixin):
             return None
         if not self.skill_retry_ready(advice.skill):
             return None
-        if advice.skill in ("eat", "cook_food", "hunt", "recover", "store_items", "resupply_food", "leave_home"):
+        if advice.skill in ("eat", "cook_food", "hunt", "recover", "store_items", "resupply_food", "leave_home", "craft"):
             self._rule_supply_candidate = {"skill": advice.skill, "params": dict(advice.params),
                                            "state": observation, "revision": self._plan_revision}
         if self._plan and self._plan[0]["skill"] == advice.skill:
@@ -1702,6 +1755,8 @@ class LifeLoop(PromptRenderMixin):
     def note_dead(self, dead: bool) -> None:
         """她死了/复活了。由 main.py 在死亡、进服和重生通知中调用。"""
         self._dead = bool(dead)
+        if dead:
+            self._supply_budget_status = None
         if dead and (self._return_task_attempt is not None or self._mining_return is not None):
             self.clear_plan("身体已死亡，旧采矿返程计划作废")
         self._announce_hold()
@@ -1709,6 +1764,8 @@ class LifeLoop(PromptRenderMixin):
     def note_engine_up(self, up: bool) -> None:
         """引擎进程在不在。由 main.py 在引擎启停时调用。"""
         self._engine_up = bool(up)
+        if not up:
+            self._supply_budget_status = None
         if not up and (self._return_task_attempt is not None or self._mining_return is not None):
             self.clear_plan("引擎掉线，旧采矿返程计划作废")
         self._announce_hold()
@@ -2530,6 +2587,31 @@ class LifeLoop(PromptRenderMixin):
     # ------------------------------------------------------------ 技能知识（Markdown）
 
 
+    def _validated_plan(self, steps: object) -> list[dict]:
+        """Validate the whole chain before accepting any step or changing queues."""
+        if not isinstance(steps, list):
+            raise ValueError("计划必须是步骤数组")
+        if len(steps) > 6:
+            raise ValueError("一次最多安排 6 步，请拆成较短的计划")
+        cleaned = []
+        for index, item in enumerate(steps, start=1):
+            if isinstance(item, str):
+                item = {"skill": item}
+            if not isinstance(item, dict):
+                raise ValueError(f"第 {index} 步必须是技能名或步骤对象")
+            skill = item.get("skill") or item.get("name")
+            if not isinstance(skill, str) or not skill.strip():
+                raise ValueError(f"第 {index} 步缺少有效的技能名")
+            skill = skill.strip()
+            if not self._skill_is_known(skill):
+                raise ValueError(f"第 {index} 步的技能「{skill}」不在已知技能清单中")
+            params = item.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError(f"第 {index} 步的 params 必须是参数对象")
+            cleaned.append({"skill": skill, "params": dict(params),
+                            "why": str(item.get("why") or item.get("reason") or "").strip()})
+        return cleaned
+
     def note_plan_from_agent(self, steps: list, why: str = "") -> dict:
         """**agent 留下接下来的几步**（C 批次）。
 
@@ -2544,36 +2626,15 @@ class LifeLoop(PromptRenderMixin):
         现在 agent 可以用 `mc_plan_do` 留下接下来的几步，
         循环那边会在下一轮把它装进计划表，**然后就不再调模型**。
         """
-        cleaned = []
-        unknown = []
         known = set(self._known_skills or [])
-        for item in steps or []:
-            if isinstance(item, str):
-                item = {"skill": item}
-            if not isinstance(item, dict):
-                continue
-            skill = str(item.get("skill") or item.get("name") or "").strip()
-            if not skill:
-                continue
-            # **fail-open**：拿不到技能清单时（引擎没起来）就放行
-            if known and skill not in known:
-                unknown.append(skill)
-                continue
-            cleaned.append(
-                {
-                    "skill": skill,
-                    "params": dict(item.get("params") or {}),
-                    "why": str(item.get("why") or item.get("reason") or "").strip(),
-                }
-            )
-        if not cleaned:
+        try:
+            cleaned = self._validated_plan(steps)
+            if not cleaned:
+                raise ValueError("没给步骤")
+        except ValueError as exc:
             return {
                 "ok": False,
-                "reason": (
-                    f"这几步里没有认得出的技能：{'、'.join(unknown[:5])}"
-                    if unknown
-                    else "没给步骤"
-                ),
+                "reason": f"{exc}；整份计划未接收，之前的计划已保留",
                 "known_skills": sorted(known)[:12],
             }
         self._pending_plan = cleaned
@@ -2586,7 +2647,7 @@ class LifeLoop(PromptRenderMixin):
             "ok": True,
             "accepted": len(cleaned),
             "steps": [s["skill"] for s in cleaned],
-            "unknown": unknown,
+            "unknown": [],
             "note": (
                 f"记下了 {len(cleaned)} 步，**下一轮开始我直接按这个做，不再问模型**"
                 "（所以这几步要写具体、能独立跑完）"
@@ -2599,31 +2660,11 @@ class LifeLoop(PromptRenderMixin):
         计划就是"任务排序"：LLM 一次给出几步、按顺序执行，
         中间不再问模型，所以她做完一步会**立刻**接下一步（连贯）。
         """
-        cleaned = []
-        for item in plan or []:
-            if not isinstance(item, dict):
-                continue
-            skill = str(item.get("skill") or "").strip()
-            if not skill:
-                continue
-            # 未知技能直接丢掉这一步（B3）：留着只会白烧一轮模型往返 + 记一笔失败
-            if not self._skill_is_known(skill):
-                logger.warning(
-                    "计划里的技能「%s」不在引擎注册表里，丢掉这一步（已知技能 %d 个：%s）",
-                    skill,
-                    len(self._known_skills),
-                    "、".join(sorted(self._known_skills)[:8]) or "（清单为空）",
-                )
-                continue
-            cleaned.append(
-                {
-                    "skill": skill,
-                    "params": dict(item.get("params") or {}),
-                    "why": str(item.get("why") or item.get("reason") or "").strip(),
-                }
-            )
-            if len(cleaned) >= 6:  # 太长的计划容易在环境变化后变成负担
-                break
+        try:
+            cleaned = self._validated_plan(plan)
+        except ValueError as exc:
+            logger.warning("计划未装载，保留原计划：%s", exc)
+            return
         self._plan = cleaned
         self._plan_source = source
         if cleaned:
@@ -2638,6 +2679,7 @@ class LifeLoop(PromptRenderMixin):
 
     def clear_plan(self, reason: str = "") -> None:
         """丢掉剩余计划（环境变了、某一步失败、玩家插手等）。"""
+        self._supply_budget_status = None
         if self._plan:
             logger.info("放弃剩余 %d 步计划（%s）", len(self._plan), reason or "原因未记录")
         self._plan = []
@@ -2655,6 +2697,7 @@ class LifeLoop(PromptRenderMixin):
         进服后第一次决策会产出一份新计划（而不是接着上次的旧计划干）。
         """
         self.clear_plan("重新进服，旧会话计划作废")
+        self._supply_budget_status = None
         self._rule_supply_candidate = self._rule_supply_attempt = None
         self._rule_supply_stalls.clear()
         self._world_changing = False
@@ -2713,52 +2756,21 @@ class LifeLoop(PromptRenderMixin):
         say = data.get("say")
         if say is not None:
             say = str(say).strip() or None
-        params = data.get("params")
-        if not isinstance(params, dict):
-            params = {}
-        skill = data.get("skill")
-        if skill is not None:
-            skill = str(skill).strip() or None
-
-        # **计划（任务排序）**：LLM 给的有序几步。
-        # 兼容两种格式：
-        #   "plan": [{"skill": "chop_tree", "params": {...}, "why": "..."}, ...]
-        #   "skill" + "params"（只做一件事）→ 包成一步的计划
-        #
-        # **每一步的技能名都要校验**（B3）：模型幻觉出来的名字（比如早期的
-        # `craft`、或者它自己编的 `mine_diamond`）会被原样提交给 skill.run，
-        # 换来一句"没有这个技能：xxx"——白烧一轮模型往返，还会记进
-        # `_recent_failures` 触发 30 秒失败退避。未知技能在这里就丢掉，
-        # 并留下一条能定位的日志（模型到底编了什么名字）。
-        plan = []
-        raw_plan = data.get("plan")
-        if isinstance(raw_plan, list):
-            for item in raw_plan:
-                if isinstance(item, dict):
-                    s = str(item.get("skill") or "").strip()
-                    if not s:
-                        continue
-                    if not self._skill_is_known(s):
-                        logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", s)
-                        continue
-                    plan.append(
-                        {
-                            "skill": s,
-                            "params": item.get("params") if isinstance(item.get("params"), dict) else {},
-                            "why": str(item.get("why") or item.get("reason") or "").strip(),
-                        }
-                    )
-                elif isinstance(item, str) and item.strip():
-                    s = item.strip()
-                    if not self._skill_is_known(s):
-                        logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", s)
-                        continue
-                    plan.append({"skill": s, "params": {}, "why": ""})
-        if not plan and skill:
-            if self._skill_is_known(skill):
-                plan = [{"skill": skill, "params": params, "why": str(data.get("reason") or "").strip()}]
-            else:
-                logger.warning("她写了一个不存在的技能「%s」，丢掉这一步", skill)
+        # A missing prerequisite invalidates its dependent steps. Validate the
+        # complete plan before changing _pending_plan; this also lets a failed
+        # reconsideration retain the first, already valid decision and tail.
+        try:
+            plan = self._validated_plan(data.get("plan", []))
+            if not plan and data.get("skill") is not None:
+                skill = data["skill"]
+                if not isinstance(skill, str) or skill.strip():
+                    plan = self._validated_plan([{
+                        "skill": skill, "params": data.get("params", {}),
+                        "why": data.get("reason"),
+                    }])
+        except ValueError as exc:
+            logger.warning("她给出的决定无效，整份计划未接收：%s", exc)
+            return None
 
         # 本次决定 = 计划的第一步（立刻执行）；剩下的进队列，由循环逐步执行。
         if plan:

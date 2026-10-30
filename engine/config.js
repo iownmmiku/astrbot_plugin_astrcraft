@@ -136,6 +136,8 @@ const DEFAULTS = {
     'oak_leaves', 'spruce_leaves', 'birch_leaves', 'dark_oak_leaves',
     // 成熟作物（采集技能会核验 age 并补种，不破坏幼苗）
     'wheat', 'carrots', 'potatoes', 'beetroots',
+    // 有限打草取种；建田技能仍核验位置和基地保护。
+    'grass', 'short_grass', 'tall_grass',
     'netherrack',
     // 矿石（mining.js 的 ORES 表；漏掉它们 = 默认配置下挖矿必然失败）
     'coal_ore', 'deepslate_coal_ore',

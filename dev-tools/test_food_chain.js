@@ -44,7 +44,7 @@ function fixture(inventory = {}, { craftHook = null } = {}) {
   };
   const ctx = new SkillContext({ signal: controller.signal, deadline: Date.now() + 5000 });
   return { counts, calls, actions, controller, ctx,
-    run: () => skills.get('food_chain').run({ actions, ctx, params: {},
+    run: (profile) => skills.get('food_chain').run({ actions, ctx, params: profile ? {profile} : {},
       nav: { goTo: async () => {} }, state: { nearbyEntities: () => [] } }) };
 }
 
@@ -65,6 +65,21 @@ test('all supplies already present succeed without manufacturing or fabricated o
   const r = await f.run();
   assert.equal(r.ok, true); assert.deepEqual(r.produced, {}); assert.deepEqual(f.calls, []);
   assert.deepEqual(r.missing, []); assert.equal(r.pickaxe_tier, 'iron');
+});
+
+test('mining departure uses eight portions and sixteen torches without repeating supplied work', async () => {
+  const f = fixture({ bread: 8, iron_pickaxe: 1, coal: 4, stick: 4, torch: 4 });
+  const r = await f.run('mining');
+  assert.equal(r.ok, true); assert.equal(f.counts.torch, 16); assert.equal(f.counts.bread, 8);
+  assert.equal(r.profile, 'mining'); assert.equal(r.budget.food_target, 8);
+  assert.deepEqual(f.calls, [{item:'torch',count:12}]);
+});
+
+test('travel does not accept the nearby food budget and rejects unknown profiles', async () => {
+  const f = fixture({ bread: 4, iron_pickaxe: 1, torch: 8 });
+  const r = await f.run('travel');
+  assert.equal(r.ok, false); assert.ok(r.missing.includes('food')); assert.equal(r.budget.food_target, 8);
+  await assert.rejects(() => f.run('unknown'), /profile/);
 });
 test('partial cooking preserves actual bread and stops before making a pick', async () => {
   const f = fixture({ wheat: 6, oak_planks: 3, stick: 2, torch: 4 });

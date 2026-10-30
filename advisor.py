@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
+from .supply_budget import budget_for, work_profile, EMERGENCY_FOOD
 
 # ---------------------------------------------------------------- 物品分类
 
@@ -164,6 +165,8 @@ def advise(
     nearby_entities: list | None = None,
     home: dict | None = None,
     home_status: dict | None = None,
+    next_work: dict | None = None,
+    farm_status: dict | None = None,
 ) -> Advice:
     """核心入口：给出现状评估与下一步建议。
 
@@ -187,6 +190,9 @@ def advise(
     axe = best_tool_tier(inv, ("axe",))
     stone = count_any(inv, STONE_MATERIALS)
     food_items = count_any(inv, FOODS)
+    ordinary_food = count_any(inv, set(FOODS) - EMERGENCY_FOOD)
+    profile = work_profile((next_work or {}).get('skill'), (next_work or {}).get('params'))
+    budget = budget_for(profile)
     raw_food = count_any(inv, RAW_FOODS)
     build_blocks = count_any(inv, BUILD_BLOCKS)
     torch = inv.get("torch", 0)
@@ -212,32 +218,35 @@ def advise(
     #
     # 早期一律建议 cook_food，可手上连一块生肉都没有时做饭必然失败，
     # 于是她卡在"想做吃的 → 做不了"的循环里，从来不会去打猎。
-    def _food_advice() -> tuple[str, dict, str]:
-        furniture = ((home.get("furnished") or {}) if home and home_condition == "unknown"
-                     else home_status.get("furniture") or {})
-        distance = home_status.get("distance")
-        empty_at = home.get("food_stock_checked_at") if home else None
-        recently_empty = (home and home.get("food_stock_empty") is True
-                          and type(empty_at) in (int, float) and 0 <= time.time() - empty_at < 120)
-        # A short verified route is useful when no ingredients are already in
-        # hand. Inside the house, checking its shelves is cheaper than cooking.
-        has_ingredients = inv.get("wheat", 0) >= 3 or raw_food > 0
-        reach = 8 if food <= 4 or health <= 8 else 48
-        if (owns_home and isinstance(furniture, dict) and furniture.get("chest") and not recently_empty
-                and fails.get("resupply_food", 0) < 2
-                and (safe_home or type(distance) in (int, float) and 0 <= distance <= reach)
-                and (safe_home or not has_ingredients)):
-            return "resupply_food", {"home": dict(home), "count": 4}, "先利用当前世界近处基地的普通食物储备，真实取到后在屋内吃饭恢复"
+    furniture = ((home.get("furnished") or {}) if home and home_condition == "unknown"
+                 else home_status.get("furniture") or {})
+    distance = home_status.get("distance")
+    empty_at = home.get("food_stock_checked_at") if home else None
+    recently_empty = (home and home.get("food_stock_empty") is True
+                      and type(empty_at) in (int, float) and 0 <= time.time() - empty_at < 120)
+    # Trip preparation and the actual meal choice share the same evidence. A
+    # remembered distant or repeatedly failed chest must not authorize a blind
+    # food search merely because the requested trip reserve is still missing.
+    has_ingredients = inv.get("wheat", 0) >= 3 or raw_food > 0
+    reach = 8 if food <= 4 or health <= 8 else 48
+    can_resupply = (owns_home and isinstance(furniture, dict) and furniture.get("chest") and not recently_empty
+                   and fails.get("resupply_food", 0) < 2
+                   and (safe_home or type(distance) in (int, float) and 0 <= distance <= reach)
+                   and (safe_home or not has_ingredients))
+
+    def _food_advice(target: int | None = None) -> tuple[str, dict, str]:
+        if can_resupply:
+            return "resupply_food", {"home": dict(home), "count": target or 4}, "先利用当前世界近处基地的普通食物储备，真实取到后在屋内吃饭恢复"
         if inv.get("wheat", 0) >= 3:
-            return "cook_food", {"count": min(4, inv["wheat"] // 3)}, "已有小麦，补齐工作台后做面包，不必外出打猎"
+            return "cook_food", {"count": target if target is not None else min(4, inv['wheat'] // 3)}, "已有小麦，补齐工作台后做面包，不必外出打猎"
         if raw_food > 0:
-            return "cook_food", {"count": min(4, raw_food)}, "已有生食，先利用现成食材"
+            return "cook_food", {"count": target if target is not None else min(4, raw_food)}, "已有生食，先利用现成食材"
         animals = [e for e in (nearby_entities or []) if isinstance(e, dict)
                    and e.get("name") in HUNTABLE and not e.get("hostile")]
         if animals:
             animal = min(animals, key=lambda e: float(e.get("distance", 999)))
             return "hunt", {"mob": animal["name"], "count": 1}, "先猎取附近可见的动物，避免盲找牛"
-        return "cook_food", {"count": 2}, "没有食物，先查找可用食材与动物，再补充两份食物"
+        return "cook_food", {"count": target or 2}, "先查找可用食材与动物，补足这段工作的食物储备"
 
     # ---- 按阶段给建议
     if adv.stage == "bare":
@@ -293,7 +302,9 @@ def advise(
             adv.why = "基础都有了，去挖点铁矿升级工具"
 
     else:  # settled
-        if food_items == 0:
+        iron_stock = count_any(inv, ('iron_ingot', 'raw_iron', 'iron_ore', 'deepslate_iron_ore'))
+        farm_status = farm_status or {}
+        if ordinary_food < budget_for()['food_min']:
             adv.missing.append("食物")
             adv.skill, adv.params, adv.why = _food_advice()
         elif inventory_slots_used >= 32:
@@ -308,10 +319,21 @@ def advise(
             adv.skill = "craft"
             adv.params = {"item": "torch", "count": 8}
             adv.why = "手上有煤却没有火把，做点备用（进洞、过夜都用得上）"
-        else:
+        elif iron_stock < 16:
             adv.skill = "mine_ores"
-            adv.params = {"ore": "iron", "count": 8}
-            adv.why = "日子稳了，攒点铁矿做更好的装备"
+            adv.params = {"ore": "iron", "count": min(8, 16 - iron_stock)}
+            adv.why = f"补足备用铁料到 16 个，目前有 {iron_stock} 个，不无限重复挖铁"
+        elif owns_home and farm_status.get('can_start') is True and farm_status.get('needs_work') is True:
+            adv.skill, adv.params = 'tend_farm', {'home': dict(home), 'farm': home.get('farm'), 'plots': 4}
+            adv.why = '基地附近已有可耕种或可收割的实际证据，维护小田并保留种子，建立可持续粮源'
+        elif ordinary_food < 8:
+            adv.skill, adv.params, adv.why = _food_advice(8)
+        elif owns_home and home_condition == 'intact':
+            adv.skill, adv.params = 'explore_nearby', {'home': dict(home), 'radius': 24}
+            adv.why = '铁料与食物储备已达标，在基地附近有限探索，实际到达后再决定下一段工作'
+        else:
+            adv.skill, adv.params = None, {}
+            adv.why = '基础物资已足够，先观察基地与环境，避免继续重复采铁'
 
     # ---- 时序压力：天黑 + 没住处
     if is_night and not has_shelter and adv.skill != "build_shelter":
@@ -340,6 +362,28 @@ def advise(
             adv.skill, adv.params = "smelt", {"item": source, "count": min(8, inv[source])}
             adv.why = "已有铁料，先炼成可用的铁锭"
 
+    # Prepare reserves before established work, but do not prevent a bare body
+    # from getting its first wood/tools or demand a hunt just to leave starvation.
+    if next_work and pick in ('stone', 'iron', 'diamond', 'netherite') and health > 8 and food > 10 and not is_night:
+        upcoming = next_work.get('skill')
+        if upcoming in ('mine_ores', 'mine_stone', 'collect', 'chop_tree', 'hunt', 'pave', 'dig_path', 'explore_nearby'):
+            available_supply = (has_ingredients or can_resupply or
+                any(isinstance(e, dict) and e.get('name') in HUNTABLE and not e.get('hostile') for e in nearby_entities or []))
+            if ordinary_food < budget['food_min'] and available_supply:
+                adv.skill, adv.params, adv.why = _food_advice(budget['food_target'])
+                adv.priority, adv.hard = 'survival', True
+                adv.why = f"出发前按 {profile} 预算备粮（现有 {ordinary_food}，目标 {budget['food_target']}）；" + adv.why
+            elif ordinary_food < budget['food_min']:
+                adv.warnings.append(f"{profile} 工作口粮低于 {budget['food_min']} 份，尚无明确补给来源，应缩短行程并先观察可用食物")
+            elif inv.get('torch', 0) < budget['torch_min']:
+                deficit = budget['torch_target'] - inv.get('torch', 0)
+                if count_any(inv, ('coal', 'charcoal')) >= (deficit + 3) // 4 and inv.get('stick', 0) >= (deficit + 3) // 4:
+                    adv.skill, adv.params = 'craft', {'item': 'torch', 'count': deficit}
+                    adv.priority, adv.hard = 'survival', True
+                    adv.why = f"出发前用现成材料把火把补到 {budget['torch_target']} 根，再继续原计划"
+                else:
+                    adv.warnings.append(f"{profile} 工作建议至少 {budget['torch_min']} 根火把；当前缺材料，先选择近处补料，不为备料无限递归")
+
     # 生存优先级覆盖成长阶段；仅提醒不能阻止她饿着继续挖矿。
     needs_food = food <= 10 or (health <= 12 and food < 18)
     if needs_food:
@@ -361,6 +405,8 @@ def advise(
     elif inventory_slots_used >= 32:
         adv.priority = "maintenance"
         adv.skill, adv.params = "store_items", {}
+        if next_work:
+            adv.params['profile'] = profile
         adv.why = "先腾出背包空间，保留工具与食物，再继续采集"
         home_distance = home_status.get("distance")
         furniture = (home.get("furnished") or {}) if home and home_status.get("condition") == "unknown" else home_status.get("furniture") or {}

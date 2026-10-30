@@ -137,6 +137,7 @@ class EngineClient:
         self._next_id = 1
         self._lock = asyncio.Lock()
         self._closing = False
+        self._lifecycle_revision = 0
         self._engine_info: dict[str, Any] = {}
         self._last_stderr: list[str] = []
 
@@ -157,10 +158,20 @@ class EngineClient:
         return dict(self._engine_info)
 
     async def start(self) -> dict[str, Any]:
-        """启动引擎进程并等待 engine.ready。幂等：已在跑就直接返回。"""
+        """启动并等待本次 engine.ready；并发调用共享一次完整启动。"""
+        revision = self._lifecycle_revision
         async with self._lock:
-            if self.running:
+            if revision != self._lifecycle_revision:
+                raise EngineUnavailable("引擎启动已被停止")
+            if self.running and self._engine_info:
                 return self._engine_info
+            if self._proc is not None:
+                # Reap a crashed process or one whose stdout closed before exit.
+                expected = self._lifecycle_revision + 1
+                await self.stop()
+                if self._lifecycle_revision != expected:
+                    raise EngineUnavailable("引擎启动已被停止")
+                revision = self._lifecycle_revision
 
             # **派生新进程前先清掉上一份就绪信息**（P3）。
             #
@@ -173,6 +184,7 @@ class EngineClient:
             # 放在这里而不是只放在 stop() 里，是因为**异常退出不会走 stop()**
             # （进程被外部杀掉、OOM 等），那条路径上 `_engine_info` 会一直留着。
             self._engine_info = {}
+            self._last_stderr.clear()
 
             entry = self._cfg.engine_dir / "index.js"
             if not entry.exists():
@@ -181,7 +193,7 @@ class EngineClient:
             if not node_modules.exists():
                 raise EngineUnavailable(
                     f"引擎依赖缺失：{node_modules} 不存在。请在 {self._cfg.engine_dir} 下执行 "
-                    f'npm install --cache "<工作台内目录>"'
+                    f'npm ci --cache "<可写缓存目录>"'
                 )
 
             node = self._cfg.resolve_node()
@@ -193,7 +205,7 @@ class EngineClient:
 
             logger.info("启动 Minecraft 引擎：%s %s", node, entry)
             self._closing = False
-            self._proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 node,
                 str(entry),
                 cwd=str(self._cfg.engine_dir),
@@ -202,38 +214,51 @@ class EngineClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            self._reader_task = asyncio.create_task(self._read_loop(), name="mc-engine-reader")
-            self._stderr_task = asyncio.create_task(self._drain_stderr(), name="mc-engine-stderr")
+            # stop() may run while the OS is still creating the process.
+            if revision != self._lifecycle_revision:
+                await self._close_process(proc)
+                raise EngineUnavailable("引擎启动已被停止")
+            self._proc = proc
+            self._reader_task = asyncio.create_task(self._read_loop(proc), name="mc-engine-reader")
+            self._stderr_task = asyncio.create_task(self._drain_stderr(proc), name="mc-engine-stderr")
 
-        # 等 engine.ready（引擎启动后会立刻推一条）
-        ready = await self._wait_ready(timeout=15.0)
-        if ready is None:
-            tail = "\n".join(self._last_stderr[-10:])
-            await self.stop()
-            raise EngineUnavailable(f"引擎启动后没有就绪响应，stderr 末尾：\n{tail}")
-        self._engine_info = ready
-        logger.info(
-            "Minecraft 引擎就绪：v%s，%s 个技能",
-            ready.get("version"),
-            len(ready.get("skills", [])),
-        )
-        if self.on_ready:
-            _fire(self.on_ready(ready))
-        return ready
+            try:
+                ready = await self._wait_ready(timeout=15.0, proc=proc)
+                if revision != self._lifecycle_revision:
+                    raise EngineUnavailable("引擎启动已被停止")
+                if ready is None:
+                    tail = "\n".join(self._last_stderr[-10:])
+                    raise EngineUnavailable(f"引擎启动后没有就绪响应，stderr 末尾：\n{tail}")
+            except (Exception, asyncio.CancelledError):
+                # Clean only the process this start owns, never a replacement.
+                if self._proc is proc:
+                    await self.stop()
+                raise
+            self._engine_info = ready
+            logger.info(
+                "Minecraft 引擎就绪：v%s，%s 个技能",
+                ready.get("version"),
+                len(ready.get("skills", [])),
+            )
+            if self.on_ready:
+                _fire(self.on_ready(ready))
+            return ready
 
-    async def _wait_ready(self, timeout: float) -> dict | None:
+    async def _wait_ready(self, timeout: float, *, proc=None) -> dict | None:
+        proc = proc if proc is not None else self._proc
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
+            if proc is None or self._proc is not proc or proc.returncode is not None:
+                return None
             if self._engine_info:
                 return self._engine_info
-            if not self.running:
-                return None
             await asyncio.sleep(0.1)
-        return self._engine_info or None
+        return (self._engine_info or None) if self._proc is proc and self.running else None
 
     async def stop(self, *, kill_after: float = 3.0) -> None:
         """优雅关闭：关 stdin 让引擎自己退出，超时再 kill。"""
         self._closing = True
+        self._lifecycle_revision += 1
         # **清掉就绪信息**（P3）：`_wait_ready()` 以"`_engine_info` 非空"作为
         # "引擎已就绪"的唯一判据。进程都停了还留着它，下一次 start() 就会
         # 立刻拿旧数据报"就绪"——pid / 技能数全是上一个进程的。
@@ -249,11 +274,22 @@ class EngineClient:
 
         if proc is None:
             return
+        await self._close_process(proc, kill_after=kill_after)
+
+    async def _close_process(self, proc, *, kill_after: float = 3.0) -> None:
+        """Reap one captured process without changing another process's state."""
         with contextlib.suppress(Exception):
             if proc.stdin and not proc.stdin.is_closing():
                 proc.stdin.close()
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_after)
+        except asyncio.CancelledError:
+            # A cancelled startup still owns its child until it has been reaped.
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise
         except asyncio.TimeoutError:
             logger.warning("引擎未在 %.1f 秒内退出，强制结束", kill_after)
             with contextlib.suppress(Exception):
@@ -263,13 +299,16 @@ class EngineClient:
 
     # ------------------------------------------------------------ 读取循环
 
-    async def _read_loop(self) -> None:
-        assert self._proc and self._proc.stdout
-        stream = self._proc.stdout
+    async def _read_loop(self, proc=None) -> None:
+        proc = proc if proc is not None else self._proc
+        assert proc and proc.stdout
+        stream = proc.stdout
         buf = b""
         try:
             while True:
                 chunk = await stream.read(65536)
+                if self._proc is not proc:
+                    break
                 if not chunk:
                     break
                 buf += chunk
@@ -285,13 +324,12 @@ class EngineClient:
             logger.error("引擎输出读取异常：%s", exc)
         finally:
             # 进程结束（无论正常还是崩溃）
-            reason = "引擎进程已退出"
-            if self._proc is not None:
-                code = self._proc.returncode
-                reason = f"引擎进程退出（code={code}）"
-            self._fail_pending(reason)
-            if not self._closing and self.on_disconnected:
-                _fire(self.on_disconnected(reason))
+            if self._proc is proc:
+                reason = f"引擎进程退出（code={proc.returncode}）"
+                self._engine_info = {}
+                self._fail_pending(reason)
+                if not self._closing and self.on_disconnected:
+                    _fire(self.on_disconnected(reason))
 
     def _handle_line(self, line: bytes) -> None:
         try:
@@ -324,13 +362,16 @@ class EngineClient:
         else:
             fut.set_result(msg.get("result"))
 
-    async def _drain_stderr(self) -> None:
-        assert self._proc and self._proc.stderr
-        stream = self._proc.stderr
+    async def _drain_stderr(self, proc=None) -> None:
+        proc = proc if proc is not None else self._proc
+        assert proc and proc.stderr
+        stream = proc.stderr
         buf = b""
         try:
             while True:
                 chunk = await stream.read(8192)
+                if self._proc is not proc:
+                    break
                 if not chunk:
                     break
                 buf += chunk

@@ -194,6 +194,16 @@ function render() {
   text("dimension",ready?(dimensions[s.dimension]||s.dimension||"未知维度"):"未知维度");text("coordinates",ready&&s.position?[s.position.x,s.position.y,s.position.z].map(v=>number(v)==null?"—":Math.floor(v)).join(" / "):"— / — / —");
   text("standing",ready?`脚下 ${s.standing_on||"未知"}${s.in_water?" · 在水中":""}${s.in_lava?" · 在岩浆中":""}`:"脚下地形尚未读取");text("xp",ready?s.xp?.level:null);text("weather",ready&&typeof s.is_raining==="boolean"?(s.is_raining?"下雨":"晴朗"):"—");text("environment",`光照 ${ready?s.light??"—":"—"} · 延迟 ${ready?s.ping??"—":"—"}${ready&&number(s.ping)!=null?" ms":""}`);
   text("activity",life?.activity||"暂无近期决策");text("reason",life?.reason||life?.hold_reason||"自主生活系统未初始化");text("intention",life?.intention||"尚未形成持续打算");text("life-tag",stopped?"已急停":life?.paused?"已暂停":life?.running?"自主生活":"待命");text("plan-count",life?`自主计划还剩 ${life.plan.length} 步`:"生活系统未初始化");text("hold-reason",life?.hold_reason);text("life-summary",life?.summary);
+  const wait=life?.waiting, flow=state.flow;
+  text("wait-detail",wait?.reason||life?.hold_reason||"尚未读取自主状态");
+  text("wait-release",wait?.release_when);
+  const retry=number(wait?.retry_at), sampled=number(state.sampled_at);
+  text("wait-retry",retry==null?"未安排定时重试":sampled==null?clock(retry):retry<=sampled?"已到期，等待重新核验":`${Math.ceil(retry-sampled)} 秒后重新核验`);
+  text("wait-attempts",number(wait?.attempts));
+  const measurement=value=>value?.samples>0&&number(value.p95)!=null?`${Math.round(value.p95)} ms（${value.samples} 次）`:"尚无样本";
+  text("flow-observation",measurement(flow?.observation_ms));text("flow-handoff",measurement(flow?.handoff_ms));
+  const supplies=state.supplies;
+  text("supply-plan",supplies?.summary||"尚未形成出发预算");
   const viewer=state.viewer;$("viewer-link").hidden=!viewer?.running||Boolean(bridge);
   $("viewer-native").hidden=true;$("viewer-address").value="";
   document.querySelector('[data-action="viewer"]').hidden=Boolean(viewer?.running);

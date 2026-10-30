@@ -471,16 +471,6 @@ const STORAGE_TRAVEL_MS = 20000;
 const STORAGE_TRAVEL_STEP = 10;
 const STORAGE_REACH = 4;
 
-function storageSupplies(inventory) {
-  return Object.keys(inventory).filter((name) =>
-    /_(pickaxe|axe|shovel|sword|hoe|helmet|chestplate|leggings|boots|bed|door|bucket)$/.test(name) ||
-    ['bow', 'crossbow', 'arrow', 'spectral_arrow', 'tipped_arrow', 'shield', 'trident', 'mace', 'elytra',
-      'bucket', 'torch', 'soul_torch', 'lantern', 'soul_lantern', 'crafting_table', 'furnace',
-      'coal', 'charcoal', 'dried_kelp_block', 'blaze_rod', 'stick', 'wheat',
-      'flint_and_steel', 'shears', 'fishing_rod', 'compass', 'recovery_compass', 'totem_of_undying'].includes(name) ||
-    READY_FOOD.includes(name) || Object.hasOwn(COOKABLE, name));
-}
-
 function rethrowStorageCancellation(err, actions, ctx) {
   if (err instanceof CancelledError || err?.name === 'CancelledError' || err?.name === 'AbortError') throw err;
   if (ctx.signal?.aborted || actions._stopped) throw new CancelledError('存东西被取消');
@@ -556,16 +546,20 @@ async function storeItems(options) {
   }
 }
 
-async function storeItemsInWorld({ actions, nav, state, ctx, config = null, home = null, resumeWork = false, items = null, keep = null }) {
+async function storeItemsInWorld({ actions, nav, state, ctx, config = null, home = null, resumeWork = false, items = null, keep = null, profile = 'nearby' }) {
   ctx.checkAborted();
   if (actions._stopped) throw new CancelledError('引擎已急停');
   const steps = [];
   const bot = actions.bot;
   const world = storageWorld(bot);
-  const supplies = keep !== null ? keep : items !== null ? [] : storageSupplies(actions.inventoryMap());
+  const automatic = keep === null && items === null;
+  const supplies = keep !== null ? keep : [];
+  const keepCounts = automatic ? require('../supply_budget').storageBudget(actions.inventoryMap(), profile) : null;
   const keepSet = new Set(supplies.map((name) => String(name).replace(/^minecraft:/, '')));
   const wanted = items !== null ? new Set(items.map((name) => String(name).replace(/^minecraft:/, ''))) : null;
-  if (!Object.entries(actions.inventoryMap()).some(([name, count]) => count > 0 && !keepSet.has(name) && (!wanted || wanted.has(name)))) {
+  const tools = automatic ? require('../supply_budget').preferredTools(bot.inventory.items()) : [];
+  const toolCounts = tools.reduce((counts, item) => { counts[item.name] = (counts[item.name] || 0) + 1; return counts; }, {});
+  if (!Object.entries(actions.inventoryMap()).some(([name, count]) => count > Math.max(keepCounts?.[name] || 0, toolCounts[name] || 0) && !keepSet.has(name) && (!wanted || wanted.has(name)))) {
     return skillResult(false, { reason: '没有可存的物品，检查指定物品与保留清单' });
   }
 
@@ -676,7 +670,10 @@ async function storeItemsInWorld({ actions, nav, state, ctx, config = null, home
       }
       if (actions.stations) actions.stations.remember(actual.name, actual.position || candidate);
       // reachStorage already verified the distance; opening must not start another walk.
-      const r = await actions.deposit({ ...candidate, items, keep: supplies, signal: ctx.signal, reach: false });
+      // Re-budget inside each actual window so route/opening-time consumption
+      // and pickups cannot leave an obsolete reserve for a different food mix.
+      const r = await actions.deposit({ ...candidate, items, keep: supplies, keepCounts,
+        keepBestTools: automatic, budgetProfile: automatic ? profile : null, signal: ctx.signal, reach: false });
       const stored = positiveOnly(r.stored || {});
       const total = Object.values(stored).reduce((sum, count) => sum + count, 0);
       if (total) storedAlready = stored;

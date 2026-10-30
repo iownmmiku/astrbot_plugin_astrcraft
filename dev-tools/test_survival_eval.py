@@ -153,6 +153,8 @@ class MetricsTests(unittest.TestCase):
             self.assertIsNotNone(host.life.perception._toolset())
             self.assertIs(manager.get_func("mc_plan_do").handler.args[0], host)
             self.assertEqual(host.engine._cfg.extra_env["MC_DATA_DIR"], scratch)
+            self.assertIs(host.life._state_provider.__self__, host)
+            self.assertEqual(host.life._state_provider.__func__, type(host)._life_state_snapshot)
             asyncio.run(host.life.stop())
 
 
@@ -194,6 +196,32 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def emit(self, event, payload):
         for callback in self.host.engine._handlers.get(event, []):
             await callback(payload)
+        for callback in self.host.engine._handlers.get("*", []):
+            await callback({"event": event, "data": payload})
+
+    async def test_production_events_invalidate_observations_and_persist_farm(self):
+        from test_home_awareness import home
+        before = getattr(self.host, "_observation_revision", 0)
+        await self.emit("bot.inventory", {})
+        self.assertEqual(getattr(self.host, "_observation_revision", 0), before)
+        await self.activate()
+        before = getattr(self.host, "_observation_revision", 0)
+        await self.emit("bot.inventory", {})
+        self.assertGreater(self.host._observation_revision, before)
+        self.assertEqual(len(self.host.engine._handlers["task.finished"]), 1)
+        base = home()
+        self.assertTrue(self.host.life.remember_home(base))
+        record = {"kind": "wheat", "server": base["server"], "dimension": base["dimension"],
+                  "home_origin": base["origin"], "plots": [{"x": base["origin"]["x"] + 8,
+                      "y": base["origin"]["y"] - 1, "z": base["origin"]["z"]}]}
+        await self.emit("task.started", {"task_id": "farm", "kind": "skill", "status": "running", "meta": {"skill": "tend_farm"}})
+        await self.emit("task.finished", {"task_id": "farm", "kind": "skill", "status": "done", "name": "tend_farm",
+            "meta": {"skill": "tend_farm", "params": {"home": base}}, "result": {"ok": True, "home": base, "farm": record}})
+        self.assertEqual(self.host.life._homes[0]["farm"]["plots"], record["plots"])
+        # Reload the production state file rather than trusting only live memory.
+        self.host.life._homes = []
+        self.host.life.bind_data_dir(Path(self.scratch.name))
+        self.assertEqual(self.host.life._homes[0]["farm"]["plots"], record["plots"])
 
     async def activate(self):
         await self.emit("bot.spawn", {"lifecycle_id": 1, "position": {}, "username": "Eval"})
@@ -268,7 +296,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.lifecycle.ready)
         self.assertFalse(any(call.args[0] == "safety.resume" for call in self.host.engine.call.await_args_list))
 
-    async def test_initial_failure_and_cancel_cleanup_real_host_without_requests(self):
+    async def test_run_reports_and_cleanup_real_host_without_requests(self):
         # 跑实际 run() 的失败/取消出口，替换的只有外部服务器、模型与子进程。
         from astrbot.core.provider.sources import openai_source
         from lib import rcon
@@ -306,15 +334,18 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         raise asyncio.CancelledError()
                     return {**body(), "gamemode": "survival"}
                 if method == "inventory.get":
+                    if self.mode.startswith("completed"):
+                        return {"items": {"bread": 5, "stone_pickaxe": 1} if self.resume_calls else {}}
                     return {"items": {"bread": 1}}
                 if method == "safety.resume":
                     self.resume_calls += 1
                 return {}
 
-        for mode, status in (("invalid_inventory", "failed"), ("cancel", "interrupted")):
+        for mode, status in (("invalid_inventory", "failed"), ("cancel", "interrupted"),
+                             ("completed", "completed"), ("completed_gate", "completed")):
             with self.subTest(mode=mode):
                 provider = SimpleNamespace(text_chat=AsyncMock(), terminate=AsyncMock())
-                wire = SimpleNamespace(command=lambda cmd: ("normal" if cmd == "difficulty" else
+                wire = SimpleNamespace(command=lambda cmd: ("Seed: [123]" if cmd == "seed" else "normal" if cmd == "difficulty" else
                     "false" if cmd == "gamerule keepInventory" else "true"), close=Mock())
                 engine = FixtureEngine(mode)
                 captured = []
@@ -328,20 +359,29 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
                 with tempfile.TemporaryDirectory(prefix="eval-failure-") as output:
                     args = SimpleNamespace(test_host="explicit-test-host", test_port=25566, rcon_port=25576,
-                        minutes=.01, poll_seconds=5, stationary_seconds=120, model_timeout=120,
-                        interventions=None, mc_version="1.20.1", report=Path(output) / "report.json")
+                        minutes=.002, poll_seconds=.01, stationary_seconds=120, model_timeout=120,
+                        interventions=None, mc_version="1.20.1", report=Path(output) / "report.json",
+                        natural_world=True, require_pass=mode == "completed_gate")
                     with patch.dict(os.environ, {"ASTRCRAFT_EVAL_RCON_PASSWORD": "fixture"}), \
                             patch.object(openai_source, "ProviderOpenAIOfficial", return_value=provider), \
                             patch.object(rcon, "Rcon", return_value=wire), \
                             patch("survival_eval.build_host", side_effect=fixture_host):
                         exit_code = await run(args, ["https://fixture.invalid/v1", "fixture", "fixture"])
                     report = json.loads(args.report.read_text(encoding="utf-8"))
-                self.assertEqual(exit_code, 1)
+                self.assertEqual(exit_code, 0 if mode == "completed" else 1)
                 self.assertEqual(report["status"], status)
+                self.assertEqual(report["acceptance"]["status"], "failed", "without a real model request, completion cannot imply passing")
                 self.assertEqual(report["model"]["calls"], 0)
-                captured[0].life.start.assert_not_called()
+                if mode.startswith("completed"):
+                    captured[0].life.start.assert_called_once()
+                    self.assertEqual(report["survival"]["milestones"]["carried_food_net_gain"], 5)
+                    self.assertTrue(report["survival"]["milestones"]["stone_or_better_pickaxe"])
+                    self.assertEqual(report["survival"]["read_errors"], 0)
+                    self.assertEqual(len(report["seed_fingerprint"]), 64)
+                else:
+                    captured[0].life.start.assert_not_called()
                 self.assertEqual(engine.stop_calls, 1)
-                self.assertEqual(engine.resume_calls, 0)
+                self.assertEqual(engine.resume_calls, 1 if mode.startswith("completed") else 0)
                 self.assertFalse(engine.running)
                 self.assertEqual(engine._handlers, {})
                 self.assertIsNone(engine.on_disconnected)

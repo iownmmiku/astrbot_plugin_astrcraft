@@ -78,6 +78,20 @@ async function main() {
     h.read("globalThis.action=act('stop');");await flush();resolveState(snapshot('native'));await h.context.action;
     assert.equal(calls[1].endpoint,'action');assert.equal(calls[1].body.action,'stop');checks++;
   }
+  {
+    const h=harness();
+    const s=snapshot();s.sampled_at=100;
+    s.life={running:true,paused:false,plan:[],recent:[],waiting:{reason:'等白天',release_when:'天亮后再观察',retry_at:130,attempts:2}};
+    s.flow={observation_ms:{samples:3,p95:125},handoff_ms:{samples:0,p95:null}};
+    h.read('state='+JSON.stringify(s)+';render();');
+    assert.equal(h.nodes.get('wait-detail').textContent,'等白天');
+    assert.equal(h.nodes.get('wait-retry').textContent,'30 秒后重新核验');
+    assert.equal(h.nodes.get('flow-observation').textContent,'125 ms（3 次）');
+    assert.equal(h.nodes.get('flow-handoff').textContent,'尚无样本');
+    h.read('clearDisplay();');
+    assert.equal(h.nodes.get('wait-release').textContent,'—');
+    assert.equal(h.nodes.get('flow-observation').textContent,'尚无样本');checks++;
+  }
   console.log(`全部通过（${checks} 个会话与 bridge 竞态场景）`);
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
