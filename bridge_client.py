@@ -31,6 +31,27 @@ ERR_TIMEOUT = 1004        # 动作超时
 # 这些错误属于"机器人没进服"这一类，交给上层去决定要不要自动重连
 CONNECT_ERRORS = {ERR_NOT_CONNECTED}
 
+CHAT_COMMAND_REFUSED = "不能通过聊天执行服务器命令（内容以 / 开头会被服务器当成指令）"
+
+
+def _chat_text(message: object) -> str:
+    # 与引擎 chat() 的清洗一致：换行变空格、去掉首尾空白
+    return " ".join(str(message or "").splitlines()).strip()
+
+
+def is_chat_command(message: object) -> bool:
+    """这段话发出去会不会被服务器当成命令。
+
+    mineflayer 的 bot.chat 见到 / 开头就改发 chat_command，等于以她的权限执行命令；
+    她是 OP 时，能让她说话的人就能 /op、/give、/stop。所以聊天通道一律不放行。
+    """
+    return _chat_text(message).startswith("/")
+
+
+def neutralize_chat_command(message: object) -> str:
+    """模型生成的话（回复、分享、播报）偶尔会以 / 开头：去掉开头的斜杠再说，别整句丢掉。"""
+    return _chat_text(message).lstrip("/").strip()
+
 
 class EngineError(RuntimeError):
     """引擎返回的业务错误。message 已经是给人和 LLM 看的中文了。"""
@@ -498,6 +519,9 @@ class EngineClient:
         return await self.call("safety.stop", {}, timeout=timeout)
 
     async def say(self, message: str, *, timeout: float = 10.0) -> dict:
+        # 引擎侧也会拒绝；这里先拦一道，错误信息更早、更清楚（见 is_chat_command）
+        if is_chat_command(message):
+            raise EngineError(CHAT_COMMAND_REFUSED)
         return await self.call("chat.say", {"message": message}, timeout=timeout)
 
     async def apply_engine_settings(self, settings: dict, *, timeout: float = 10.0) -> dict:

@@ -81,6 +81,7 @@ KEY_PAIRS: tuple[tuple[str, str], ...] = (
     ("humanize", "humanize"),
     ("enable_viewer", "enableViewer"),
     ("viewer_port", "viewerPort"),
+    ("viewer_host", "viewerHost"),
     ("viewer_first_person", "viewerFirstPerson"),
     ("viewer_view_distance", "viewerViewDistance"),
     ("spawn_protection_radius", "spawnProtectionRadius"),

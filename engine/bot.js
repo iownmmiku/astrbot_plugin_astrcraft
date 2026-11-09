@@ -337,14 +337,18 @@ class McEngine {
     const port = Number(this.config.get('viewerPort')) || 3007;
     const firstPerson = this.config.get('viewerFirstPerson') !== false;
     const viewDistance = Math.max(2, Math.min(12, Number(this.config.get('viewerViewDistance')) || 6));
-    const srv = startViewerServer(bot, { port, firstPerson, viewDistance });
+    // 监听地址：默认只听本机（观战页没有登录验证，见 config.js 的 viewerHost 说明）
+    const host = String(this.config.get('viewerHost')).trim() || '127.0.0.1';
+    const srv = startViewerServer(bot, { port, host, firstPerson, viewDistance });
     // 等它真的监听上再算成功——端口被占用时这里会抛出可读的错误，
     // 而不是"看起来开了、其实请求被旧服务接走"
     await srv.listening;
-    this._viewer = { port, firstPerson, viewDistance, startedAt: Date.now(), srv };
+    this._viewer = { port, host, firstPerson, viewDistance, startedAt: Date.now(), srv };
+    const exposed = host !== '127.0.0.1' && host !== 'localhost' && host !== '::1';
     log.warn(
       `观战窗口已开启：浏览器打开 http://127.0.0.1:${port} —— 她的第一视角 + 玩家 HUD` +
-        `（血量/饱食/快捷栏，按 E 看背包）｜${firstPerson ? '第一视角' : '俯视'}，渲染 ${viewDistance} 区块`,
+        `（血量/饱食/快捷栏，按 E 看背包）｜${firstPerson ? '第一视角' : '俯视'}，渲染 ${viewDistance} 区块` +
+        `｜监听 ${host}${exposed ? '（⚠ 不只本机，任何能访问这个地址的人都能看，且没有登录验证）' : '（仅本机）'}`,
     );
     this._emit('viewer.started', this.viewerInfo());
     return this.viewerInfo();
@@ -355,6 +359,7 @@ class McEngine {
     return {
       running: true,
       url: `http://127.0.0.1:${this._viewer.port}`,
+      host: this._viewer.host,
       first_person: this._viewer.firstPerson,
       view_distance: this._viewer.viewDistance,
       uptime_seconds: Math.round((Date.now() - this._viewer.startedAt) / 1000),
@@ -2382,6 +2387,13 @@ class McEngine {
     const bot = this.requireBot();
     const text = String(message || '').replace(/[\r\n]+/g, ' ').trim();
     if (!text) throw new GameError('要说的内容不能为空');
+    // **以 / 开头的内容会被当成服务器命令执行**（minecraft-protocol 的 client.chat
+    // 见到 / 就改发 chat_command），等于以她的权限跑命令。她是 OP 的话，
+    // 任何能让她说话的人（/mc说、mc_say、游戏里的提示词注入）都能 /op、/give、/stop。
+    // 聊天通道一律不放行命令。
+    if (text.startsWith('/')) {
+      throw new GameError('不能通过聊天执行服务器命令（内容以 / 开头会被服务器当成指令）');
+    }
     if (text.length > 250) throw new GameError(`内容太长（${text.length} 字符，上限 250）`);
     const now = Date.now();
     this._chatTimes = this._chatTimes.filter((t) => now - t < 10000);

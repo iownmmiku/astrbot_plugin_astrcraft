@@ -17,7 +17,7 @@ import json
 
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 
-from .bridge_client import EngineError
+from .bridge_client import EngineError, neutralize_chat_command
 
 FAST_TIMEOUT = 20.0
 
@@ -181,6 +181,8 @@ class McLifeTools:
                 text=f"有人来看你了：{message or '在忙什么呢？'}",
                 force=True,
             )
+        # 拜访留言是聊天用户写的，原样转进游戏前要去掉开头的 /，免得变成服务器命令
+        message = neutralize_chat_command(message)
         if message and self.engine and self.engine.running:
             try:
                 await self.engine.say(message)

@@ -152,6 +152,27 @@
     "description": "【超时/性能】游戏内对话的 LLM 超时（秒）。模型太慢时超时会退回纯文字回复，不会一直卡着",
     "default": 120
   },
+  "in_game_action_players": {
+    "type": "list",
+    "description": "【安全】允许在游戏里指挥她动手的玩家名（不区分大小写）。留空 = 所有玩家都能指挥（适合自己的单人/小服）；公开服务器建议只填你自己。不在名单里的玩家叫她，她只聊天不动手",
+    "default": []
+  },
+  "in_game_reply_cooldown": {
+    "type": "int",
+    "description": "【安全/成本】不能指挥她的玩家，同一个人两次得到回复的最短间隔（秒）。防止有人刷屏让她一直调用模型；能指挥她的玩家不受限，最新一句总会被处理",
+    "default": 10
+  },
+  "in_game_max_pending": {
+    "type": "int",
+    "description": "【安全/成本】最多有几个玩家的话在排队等她回复。同一玩家排队期间又说话只保留最新一句；超过这个人数的新消息直接忽略",
+    "default": 3
+  },
+  "tool_control_permission": {
+    "type": "string",
+    "description": "【安全】谁能通过和机器人聊天（QQ/TG 等会话）让她动手、改目标、写知识、在游戏里说话。admin = 仅 AstrBot 管理员（默认）；everyone = 所有人。查状态、看背包、让她停下不受限",
+    "default": "admin",
+    "options": ["admin", "everyone"]
+  },
   "announce_task_done": {
     "type": "bool",
     "description": "【行为】技能任务做完后在游戏里播报结果（「砍完了，拿到 8 个木头」）。关掉则只在 QQ 侧可见",
@@ -191,6 +212,11 @@
     "type": "int",
     "default": 3007,
     "description": "【观战窗口】观战页面的端口。浏览器打开 http://127.0.0.1:这个端口 就能看她"
+  },
+  "viewer_host": {
+    "type": "string",
+    "default": "127.0.0.1",
+    "description": "【观战窗口】观战服务监听的地址。默认只允许本机访问；观战页面**没有登录验证**，会暴露她的视角、坐标和背包，确实要让局域网访问再改成 0.0.0.0"
   },
   "viewer_first_person": {
     "type": "bool",

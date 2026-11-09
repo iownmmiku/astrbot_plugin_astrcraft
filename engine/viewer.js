@@ -165,7 +165,10 @@ const HUD_JS = `
  *          （prismarine-viewer 的入口其实也提供了 `bot.viewer.close`，
  *           我早期误以为没有、说成"关不掉"，这里一并纠正）
  */
-function startViewerServer(bot, { port = 3007, firstPerson = true, viewDistance = 6, prefix = '' } = {}) {
+function startViewerServer(
+  bot,
+  { port = 3007, host = '127.0.0.1', firstPerson = true, viewDistance = 6, prefix = '' } = {},
+) {
   loadViewerDeps(); // 依赖没装的话，在这里抛出**说人话**的错误（而不是顶层崩溃）
   const express = require('express');
   const app = express();
@@ -290,7 +293,8 @@ function startViewerServer(bot, { port = 3007, firstPerson = true, viewDistance 
         reject(err);
       }
     });
-    http.listen(port, () => resolve());
+    // 必须带上地址：只给端口时 Node 会监听所有网卡，而观战页没有任何登录验证
+    http.listen(port, host, () => resolve());
   });
 
   const close = () => {

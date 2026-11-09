@@ -29,7 +29,13 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-from .bridge_client import EngineClient, EngineConfig, EngineError, EngineUnavailable
+from .bridge_client import (
+    EngineClient,
+    EngineConfig,
+    EngineError,
+    EngineUnavailable,
+    neutralize_chat_command,
+)
 from .inbox import Inbox
 from .perception import format_brief, format_event, format_skill_result, format_state, format_task_status
 from .goals import GoalManager
@@ -81,13 +87,67 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
 其它
   /mc技能              她能做的事
   /mc看她              看她：观战窗口（浏览器里的第一视角）+ 她的背包 + 她在干什么
-  /mc开观战            立刻打开观战窗口（不用重进服）
+  /mc开观战            立刻打开观战窗口（不用重进服，管理员）
   /mc控制台            网页控制台入口（管理员）
   /mc调试              排障信息
   /mc帮助              显示本帮助
 
 说明：她使用离线账号，只能进入 online-mode=false 的服务器。
 """
+
+# ---------------------------------------------------------------- 工具权限
+#
+# 65 个 mc_* 工具在 AstrBot 的每个会话里都能被模型调用。/mc目标、/mc暂停 这类指令
+# 要求管理员，但原来普通群友对机器人说一句"让她去挖矿 / 把箱子里的东西丢掉 /
+# 记住以后要……"，模型照样会调对应工具——指令的权限形同虚设，教训库还会被人写进
+# 自主决策的提示词里。
+#
+# 现在：从 AstrBot 会话里调用时，只有下面这些**只读查询**和**停止类**工具对所有人开放，
+# 其余（会动身体、改世界、改目标/计划/知识、让她说话的）默认只给管理员。
+# 新加的工具默认算"控制类"——宁可多拦，不要漏放。
+# 游戏内对话、自主行动、感知代理走各自的替身事件，不受这道闸门影响
+# （游戏内由 in_game_action_players 白名单管）。
+READ_ONLY_TOOLS = frozenset({
+    "mc_status", "mc_inventory", "mc_scan", "mc_plan_route", "mc_inspect_block",
+    "mc_scan_entities", "mc_check_danger", "mc_world_info", "mc_task_status",
+    "mc_goal_status", "mc_players", "mc_skills", "mc_whats_she_doing",
+    "mc_her_memories", "mc_her_persona", "mc_persona_list", "mc_her_wish",
+    "mc_todo_read", "mc_load_skill", "mc_knowledge_search",
+})
+# 和 /mc急停 一样，"让她停下"谁都可以说
+STOP_TOOLS = frozenset({"mc_move_stop", "mc_task_cancel"})
+
+
+def tool_needs_control_permission(name: str, args: dict | None = None) -> bool:
+    """这个工具调用会不会改变她的身体、世界或长期状态。"""
+    if name in READ_ONLY_TOOLS or name in STOP_TOOLS:
+        return False
+    if name == "mc_chest" and (args or {}).get("action") in ("list", "inspect"):
+        return False
+    return True
+
+
+async def _guard_async_gen(self, raw, tool_name, event, *args, **kwargs):
+    """异步生成器工具的权限闸门（第一个参数是插件实例，保持 partial(func, plugin) 的绑定形状）。"""
+    denied = self._tool_permission_denied(tool_name, event, kwargs)
+    if denied:
+        yield event.plain_result(denied)
+        return
+    async for item in raw(self, event, *args, **kwargs):
+        yield item
+
+
+async def _guard_coroutine(self, raw, tool_name, event, *args, **kwargs):
+    """普通协程工具的权限闸门。"""
+    denied = self._tool_permission_denied(tool_name, event, kwargs)
+    if denied:
+        return event.plain_result(denied)
+    return await raw(self, event, *args, **kwargs)
+
+
+# 标记：已经套过闸门的 handler 不再重复包装（_bind_llm_tools 会被调用好几次）
+_guard_async_gen.__astrcraft_guard__ = True
+_guard_coroutine.__astrcraft_guard__ = True
 
 
 def _cmd_rest(event: AstrMessageEvent) -> str:
@@ -723,13 +783,19 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 if handler is None:
                     continue
                 raw = handler.func if isinstance(handler, functools.partial) else handler
+                if getattr(raw, "__astrcraft_guard__", False):
+                    continue  # 已经套过权限闸门并绑定（幂等）
                 try:
                     params = list(inspect.signature(raw).parameters)
                 except (TypeError, ValueError):
                     continue
                 if not params or params[0] not in ("self", "cls"):
                     continue  # 已经绑好了
-                tool.handler = functools.partial(raw, self)
+                # 绑定的同时套上权限闸门（见 READ_ONLY_TOOLS 的说明）。
+                # 形状仍是 partial(func, plugin, ...)：args[0] 是插件实例，
+                # game_agent / action_agent 的 _bind_if_needed 照常把它当成已绑定。
+                guard = _guard_async_gen if inspect.isasyncgenfunction(raw) else _guard_coroutine
+                tool.handler = functools.partial(guard, self, raw, name)
                 fixed.append(name)
 
             if fixed:
@@ -743,6 +809,36 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 logger.debug("工具绑定检查完成：无需修正")
         except Exception as exc:  # noqa: BLE001
             logger.error("工具绑定失败（工具调用可能全部不可用）：%s", exc)
+
+    def _tool_permission_denied(self, tool_name: str, event, kwargs: dict) -> str | None:
+        """从 AstrBot 会话调用控制类工具时检查权限；放行返回 None，拒绝返回给模型/用户看的说明。
+
+        只管**真实的 AstrBot 消息事件**：游戏内对话、自主行动、感知代理用的是替身事件，
+        有各自的规则（游戏内白名单、急停/停牌屏障），这里不重复拦。
+        """
+        if not isinstance(event, AstrMessageEvent):
+            return None
+        if not tool_needs_control_permission(tool_name, kwargs):
+            return None
+        mode = str(self._cfg("tool_control_permission", "admin") or "admin").strip().lower()
+        if mode == "everyone":
+            return None
+        try:
+            is_admin = bool(event.is_admin())
+        except Exception:  # noqa: BLE001
+            is_admin = False
+        if is_admin:
+            return None
+        try:
+            who = event.get_sender_id()
+        except Exception:  # noqa: BLE001
+            who = "?"
+        logger.info("拒绝非管理员 %s 调用控制类工具 %s（tool_control_permission=%s）", who, tool_name, mode)
+        return (
+            f"（权限不足）只有管理员能通过对话让她做这件事（{tool_name}）。"
+            "查状态、看背包、问她在干嘛这类查询不受限制；"
+            "要放开给所有人，把插件配置 tool_control_permission 改成 everyone。"
+        )
 
     def _engine_settings_from_config(self) -> dict:
         """把插件配置里"引擎侧才生效"的项整理出来。
@@ -810,6 +906,11 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     out[engine_key] = int(val)
                 except (TypeError, ValueError):
                     logger.warning("%s 不是整数，已忽略：%r", cfg_key, val)
+
+        # 观战监听地址（字符串）。观战页没有登录验证，引擎默认只听本机
+        viewer_host = self._cfg("viewer_host", None)
+        if viewer_host is not None:
+            out["viewerHost"] = str(viewer_host).strip() or "127.0.0.1"
 
         return out
 
@@ -1502,7 +1603,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             line = await self._llm(prompt, system, kind="chat")
             if not line:
                 return
-            line = line.strip().splitlines()[0][:120]
+            # 模型生成的话不能以 / 开头（会被服务器当成命令），见 bridge_client.is_chat_command
+            line = neutralize_chat_command(line.strip().splitlines()[0][:120])
             if not line:
                 return
             await self.engine.say(line)
@@ -1534,11 +1636,14 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
         await self._notify_subscribers(f"💬 [{sender}] {message}")
         will_reply = bool(self._cfg("reply_in_game", True) and self._should_reply(message))
+        # 能不能指挥她动手：开了游戏内动作，而且这个玩家在白名单里（白名单为空 = 所有人）
+        may_act = bool(will_reply and self._cfg("in_game_actions", True)
+                       and self._player_may_command(sender))
 
         # 未唤醒或不允许动作的聊天只是见闻：不唤醒、不取得主人控制权，
         # 也不能清除正在保留的采矿返程责任。明确唤醒且允许动作时，
         # 先由聊天代理持有；只有代理未尝试动作的兜底才交给生活循环。
-        if self.life and not (will_reply and self._cfg("in_game_actions", True)):
+        if self.life and not may_act:
             try:
                 self.life.note_world_event(
                     "game_chat", f"游戏聊天（仅作见闻，不是动作指令）：{sender} 说：{message}"
@@ -1553,6 +1658,60 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 游戏内聊天是否触发 LLM 回复
         if not will_reply:
             return
+        # 不能指挥她的玩家只聊天，而且按人限频：防止有人刷屏让她一直调模型
+        if not may_act and not self._game_chat_cooldown_ok(sender):
+            logger.debug("%s 的游戏内消息在冷却中，不回复：%s", sender, message[:30])
+            return
+        self._queue_game_reply(sender, message)
+
+    def _player_may_command(self, sender: str) -> bool:
+        """这个玩家能不能在游戏里指挥她动手（in_game_action_players 为空表示所有人都可以）。"""
+        allowed = self._cfg("in_game_action_players", []) or []
+        if isinstance(allowed, str):
+            allowed = [w for w in allowed.replace("，", ",").split(",")]
+        names = {str(n).strip().lower() for n in allowed if str(n).strip()}
+        return not names or str(sender or "").strip().lower() in names
+
+    def _game_chat_cooldown_ok(self, sender: str) -> bool:
+        """不能指挥她的玩家：同一个人两次得到回复至少隔 in_game_reply_cooldown 秒。"""
+        try:
+            cooldown = float(self._cfg("in_game_reply_cooldown", 10) or 0)
+        except (TypeError, ValueError):
+            cooldown = 10.0
+        if cooldown <= 0:
+            return True
+        last = self.__dict__.setdefault("_game_last_reply", {})
+        key = str(sender or "").strip().lower()
+        now = time.time()
+        if now - last.get(key, 0.0) < cooldown:
+            return False
+        last[key] = now
+        if len(last) > 200:  # 顺手清掉过期的，别让字典一直长
+            for k in [k for k, t in last.items() if now - t >= cooldown]:
+                last.pop(k, None)
+        return True
+
+    def _queue_game_reply(self, sender: str, message: str) -> None:
+        """把一条要回复的游戏内消息排进队。
+
+        原来每条消息都直接开一个任务去等回复锁：刷屏的人能排出无限长的队，
+        每条都是一次带全套工具的模型往返。现在：
+        - 同一玩家排队期间又说话，只保留**最新一句**（"砍树"后面跟着"停下"，要执行的是"停下"）；
+        - 同时排队的玩家数有上限（in_game_max_pending），超出的新消息直接忽略。
+        """
+        pending = self.__dict__.setdefault("_game_pending", {})
+        key = str(sender or "").strip().lower()
+        if key in pending:
+            pending[key] = (sender, message)  # 已经有任务在等锁，它拿到锁时会读最新这句
+            return
+        try:
+            limit = max(1, int(self._cfg("in_game_max_pending", 3) or 3))
+        except (TypeError, ValueError):
+            limit = 3
+        if len(pending) >= limit:
+            logger.info("游戏内回复排队已满（%d 人在等），忽略 %s 的消息：%s", len(pending), sender, message[:30])
+            return
+        pending[key] = (sender, message)
         self._spawn_background(self._reply_in_game(sender, message), name="mc-reply")
 
     def _should_reply(self, message: str) -> bool:
@@ -1578,11 +1737,16 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         """
         # 锁按到达顺序等待，不能因为正在回复就丢掉后来的动作或取消指令。
         async with self._game_reply_lock:
+            # 排队期间同一玩家又说了话：处理最新那句（见 _queue_game_reply）
+            queued = self.__dict__.get("_game_pending", {}).pop(str(sender or "").strip().lower(), None)
+            if queued:
+                sender, message = queued
             try:
                 reply: str | None = None
                 allow_actions = bool(self._cfg("reply_in_game", True)
                                      and self._cfg("in_game_actions", True)
-                                     and self._should_reply(message))
+                                     and self._should_reply(message)
+                                     and self._player_may_command(sender))
                 agent_called = False
 
                 if allow_actions and self.game_agent:
@@ -1623,7 +1787,10 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
                 if not reply:
                     return
-                text = reply.strip().replace("\n", " ")[:200]
+                # 回复内容可能被玩家用提示词注入成 "/op xxx"：去掉开头的斜杠再说
+                text = neutralize_chat_command(reply.strip().replace("\n", " ")[:200])
+                if not text:
+                    return
                 if self.engine and self.engine.running:
                     await self.engine.say(text)
                     # 自己说过的话也算经历（下次她可能记得"我跟他聊过什么"）
@@ -1754,7 +1921,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     async def _share_to_world(self, text: str) -> None:
         """她说了句话：发到游戏内，同时转给订阅的会话。"""
-        text = (text or "").strip()
+        # 自主分享的输入里混着玩家聊天，同样不能让它以 / 开头变成命令
+        text = neutralize_chat_command(text)
         if not text:
             return
         if self.connected and self.engine and self.engine.running:
@@ -1977,8 +2145,13 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mc开观战", alias={"开观战", "mcviewstart"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_view_start(self, event: AstrMessageEvent):
-        """立刻打开观战窗口（浏览器里她的第一视角）"""
+        """立刻打开观战窗口（浏览器里她的第一视角）。
+
+        只给管理员：它会绕过 enable_viewer 直接起一个**没有登录验证**的 HTTP 服务，
+        并额外占用引擎（也就是她本身）的 CPU 去推区块。
+        """
         if not await self._ensure_engine():
             yield event.plain_result("引擎未运行")
             return
@@ -2433,6 +2606,11 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
     @filter.command("mc说", alias={"mcsay"})
     async def cmd_say(self, event: AstrMessageEvent):
         """让机器人在游戏内发言"""
+        # 和 mc_say 工具同一套权限（tool_control_permission），否则指令成了绕过闸门的后门
+        denied = self._tool_permission_denied("mc_say", event, {})
+        if denied:
+            yield event.plain_result(denied)
+            return
         text = _cmd_rest(event)
         if not text:
             yield event.plain_result("用法：/mc说 <内容>")
