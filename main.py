@@ -21,6 +21,7 @@ import asyncio
 import functools
 import inspect
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.tool import ToolSet
 
 from .bridge_client import (
     EngineClient,
@@ -69,13 +71,13 @@ HELP_TEXT = """【Minecraft —— 她在里面过日子】
 
 连接
   /mc状态              引擎与游戏连接状态
-  /mc进服              让她进服
-  /mc退服              断开游戏连接
+  /mc进服              让她进服（管理员）
+  /mc退服              断开游戏连接（管理员）
   /mc急停              立刻停止所有动作
 
 陪她玩
   /mc说 <内容>         让她在游戏里说一句话
-  /mc订阅 /mc退订      把游戏内的动静转发到本会话
+  /mc订阅 /mc退订      把游戏内的动静转发到本会话（订阅需管理员）
   /mc玩家              在线玩家
 
 给她派活（也可以，但不是必须）
@@ -148,6 +150,23 @@ async def _guard_coroutine(self, raw, tool_name, event, *args, **kwargs):
 # 标记：已经套过闸门的 handler 不再重复包装（_bind_llm_tools 会被调用好几次）
 _guard_async_gen.__astrcraft_guard__ = True
 _guard_coroutine.__astrcraft_guard__ = True
+
+
+# ---------------------------------------------------------------- 引擎拉起退避
+# 写成模块级函数而不是方法：监管测试（test_engine_supervise）用假的插件对象
+# 直接调 MinecraftPlugin._supervise_tick，假对象上没有新加的方法。
+
+def _note_engine_start_failure(owner) -> float:
+    """记一次引擎拉起失败，返回距下次重试的秒数：20 → 40 → 80 … 封顶 10 分钟。"""
+    owner._engine_start_failures = getattr(owner, "_engine_start_failures", 0) + 1
+    delay = min(600.0, 20.0 * 2 ** (owner._engine_start_failures - 1))
+    owner._engine_retry_at = time.time() + delay
+    return delay
+
+
+def _reset_engine_start_backoff(owner) -> None:
+    owner._engine_start_failures = 0
+    owner._engine_retry_at = 0.0
 
 
 def _cmd_rest(event: AstrMessageEvent) -> str:
@@ -266,6 +285,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 所以优先复用"已经有数据"的那个目录。
         self._data_dir = resolve_data_dir(PLUGIN_NAME, Path(__file__).resolve().parent)
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        # 恢复上次的订阅会话（原来只在内存里，重启就全丢）
+        self._load_subscribers()
 
         # ---- 人格：直接接 AstrBot 的人格库
         self.persona = MinecraftPersona(context=self.context, data_dir=self._data_dir, cfg=self._cfg)
@@ -335,6 +356,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             # 现在只留给"失败感知退避"。保留这个参数是为了兼容旧配置。
             min_decide_gap=float(self._cfg("life_min_decide_gap", 6) or 0),
             share_cooldown=float(self._cfg("life_share_cooldown", 600) or 600),
+            # 连续空闲时模型决策的最长间隔，与每小时调用上限（0 = 不限制）
+            idle_max_wait=float(self._cfg("life_idle_max_wait", 120) or 120),
+            model_calls_per_hour=int(self._cfg("life_model_calls_per_hour", 0) or 0),
             # **输入队列**（W4）：主人的话与世界事件共用这一个队列，
             # 落盘在插件数据目录下，跨重启活着。
             inbox=Inbox(self._data_dir / "inbox.json"),
@@ -397,24 +421,29 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 self.webui = None
                 logger.error("控制台启动失败：%s；原生 Pages 需要支持 Pages/astrbot.api.web 的 AstrBot。可更新管理面板或选择 webui_mode=standalone。", exc)
 
+        engine_started = True
         try:
             await self.engine.start()
         except EngineUnavailable as exc:
-            logger.error("Minecraft 引擎启动失败：%s", exc)
+            engine_started = False
+            delay = _note_engine_start_failure(self)
+            logger.error("Minecraft 引擎启动失败（%.0f 秒后自动重试）：%s", delay, exc)
             logger.error("请检查：1) 是否已安装 Node 依赖  2) engine_dir / node_path 配置是否正确")
             # **引擎起不来 = ENGINE_DOWN 停牌**（W2）：这时她什么都做不了，
             # 而且必须能说清"是引擎没了"，而不是让她安静地站着。
             if self.life:
                 self.life.note_engine_up(False)
-            return
-        if self.life:
-            self.life.note_engine_up(True)
-        if self._emergency_stopped:
-            await self.engine.safety_stop()
-
-        if self._cfg("auto_connect", False):
-            self._spawn_background(self._auto_connect(), name="mc-auto-connect")
-        # 引擎监管：崩了自动拉起（引擎进程是长期依赖，不能等用户手动重启）
+        if engine_started:
+            if self.life:
+                self.life.note_engine_up(True)
+            if self._emergency_stopped:
+                await self.engine.safety_stop()
+            if self._cfg("auto_connect", False):
+                self._spawn_background(self._auto_connect(), name="mc-auto-connect")
+        # 引擎监管：崩了自动拉起（引擎进程是长期依赖，不能等用户手动重启）。
+        # 首次启动失败也要开：原来这里直接 return，监管循环根本没启动，
+        # 之后再也不会自动重试、自动进服，要等有人手动敲指令才恢复。
+        # 监管里重新拉起成功后会按 auto_connect 自动进服。
         self._supervise_task = asyncio.create_task(self._supervise_loop(), name="mc-engine-supervise")
 
         # 兜底：即使 on_astrbot_loaded 钩子没触发（某些版本/加载路径下可能不触发），
@@ -593,8 +622,12 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                 logger.error("停掉假死的引擎失败（继续尝试重启）：%s", exc)
 
         if not self.engine.running:
-            logger.warning("检测到引擎未运行，正在重新拉起")
             self.connected = False
+            if time.time() < getattr(self, "_engine_retry_at", 0.0):
+                # 上次拉起失败（比如 Node 依赖没装），按退避间隔再试，
+                # 别每 20 秒失败一次、刷一遍同样的错误
+                return
+            logger.warning("检测到引擎未运行，正在重新拉起")
             # **引擎没了 = ENGINE_DOWN 停牌**（W2）：这时她做不了任何事，
             # 而这张表让"她为什么不动"有一个明确的答案，不是安静地站着。
             # （假死分支已经报过一次的话就跳过，别报两遍。）
@@ -605,6 +638,7 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                     logger.info("标记引擎停牌失败：%s", exc)
             try:
                 await self.engine.start()
+                _reset_engine_start_backoff(self)
                 if self.life:
                     self.life.note_engine_up(True)
                 if getattr(self, "_emergency_stopped", False):
@@ -613,7 +647,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
                         and not getattr(self, "_manual_disconnect_requested", False)):
                     await self._auto_connect(reason="引擎重启后恢复")
             except Exception as exc:  # noqa: BLE001
-                logger.error("重新拉起引擎失败：%s", exc)
+                delay = _note_engine_start_failure(self)
+                logger.error("重新拉起引擎失败（%.0f 秒后再试）：%s", delay, exc)
 
     async def _engine_call(self, method: str, params: dict | None = None, *, timeout: float = 30.0):
         """给 GoalManager 用的调用入口（引擎不可用时抛 EngineUnavailable）。"""
@@ -709,6 +744,8 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
             return True
         try:
             await self.engine.start()
+            # 手动拉起成功（比如装好依赖后敲了指令）：监管不用再等退避
+            _reset_engine_start_backoff(self)
             if self._emergency_stopped:
                 await self.engine.safety_stop()
             if self.life:
@@ -741,6 +778,53 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         # 多试几次成本极低（绑定是幂等的），但能避免"工具静默不可用"这种最坑的故障。
         for delay in (5, 15, 40):
             self._spawn_background(self._bind_tools_later(delay), name=f"mc-bind-{delay}")
+
+    def _mc_tools_visible(self, event) -> bool:
+        """这次 AstrBot 对话请求要不要带上 mc_* 工具（见 llm_tool_scope 配置）。
+
+        - all：总是带（旧行为）
+        - connected：她在服里才带
+        - auto（默认）：她在服里，并且这个会话订阅过（/mc订阅）或说话的人是管理员
+        """
+        scope = str(self._cfg("llm_tool_scope", "auto") or "auto").strip().lower()
+        if scope == "all":
+            return True
+        if not self.connected:
+            return False
+        if scope == "connected":
+            return True
+        if getattr(event, "unified_msg_origin", None) in getattr(self, "_subscribers", ()):
+            return True
+        try:
+            return bool(event.is_admin())
+        except Exception:  # noqa: BLE001
+            return False
+
+    @filter.on_llm_request()
+    async def _scope_mc_tools(self, event: AstrMessageEvent, req) -> None:
+        """把用不上的 mc_* 工具从这次请求里拿掉。
+
+        65 个工具的说明大约 1 万字，原来附在**每个会话**的每次模型请求里——
+        包括跟 Minecraft 完全无关的群聊、她不在服里的时候——这些请求全都在为它付费。
+        AstrBot 每次请求都会新建工具集，这里换成过滤后的新集合，不影响别的会话和别的插件的工具。
+        插件自己的代理（游戏内、自主、感知）直接调模型，不经过这个钩子。
+        """
+        tools = getattr(req, "func_tool", None)
+        if not tools:
+            return
+        try:
+            names = list(tools.names())
+        except Exception:  # noqa: BLE001
+            return
+        if not any(name.startswith("mc_") for name in names) or self._mc_tools_visible(event):
+            return
+        kept = ToolSet()
+        for name in names:
+            if not name.startswith("mc_"):
+                tool = tools.get_tool(name)
+                if tool is not None:
+                    kept.add_tool(tool)
+        req.func_tool = kept
 
     async def _bind_tools_later(self, delay: float) -> None:
         await asyncio.sleep(delay)
@@ -2020,9 +2104,46 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
 
     # ================================================================ 会话推送
 
+    # 合并推送时一条消息最多带几行，再多的只说"还有 N 条"
+    PUSH_MAX_LINES = 15
+
     async def _notify_subscribers(self, text: str) -> None:
+        """推送到订阅的会话。默认把 push_merge_seconds 秒内的多条合成一条发。
+
+        原来游戏里每句聊天、目标的每一步都单独发一条，热闹的服务器上一分钟几十条，
+        容易刷屏、也容易触发平台风控。现在：一个窗口内的消息合并成一条，
+        每个窗口最多发一次；push_merge_seconds=0 恢复逐条立即发送。
+        """
         if not self._subscribers or not text:
             return
+        try:
+            window = float(self._cfg("push_merge_seconds", 5) or 0)
+        except (TypeError, ValueError):
+            window = 5.0
+        if window <= 0:
+            await self._send_to_subscribers(text)
+            return
+        self.__dict__.setdefault("_push_pending", []).append(text)
+        task = getattr(self, "_push_flush_task", None)
+        if task is None or task.done():
+            self._push_flush_task = self._spawn_background(
+                self._flush_pushes(window), name="mc-push-flush"
+            )
+
+    async def _flush_pushes(self, window: float) -> None:
+        """每隔一个窗口把攒下的消息合成一条发出去，直到没有新消息为止。"""
+        while True:
+            await asyncio.sleep(window)
+            pending = self.__dict__.get("_push_pending") or []
+            if not pending:
+                return
+            lines, self._push_pending = list(pending), []
+            text = "\n".join(lines[: self.PUSH_MAX_LINES])
+            if len(lines) > self.PUSH_MAX_LINES:
+                text += f"\n……还有 {len(lines) - self.PUSH_MAX_LINES} 条没显示"
+            await self._send_to_subscribers(text)
+
+    async def _send_to_subscribers(self, text: str) -> None:
         for umo in list(self._subscribers):
             try:
                 chain = MessageChain().message(text)
@@ -2425,8 +2546,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.command("mc进服", alias={"mcconnect"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_connect(self, event: AstrMessageEvent):
-        """让机器人进服"""
+        """让机器人进服（管理员：原来谁都能让她进出服务器）"""
         self._manual_disconnect_requested = False
         if not await self._ensure_engine():
             yield event.plain_result("❌ 引擎未启动，请先检查配置")
@@ -2438,8 +2560,9 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         await self._auto_connect(reason="手动进服")
 
     @filter.command("mc退服", alias={"mcdisconnect"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_disconnect(self, event: AstrMessageEvent):
-        """断开游戏连接"""
+        """断开游戏连接（管理员：退服后自动进服也会停，普通成员不该能把她踢下线）"""
         result = await self._do_disconnect()
         yield event.plain_result(result)
 
@@ -2592,16 +2715,67 @@ class MinecraftPlugin(McPerceptionTools, McSkillTools, McLifeTools, Star):
         yield event.plain_result(f"控制台：{ui.url}\n访问令牌：{ui.token}\n远程或容器部署时将地址替换为 AstrBot 主机地址并映射 WebUI 端口。")
 
     @filter.command("mc订阅", alias={"mcsubscribe"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_subscribe(self, event: AstrMessageEvent):
-        """把游戏内聊天转发到本会话"""
+        """把游戏内聊天转发到本会话（管理员：订阅会开推送，并让这个会话的对话带上 MC 工具）。
+
+        退订不限权限：谁都可以让自己所在的会话不再收推送。
+        """
         self._subscribers.add(event.unified_msg_origin)
-        yield event.plain_result("✅ 已订阅：游戏内的聊天和机器人动态会转发到这里（/mc退订 取消）")
+        saved = self._save_subscribers()
+        note = "" if saved else "\n（⚠ 订阅没能存盘，插件重载后需要重新订阅）"
+        yield event.plain_result(f"✅ 已订阅：游戏内的聊天和机器人动态会转发到这里（/mc退订 取消）{note}")
 
     @filter.command("mc退订", alias={"mcunsubscribe"})
     async def cmd_unsubscribe(self, event: AstrMessageEvent):
         """取消转发"""
         self._subscribers.discard(event.unified_msg_origin)
+        self._save_subscribers()
         yield event.plain_result("已退订")
+
+    # ---------------------------------------------------------------- 订阅存档
+    #
+    # 原来订阅只放在内存里，每次重启 AstrBot 或重载插件都会悄悄全部丢掉，
+    # 订阅过的群再也收不到推送，也没有任何提示。现在存到数据目录的 subscribers.json。
+
+    def _subscribers_path(self) -> Path | None:
+        data_dir = getattr(self, "_data_dir", None)
+        return Path(data_dir) / "subscribers.json" if data_dir else None
+
+    def _load_subscribers(self) -> None:
+        path = self._subscribers_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items = data.get("subscribers") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("格式不对：缺少 subscribers 列表")
+            self._subscribers.update(str(umo) for umo in items if isinstance(umo, str) and umo)
+            logger.info("已恢复 %d 个订阅会话", len(self._subscribers))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取订阅存档失败，本次不恢复订阅（原文件保留不动）：%s", exc)
+
+    def _save_subscribers(self) -> bool:
+        """原子写入：先写同目录临时文件再替换，写到一半崩溃也不会弄坏原档。"""
+        path = self._subscribers_path()
+        if path is None:
+            return False
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 1, "subscribers": sorted(self._subscribers)}
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存订阅失败（重载后需要重新订阅）：%s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            # **有意吞掉**：清理临时文件失败不影响结果，上面已经记过保存失败
+            except OSError:
+                pass
+            return False
 
     @filter.command("mc说", alias={"mcsay"})
     async def cmd_say(self, event: AstrMessageEvent):

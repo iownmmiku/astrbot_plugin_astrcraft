@@ -333,8 +333,10 @@ class EngineClient:
                 if not chunk:
                     break
                 buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                # 一次切完，最后一段（可能是半行）留到下一块。原来每取一行都
+                # split(b"\n", 1) 一次、复制一遍剩余缓冲，输出成批涌来时是平方级开销。
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
                     line = line.strip()
                     if not line:
                         continue
@@ -396,8 +398,8 @@ class EngineClient:
                 if not chunk:
                     break
                 buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                *lines, buf = buf.split(b"\n")  # 同 _read_loop：一次切完，半行留到下一块
+                for line in lines:
                     text = line.decode("utf-8", errors="replace").rstrip()
                     if not text:
                         continue

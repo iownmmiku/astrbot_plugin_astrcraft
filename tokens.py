@@ -143,6 +143,21 @@ class TokenLedger:
     _latest_record: dict | None = None
     _groups: dict = field(default_factory=dict)
     _recent: list = field(default_factory=list)
+    # 最近一小时每次请求的 (时间, 类别)，给"每小时调用上限"用；_recent 只留 30 条不够
+    _window: list = field(default_factory=list)
+
+    WINDOW_SECONDS = 3600.0
+
+    def calls_within(self, seconds: float, kinds: tuple[str, ...] | None = None,
+                     *, now: float | None = None) -> tuple[int, float | None]:
+        """最近 seconds 秒内的请求数（可按类别过滤），以及其中最早一次的时间。
+
+        不管提供方报没报 token 用量，次数总是可数的，所以上限按次数算。
+        """
+        now = time.time() if now is None else now
+        since = now - seconds
+        hits = [at for at, kind in self._window if at >= since and (kinds is None or kind in kinds)]
+        return len(hits), (min(hits) if hits else None)
 
     def record(self, usage, *, kind: str = "autonomous", duration_seconds: float | None = None,
                status: str = "ok") -> Usage:
@@ -183,6 +198,10 @@ class TokenLedger:
         self._latest_record = record
         self._recent.append(record)
         del self._recent[:-30]
+        self._window.append((now, kind))
+        cutoff = now - self.WINDOW_SECONDS
+        while self._window and self._window[0][0] < cutoff:
+            self._window.pop(0)
         if u.is_empty():
             self._zero_hit_streak = 0
             return u

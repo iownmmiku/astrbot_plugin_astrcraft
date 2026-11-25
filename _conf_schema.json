@@ -122,6 +122,16 @@
     "description": "【超时/性能】她主动分享见闻的最小间隔（秒）。发现钻石、死亡这类大事不受此限制",
     "default": 600
   },
+  "life_idle_max_wait": {
+    "type": "int",
+    "description": "【成本】没活干时两次模型决策的最长间隔（秒）。连续想不出要做什么时，间隔从 6 秒逐轮翻倍到这个值；任务完成、主人说话、受伤等事件会立刻叫醒她",
+    "default": 120
+  },
+  "life_model_calls_per_hour": {
+    "type": "int",
+    "description": "【成本】自主生活每小时最多调用模型几次（每次模型往返算一次，含环境侦察），0 = 不限制。到上限后只按已有计划和规则行动，额度腾出来自动恢复；游戏内聊天、指派目标和主人的话不受限",
+    "default": 0
+  },
   "remember_experiences": {
     "type": "bool",
     "description": "【行为】记录她的经历（去过哪、见过什么、和谁聊过），让她有连续的记忆",
@@ -172,6 +182,17 @@
     "description": "【安全】谁能通过和机器人聊天（QQ/TG 等会话）让她动手、改目标、写知识、在游戏里说话。admin = 仅 AstrBot 管理员（默认）；everyone = 所有人。查状态、看背包、让她停下不受限",
     "default": "admin",
     "options": ["admin", "everyone"]
+  },
+  "push_merge_seconds": {
+    "type": "int",
+    "description": "【推送】把这么多秒内要推送到订阅会话的消息合并成一条发（游戏聊天、目标进度等），每个窗口最多发一次，防止刷屏和平台风控。0 = 逐条立即发送（旧行为）",
+    "default": 5
+  },
+  "llm_tool_scope": {
+    "type": "string",
+    "description": "【成本】哪些会话的模型请求会带上 Minecraft 工具（约 1 万字说明，每次请求都要付费）。auto = 她在服里，且会话订阅过（mc订阅）或说话的是管理员（默认）；connected = 她在服里就带；all = 总是带（旧行为）",
+    "default": "auto",
+    "options": ["auto", "connected", "all"]
   },
   "announce_task_done": {
     "type": "bool",

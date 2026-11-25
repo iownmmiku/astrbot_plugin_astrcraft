@@ -148,6 +148,33 @@ test('startViewer 把监听地址交给 http.listen（默认 127.0.0.1，可配�
   }
 });
 
+// ---------------------------------------------------------------- 3. 未捕获异常熔断
+test('偶发异常继续跑，一分钟内接连 5 次才退出', () => {
+  const { createCrashGuard } = require('../engine/util');
+  let t = 0;
+  const guard = createCrashGuard({ limit: 5, windowMs: 60000, now: () => t });
+  for (let i = 0; i < 4; i += 1) {
+    t += 1000;
+    assert.equal(guard.record(), false, `第 ${i + 1} 次不该退出`);
+  }
+  t += 1000;
+  assert.equal(guard.record(), true, '一分钟内第 5 次应该退出');
+
+  let s = 0;
+  const sparse = createCrashGuard({ limit: 5, windowMs: 60000, now: () => s });
+  for (let i = 0; i < 20; i += 1) {
+    s += 20000; // 每 20 秒一次：窗口里最多 4 次
+    assert.equal(sparse.record(), false, '零星的异常不该让进程退出');
+  }
+});
+
+test('引擎入口接上了熔断（不再无论多少次都接着跑）', () => {
+  const src = require('node:fs').readFileSync(path.join(__dirname, '..', 'engine', 'index.js'), 'utf8');
+  const handler = src.slice(src.indexOf("process.on('uncaughtException'"));
+  assert.match(handler.slice(0, 1200), /crashGuard\.record\(\)/);
+  assert.match(handler.slice(0, 1200), /process\.exit\(1\)/);
+});
+
 (async () => {
   let failed = 0;
   for (const { name, run } of tests) {

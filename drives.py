@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from dataclasses import dataclass, field, replace
@@ -161,7 +162,11 @@ class DriveSystem:
                     for k, d in self._drives.items()
                 },
             }
-            self._path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            # 原子写入：先写同目录临时文件再替换。原来直接覆盖原文件，
+            # 写到一半崩溃（或断电）就会留下半截 JSON，下次启动水位全部丢失。
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, self._path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("保存驱动状态失败：%s", exc)
 

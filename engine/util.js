@@ -277,8 +277,32 @@ class Semaphore {
   }
 }
 
+/**
+ * 未捕获异常的熔断计数：windowMs 内累计到 limit 次就该让进程退出。
+ *
+ * 偶发一次（比如 mineflayer 解析某个包出错）继续跑，不至于每次都断线重连；
+ * 但短时间内接连出错，说明进程已经处在不一致的状态，再撑下去只会"活着但什么都做不了"。
+ * 这时退出，由插件的监管循环重新拉起并自动进服。
+ */
+function createCrashGuard({ limit = 5, windowMs = 60000, now = () => Date.now() } = {}) {
+  const hits = [];
+  return {
+    /** 记一次异常；返回 true 表示该退出了 */
+    record() {
+      const t = now();
+      hits.push(t);
+      while (hits.length && t - hits[0] > windowMs) hits.shift();
+      return hits.length >= limit;
+    },
+    get count() {
+      return hits.length;
+    },
+  };
+}
+
 module.exports = {
   log,
+  createCrashGuard,
   delay,
   withTimeout,
   waitFor,

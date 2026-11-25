@@ -39,6 +39,7 @@ from .drives import DriveSystem
 from .memory import MemoryStore
 from .life_types import HOLD_RELEASE, HOLD_WHY, Hold, LifeDecision
 from .life_render import PromptRenderMixin
+from .tokens import ledger
 
 # 决策阶段的行为约束（配合 perception_agent 的只读工具）
 PERCEPTION_PROMPT_EXTRA = """在决定"接下来做什么"时：
@@ -174,8 +175,15 @@ class LifeLoop(PromptRenderMixin):
         decide_interval: float = 90.0,
         min_decide_gap: float = 6.0,
         share_cooldown: float = 600.0,
+        idle_max_wait: float = 120.0,
+        model_calls_per_hour: int = 0,
     ):
         self._call = engine_call
+        # 连续空闲时两次模型决策的最长间隔（秒），见 _idle_backoff_wait
+        self._idle_max_wait = max(6.0, float(idle_max_wait or 120.0))
+        # 自主生活每小时最多调用模型几次（0 = 不限制），见 _model_budget_wait
+        self._model_calls_per_hour = max(0, int(model_calls_per_hour or 0))
+        self._budget_hold_noted = False
         self.memory = memory
         self.drives = drives
         self._brief = brief_provider
@@ -508,7 +516,44 @@ class LifeLoop(PromptRenderMixin):
         )
         self.state_note(f"我暂时想不出该做什么{detail}")
 
+    def _idle_backoff_wait(self) -> float:
+        """连续空闲时，下一次模型决策前等多久。
 
+        原来"这一轮什么都没提交"之后固定约 6 秒再问一次模型，没活干时一小时能白问几百次。
+        现在按连续空闲轮数翻倍：6 → 12 → 24 → … 封顶 idle_max_wait（默认 120 秒）。
+        等待期间任何唤醒（任务完成、主人说话、受伤、聊天见闻）都会立刻打断，
+        做成一件事（_note_busy_round）就清零，所以有活干时不受影响。
+        """
+        base = min(6.0, self._decide_interval)
+        rounds = max(1, getattr(self, "_idle_rounds", 1))
+        cap = max(base, getattr(self, "_idle_max_wait", 120.0))
+        return min(cap, base * 2 ** (rounds - 1))
+
+    def _model_budget_wait(self, now: float | None = None) -> float:
+        """自主生活的模型调用到了每小时上限时，还要等多少秒才腾出额度；没到上限返回 0。
+
+        只数自主行动和环境侦察（kind = autonomous / perception）：游戏内聊天、
+        主人指派目标时的规划不受这个上限影响。按次数算是因为有的提供方不报告 token 用量。
+        """
+        limit = getattr(self, "_model_calls_per_hour", 0)
+        if not limit:
+            return 0.0
+        now = time.time() if now is None else now
+        used, oldest = ledger().calls_within(3600.0, ("autonomous", "perception"), now=now)
+        if used < limit:
+            if getattr(self, "_budget_hold_noted", False):
+                self._budget_hold_noted = False
+                logger.info("模型调用额度已腾出（最近一小时 %d/%d 次），恢复自主决策", used, limit)
+            return 0.0
+        wait = max(1.0, (oldest or now) + 3600.0 - now)
+        if not getattr(self, "_budget_hold_noted", False):
+            self._budget_hold_noted = True
+            logger.warning(
+                "自主生活最近一小时已调用模型 %d 次（上限 %d），约 %.0f 分钟后恢复；"
+                "期间只按已有计划和规则行动", used, limit, wait / 60.0,
+            )
+            self.state_note("这个小时的思考额度用完了，先按计划和规则做事")
+        return wait
 
     @staticmethod
     def _return_position(value: object) -> dict | None:
@@ -1846,7 +1891,13 @@ class LifeLoop(PromptRenderMixin):
                 next_wait = self._decide_interval
                 self._probing_endpoint = False
                 self.drives.tick()
-                self.drives.save()
+                # 水位只是随时间缓慢上涨，不必每圈都写盘：原来执行任务时循环约 2 秒一圈，
+                # 一小时写 1800 次。现在最多每分钟存一次；"做了某件事"（satisfy）和
+                # 插件卸载时仍会立刻保存，崩溃最多丢一分钟的缓慢上涨。
+                now_save = time.time()
+                if now_save - getattr(self, "_drives_saved_at", 0.0) >= 60.0:
+                    self.drives.save()
+                    self._drives_saved_at = now_save
                 self._auto_resume_if_expired()
                 self._announce_hold()
                 hold = self.current_hold()
@@ -1932,6 +1983,13 @@ class LifeLoop(PromptRenderMixin):
                 if now < self._decision_retry_at:
                     next_wait = min(5.0, self._decision_retry_at - now)
                     continue
+                # 每小时调用上限：到了就只按计划和规则行动（上面的计划步骤、生存补给照常执行）。
+                # 主人的话不受限，必须能被处理。
+                if not self._owner_steer_pending():
+                    budget_wait = self._model_budget_wait(now)
+                    if budget_wait > 0:
+                        next_wait = min(60.0, budget_wait)
+                        continue
                 if self.current_hold() is Hold.BLOCKED:
                     # 仅这次实际模型探测可以越过 BLOCKED，成功才解除故障。
                     self._probing_endpoint = True
@@ -1964,7 +2022,8 @@ class LifeLoop(PromptRenderMixin):
                             and len(self.inbox) == 0
                         ):
                             self.note_idle_round("agent 这一轮没有提交任何任务，队列也空")
-                            next_wait = min(6.0, self._decide_interval)
+                            # 连续空闲逐轮拉长间隔（有任何唤醒会立刻打断），见 _idle_backoff_wait
+                            next_wait = self._idle_backoff_wait()
                         else:
                             self._note_busy_round()
                             next_wait = 0.0 if self._pending_plan else min(2.0, self._decide_interval)
@@ -2001,7 +2060,9 @@ class LifeLoop(PromptRenderMixin):
                 if decision is None:
                     if len(self.inbox) == 0:
                         self.note_idle_round("想不出该做什么，队列也空")
-                    next_wait = min(6.0, self._decide_interval)
+                        next_wait = self._idle_backoff_wait()
+                    else:
+                        next_wait = min(6.0, self._decide_interval)
                     continue
                 if self._needs_work_boundary(decision.skill):
                     # The JSON response carries its first step separately from
@@ -2979,6 +3040,10 @@ class LifeLoop(PromptRenderMixin):
         """
         now = time.time()
         if not force and now - self._last_share_at < self._share_cooldown:
+            return False
+        # 主动分享也是一次模型调用（kind=autonomous），额度用完就先不说；
+        # force 的大事（死亡、有人来访）照说
+        if not force and self._model_budget_wait(now) > 0:
             return False
 
         # 取人格化的 system prompt（构造时以 system_prompt_provider 传入，存为 _system_prompt）

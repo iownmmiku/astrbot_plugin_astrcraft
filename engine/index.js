@@ -12,7 +12,7 @@ const { RpcPeer, RpcError, GameError, NotConnectedError } = require('./rpc');
 const log = require('./log');
 const { McEngine } = require('./bot');
 const { PRIORITY } = require('./goals');
-const { describeFailure, distance, fmtVec, blockCenter, vec3, delay } = require('./util');
+const { describeFailure, distance, fmtVec, blockCenter, vec3, delay, createCrashGuard } = require('./util');
 const skills = require('./skills');
 
 const rpc = new RpcPeer({
@@ -1226,9 +1226,24 @@ rpc.onClose(() => {
   setTimeout(() => process.exit(0), 200);
 });
 
+// 一分钟内 5 次未捕获异常就退出，交给插件监管重启（见 util.createCrashGuard）。
+// 原来无论多少次都只记日志接着跑，进程可能一直处在坏掉的状态。
+const crashGuard = createCrashGuard({ limit: 5, windowMs: 60000 });
+let crashExiting = false;
 process.on('uncaughtException', (err) => {
   log.error(`未捕获异常：${err.stack || err.message}`);
-  rpc.notify('bot.error', { message: `引擎内部错误：${err.message}`, fatal: false });
+  const fatal = crashGuard.record();
+  rpc.notify('bot.error', { message: `引擎内部错误：${err.message}`, fatal });
+  if (!fatal || crashExiting) return;
+  crashExiting = true;
+  log.error(`一分钟内已出现 ${crashGuard.count} 次未捕获异常，进程状态不可信，退出由插件重新拉起`);
+  try {
+    engine.shutdown();
+  } catch (shutdownErr) {
+    log.error(`退出前收尾失败（继续退出）：${shutdownErr.message}`);
+  }
+  // 给 stdout 一点时间把通知写出去
+  setTimeout(() => process.exit(1), 200);
 });
 
 process.on('unhandledRejection', (reason) => {
