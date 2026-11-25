@@ -58,7 +58,7 @@ from .runtime_status import RuntimeMetrics
 
 PLUGIN_NAME = "astrbot_plugin_astrcraft"
 # 发布版本与 metadata.yaml、README 保持一致；更新内容见 CHANGELOG.md。
-PLUGIN_VERSION = "1.3.5"
+PLUGIN_VERSION = "1.4.0"
 
 HELP_TEXT = """【Minecraft —— 她在里面过日子】
 她自己
